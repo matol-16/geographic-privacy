@@ -16,3 +16,4 @@ geoopt
 einops
 torchdiffeq
 webdataset==0.2.57
+reverse_geocoder # necessary in lonk/metrics/utils.py (not added in base repo)
