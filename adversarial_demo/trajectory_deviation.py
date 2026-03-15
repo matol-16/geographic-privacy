@@ -7,7 +7,7 @@ import torch
 import tqdm as tqdm
 import numpy as np
 from itertools import product
-from adversarial_eval import (
+from adversarial_metrics import (
     evaluate_displacement_metrics,
     select_displacement_score,
     mean_final_prediction_distance,
@@ -76,7 +76,7 @@ def train_diffusion_perturbation(
     clean_num_steps=200,
     log_every=20,
     target_pure_noise = False,
-    dot_product_loss="squared",
+    dot_product_loss="absolute",
     reconstruction_loss_weight=0.0,
     num_restarts=1,
     restart_selection_metric="mean_step_displacement",
@@ -85,6 +85,7 @@ def train_diffusion_perturbation(
     restart_eval_num_steps=None,
     restart_eval_seed=1234,
     print_restart_results=True,
+    show_progress=True,
     device="cuda",
 ):
     # Freeze PLONK denoiser and embedding model parameters (we only optimize delta)
@@ -112,6 +113,7 @@ def train_diffusion_perturbation(
     best_delta = None
     best_history = None
     best_restart = None
+    best_metrics=None
 
     from adversarial_utils import add_perturbation_to_image
 
@@ -122,7 +124,10 @@ def train_diffusion_perturbation(
         optimizer = torch.optim.SGD([delta], lr=lr)
 
         history = []
-        pbar = tqdm.trange(n_steps, desc=f"PGD attack training (restart {restart_idx + 1}/{int(num_restarts)})")
+        if show_progress:
+            pbar = tqdm.trange(n_steps, desc=f"PGD attack training (restart {restart_idx + 1}/{int(num_restarts)})")
+        else:
+            pbar = range(n_steps)
 
         for step in pbar:
             optimizer.zero_grad(set_to_none=True)
@@ -199,7 +204,7 @@ def train_diffusion_perturbation(
 
 
             history.append(loss.item())
-            if (step + 1) % log_every == 0:
+            if show_progress and hasattr(pbar, 'set_postfix') and (step + 1) % log_every == 0:
                 pbar.set_postfix(loss=f"{loss.item():.6f}")
 
         # Evaluate restart quality on trajectory displacement with a shared initial noise.
@@ -254,6 +259,7 @@ def train_diffusion_perturbation(
             best_delta = delta.detach().clone()
             best_history = list(history)
             best_restart = restart_idx
+            best_metrics=metrics
 
     if best_delta is None or best_history is None or best_restart is None:
         raise RuntimeError("No restart produced a valid perturbation")
@@ -264,7 +270,7 @@ def train_diffusion_perturbation(
             f"{restart_selection_metric} (score={best_score:.6f})"
         )
 
-    return best_delta, best_history, source_tensor, 
+    return best_delta, best_history, source_tensor, best_metrics
 
 
 ###########################################################################################################

@@ -7,7 +7,7 @@ import torch
 from PIL import Image
 import numpy as np
 
-from adversarial_eval import trajectory_displacement
+from adversarial_metrics import trajectory_displacement
 
 
 def _sanitize_lon_lat(coords):
@@ -51,7 +51,7 @@ def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_per
     plt.figure(figsize=(8,6))
     ax = plt.axes(projection=ccrs.PlateCarree())
     ax.set_global()
-    ax.set_extent([-180, 180, -90, 90], crs=ccrs.PlateCarree())
+    ax.set_extent([-20, 180, -10, 90], crs=ccrs.PlateCarree())
 
     # Higher-contrast map colors for better point visibility
     ax.set_facecolor('#1f2a38')
@@ -312,3 +312,61 @@ def plot_gps_trajectories_clean(gps_traj_source, gps_traj_perturbed, perturb_bud
         point_size=6,
     )
     
+    
+    
+#comprehensive evaluation plots:
+
+import os
+
+def plot_transferability_results(results_dir, attack_budgets, plot_dir, dataset_name, metric, results=None):
+	if results is None and results_dir is not None:
+		results = torch.load(os.path.join(results_dir, f"{dataset_name}_results_transferability.pt"))
+
+	plt.figure(figsize=(10,6))
+	for attack, res in results.items():
+		mean_metric = res.mean(dim=1)
+		std_metric = res.std(dim=1)
+		plt.plot(attack_budgets, mean_metric, label=attack)
+		plt.fill_between(attack_budgets, mean_metric-std_metric, mean_metric+std_metric, alpha=0.2)
+
+	plt.xlabel("Attack budget (eps)")
+	plt.ylabel(metric)
+	plt.title(f"Attack transferability evaluation on {dataset_name} dataset")
+	plt.legend()
+	if plot_dir is not None:
+		os.makedirs(plot_dir, exist_ok=True)
+		plt.savefig(os.path.join(plot_dir, f"{dataset_name}_transferability.png"))
+	else:
+		plt.show()
+ 
+  
+def plot_results(results_dir, attack_budgets, plot_dir, dataset_name, attack_types=None, attack_type=None, all_results=None, results=None, stored_metrics=["final_step_displacement", "final_loss"]):
+	# Support both old single-attack and new multi-attack signatures
+	if attack_types is None:
+		attack_types = [attack_type] if attack_type is not None else []
+	if all_results is None:
+		if results is not None:
+			all_results = {attack_types[0]: results}
+		elif results_dir is not None:
+			all_results = {}
+			for at in attack_types:
+				all_results[at] = torch.load(os.path.join(results_dir, f"{dataset_name}_{at}_results.pt"))
+
+	for metric in stored_metrics:
+		plt.figure(figsize=(10,6))
+		for at, res in all_results.items():
+			mean_metric = res[metric].mean(dim=1)
+			std_metric = res[metric].std(dim=1)
+			plt.plot(attack_budgets, mean_metric, label=at)
+			plt.fill_between(attack_budgets, mean_metric-std_metric, mean_metric+std_metric, alpha=0.2)
+		plt.xlabel("Attack budget (eps)")
+		plt.ylabel(metric)
+		plt.title(f"{metric} on {dataset_name} dataset")
+		plt.legend()
+		if plot_dir is not None:
+			os.makedirs(plot_dir, exist_ok=True)
+			suffix = '_'.join(attack_types)
+			plt.savefig(os.path.join(plot_dir, f"{dataset_name}_{suffix}_{metric}.png"))
+		else:
+			plt.show()
+		plt.close()

@@ -5,38 +5,12 @@ from typing import Any, Dict, List, Optional
 import torch
 import tqdm as tqdm
 from PIL import Image
-from adversarial_eval import (
+from adversarial_metrics import (
     evaluate_displacement_metrics,
     select_displacement_score,
 )
 
-
-def _prepare_source_tensor(source_image: Image.Image, pipeline, device: str) -> torch.Tensor:
-    """Convert a PIL image into normalized tensor expected by PLONK conditioning."""
-    return pipeline.cond_preprocessing.augmentation(source_image).unsqueeze(0).to(device)
-
-
-def _resolve_target_embedding(
-    pipeline,
-    device: str,
-    z_target: Optional[torch.Tensor] = None,
-    target_image: Optional[Image.Image] = None,
-) -> Optional[torch.Tensor]:
-    """Resolve target embedding from explicit tensor or target image; returns None for untargeted mode."""
-    if z_target is None and target_image is None:
-        return None
-
-    if z_target is not None:
-        return z_target.detach().to(device)
-
-    if target_image is None:
-        raise ValueError("target_image cannot be None when z_target is not provided")
-
-    target_tensor = _prepare_source_tensor(target_image, pipeline, device)
-    with torch.no_grad():
-        z_targ = pipeline.cond_preprocessing.emb_model(target_tensor)
-    return z_targ.detach()
-
+from adversarial_utils import (conditional_preprocessing, model_dependent_embedding)
 
 def _project_linf_(delta: torch.Tensor, eps_max: float) -> None:
     """In-place projection on the l_inf ball."""
@@ -48,9 +22,9 @@ def train_encoder_attack(
     pipeline,
     z_target: Optional[torch.Tensor] = None,
     target_image: Optional[Image.Image] = None,
-    num_steps: int = 100,
-    step_size: float = 0.1,
-    attack_size: float = 0.1,
+    n_steps: int = 100,
+    lr: float = 0.1,
+    eps_max: float = 0.1,
     device: str = "cuda",
     criterion_name: str = "MSE",
     l_z: float = 1.0,
@@ -84,36 +58,37 @@ def train_encoder_attack(
     pipeline.network.eval().requires_grad_(False)
     pipeline.cond_preprocessing.emb_model.train().requires_grad_(False)
 
-    source_tensor = _prepare_source_tensor(source_image, pipeline, device)
-    with torch.no_grad():
-        z_source = pipeline.cond_preprocessing.emb_model(source_tensor).detach()
-    z_target_resolved = _resolve_target_embedding(
-        pipeline=pipeline,
-        device=device,
-        z_target=z_target,
-        target_image=target_image,
-    )
-    attack_mode = "untargeted" if z_target_resolved is None else "targeted"
+    # source_tensor = _prepare_source_tensor(source_image, pipeline, device)
+    source_tensor = conditional_preprocessing(source_image, pipeline, device)
+
+    z_source= model_dependent_embedding(source_tensor, pipeline, track_grad=False).detach()
+    
+    target_tensor = conditional_preprocessing(target_image, pipeline, device) if target_image is not None else None
+    z_target = model_dependent_embedding(target_tensor, pipeline, track_grad=False).detach() if target_tensor is not None else None
+   
+    attack_mode = "untargeted" if z_target is None else "targeted"
 
     best_delta = None
-    best_history: List[Dict[str, float]] = []
+    best_history: List[float] = []
     best_restart = None
-    best_score = float("inf")
+    best_score = -float("inf")
     restart_summaries = []
+    best_metrics=None
 
     from adversarial_utils import add_perturbation_to_image
 
     for restart_idx in range(int(num_restarts)):
-        delta = torch.zeros_like(source_tensor, requires_grad=True)
-        optimizer = torch.optim.Adam([delta], lr=float(step_size))
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=int(num_steps))
+        delta = torch.empty_like(source_tensor).uniform_(-float(eps_max), float(eps_max))
+        delta.requires_grad_(True)
+        optimizer = torch.optim.Adam([delta], lr=float(lr))
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=int(n_steps))
 
-        history: List[Dict[str, float]] = []
-        step_iter = range(int(num_steps))
+        history: List[float] = []
+        step_iter = range(int(n_steps))
         pbar = None
         if show_progress:
             pbar = tqdm.trange(
-                int(num_steps),
+                int(n_steps),
                 desc=f"Encoder attack (restart {restart_idx + 1}/{int(num_restarts)})",
             )
             step_iter = pbar
@@ -122,10 +97,10 @@ def train_encoder_attack(
             optimizer.zero_grad(set_to_none=True)
 
             perturbed_tensor = source_tensor + delta
-            z_perturbed = pipeline.cond_preprocessing.emb_model(perturbed_tensor)
+            z_perturbed = model_dependent_embedding(perturbed_tensor, pipeline, track_grad=True)
 
             if attack_mode == "targeted":
-                loss_embed = torch.nn.functional.mse_loss(z_perturbed, z_target_resolved)
+                loss_embed = torch.nn.functional.mse_loss(z_perturbed, z_target)
                 signed_embed_term = float(l_z) * loss_embed
             else:
                 embed_l2 = torch.norm(z_perturbed - z_source, p=2, dim=-1).mean()
@@ -144,21 +119,12 @@ def train_encoder_attack(
             scheduler.step()
 
             with torch.no_grad():
-                _project_linf_(delta, attack_size)
+                _project_linf_(delta, eps_max)
 
-            row = {
-                "loss": float(loss.item()),
-                "loss_embed": float(loss_embed.item()),
-                "loss_recon": float(loss_recon.item()),
-            }
-            history.append(row)
+            history.append(float(loss.item()))
 
             if pbar is not None and (step + 1) % int(log_every) == 0:
-                pbar.set_postfix(
-                    loss=f"{row['loss']:.6f}",
-                    loss_embed=f"{row['loss_embed']:.6f}",
-                    loss_recon=f"{row['loss_recon']:.6f}",
-                )
+                pbar.set_postfix(loss=f"{loss.item():.6f}")
 
         perturbed_image = add_perturbation_to_image(source_image, delta.detach(), pipeline)
         generator = torch.Generator(device=device)
@@ -185,8 +151,8 @@ def train_encoder_attack(
             metric_name=restart_selection_metric,
         )
 
-        final_loss = float(history[-1]["loss"]) if history else float("inf")
-        min_loss = float(min(h["loss"] for h in history)) if history else float("inf")
+        final_loss = float(history[-1]) if history else float("inf")
+        min_loss = float(min(history)) if history else float("inf")
         summary = {
             "restart": restart_idx,
             "mean_step_displacement": float(mean_step_displacement),
@@ -212,6 +178,7 @@ def train_encoder_attack(
             best_delta = delta.detach().clone()
             best_history = history
             best_restart = restart_idx
+            best_metrics = metrics
 
     if best_delta is None or best_restart is None:
         raise RuntimeError("No restart produced a valid perturbation")
@@ -228,14 +195,15 @@ def train_encoder_attack(
         "delta": best_delta,
         "history": best_history,
         "source_tensor": source_tensor,
-        "z_target": z_target_resolved,
+        "z_target": z_target,
         "z_source": z_source,
         "best_restart": int(best_restart),
         "restart_summaries": restart_summaries,
+        "best_metrics": best_metrics,
         "config": {
-            "num_steps": int(num_steps),
-            "step_size": float(step_size),
-            "attack_size": float(attack_size),
+            "num_steps": int(n_steps),
+            "lr": float(lr),
+            "attack_size": float(eps_max),
             "criterion_name": criterion_name,
             "l_z": float(l_z),
             "l_x": float(l_x),

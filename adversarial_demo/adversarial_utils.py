@@ -61,3 +61,19 @@ def compute_embedding(image_tensor, batch_size, pipeline, device="cuda", track_g
         emb_single = outputs.last_hidden_state[:, 0]
     emb = emb_single.repeat(batch_size, 1)
     return emb
+
+
+def model_dependent_embedding(image_tensor, pipeline, track_grad=True):
+    if "YFCC" in pipeline.model_path or "iNaturalist" in pipeline.model_path:
+        if track_grad:
+            z_source = pipeline.cond_preprocessing.emb_model(image_tensor)
+        else:
+            with torch.no_grad():
+                z_source = pipeline.cond_preprocessing.emb_model(image_tensor)
+    else: #clip
+        if track_grad:
+            z_source = pipeline.cond_preprocessing.emb_model(image_tensor)["last_hidden_state"][:, 0]
+        else:
+            with torch.no_grad():
+                z_source = pipeline.cond_preprocessing.emb_model(pixel_values=image_tensor)["last_hidden_state"][:, 0]
+    return z_source

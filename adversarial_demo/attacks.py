@@ -1,11 +1,28 @@
 from __future__ import annotations
 
+import inspect
 from typing import Any, Dict, Optional, cast
 
 import numpy as np
 from PIL import Image
 
 from encoder_attacks import train_encoder_attack
+
+
+def _filter_kwargs_for(func, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+	"""Return a subset of *kwargs* that *func* actually accepts.
+
+	If *func* has a ``**kwargs`` catch-all, no filtering is done.
+	"""
+	sig = inspect.signature(func)
+	params = sig.parameters
+
+	# If the function already accepts **kwargs, pass everything through.
+	if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+		return dict(kwargs)
+
+	accepted = set(params.keys())
+	return {k: v for k, v in kwargs.items() if k in accepted}
 
 
 def train_diffusion_attack(
@@ -22,18 +39,19 @@ def train_diffusion_attack(
 	dot_product_loss: str = "squared",
 	reconstruction_loss_weight: float = 0.0,
 	num_restarts: int = 1,
-	attack_success_metric: str = "mean_step_displacement",
+	restart_selection_metric: str = "mean_step_displacement",
 	restart_eval_batch_size: int = 256,
 	restart_eval_cfg: float = 10.0,
 	restart_eval_num_steps: Optional[int] = None,
 	restart_eval_seed: int = 1234,
 	print_restart_results: bool = True,
+	show_progress: bool = True,
 	device: str = "cuda",
 ) -> Dict[str, Any]:
 	"""Thin wrapper around trajectory_deviation diffusion attack training."""
 	import trajectory_deviation as td
 
-	delta, history, source_tensor = td.train_diffusion_perturbation(
+	delta, history, source_tensor, best_metrics = td.train_diffusion_perturbation(
 		source_image=source_image,
 		pipeline=pipeline,
 		n_steps=n_steps,
@@ -47,12 +65,13 @@ def train_diffusion_attack(
 		dot_product_loss=dot_product_loss,
 		reconstruction_loss_weight=reconstruction_loss_weight,
 		num_restarts=num_restarts,
-		restart_selection_metric=attack_success_metric,
+		restart_selection_metric=restart_selection_metric,
 		restart_eval_batch_size=restart_eval_batch_size,
 		restart_eval_cfg=restart_eval_cfg,
 		restart_eval_num_steps=restart_eval_num_steps,
 		restart_eval_seed=restart_eval_seed,
 		print_restart_results=print_restart_results,
+		show_progress=show_progress,
 		device=device,
 	)
 
@@ -66,6 +85,7 @@ def train_diffusion_attack(
 		"source_tensor": source_tensor,
 		"final_loss": final_loss,
 		"min_loss": min_loss,
+		"best_metrics": best_metrics,
 		"config": {
 			"n_steps": int(n_steps),
 			"train_batch_size": int(train_batch_size),
@@ -77,7 +97,7 @@ def train_diffusion_attack(
 			"dot_product_loss": dot_product_loss,
 			"reconstruction_loss_weight": float(reconstruction_loss_weight),
 			"num_restarts": int(num_restarts),
-			"attack_success_metric": attack_success_metric,
+			"restart_selection_metric": restart_selection_metric,
 		},
 	}
 
@@ -86,17 +106,27 @@ def run_attack(
 	attack_type: str,
 	source_image: Image.Image,
 	pipeline,
+  	target_image = None,
+	silent: bool = False,
 	**kwargs,
 ) -> Dict[str, Any]:
 	"""
 	Run any supported attack from one API.
 
+	You can pass a superset of hyperparameters: only those accepted by the
+	chosen attack function will be forwarded (unrecognised keys are ignored).
+
 	Args:
 		attack_type: "encoder" or "diffusion".
 		source_image: PIL source image to attack.
 		pipeline: PLONK pipeline instance.
+		silent: If True, suppress all prints and progress bars from the attack.
 		**kwargs: forwarded to the corresponding attack function.
 	"""
+	if silent:
+		kwargs.setdefault("print_restart_results", False)
+		kwargs.setdefault("show_progress", False)
+
 	aliases = {
 		"encoder": "encoder",
 		"enc": "encoder",
@@ -110,14 +140,11 @@ def run_attack(
 		)
 
 	if normalized_type == "encoder":
-		metric_choice = kwargs.pop("attack_success_metric", kwargs.get("restart_selection_metric", "mean_step_displacement"))
-		kwargs["restart_selection_metric"] = metric_choice
-		return train_encoder_attack(source_image=source_image, pipeline=pipeline, **kwargs)
+		filtered = _filter_kwargs_for(train_encoder_attack, kwargs)
+		return train_encoder_attack(source_image=source_image, target_image=target_image, pipeline=pipeline, **filtered)
 
-	metric_choice = kwargs.pop("attack_success_metric", kwargs.get("restart_selection_metric", "mean_step_displacement"))
-	kwargs["attack_success_metric"] = metric_choice
-	kwargs.pop("restart_selection_metric", None)
-	return train_diffusion_attack(source_image=source_image, pipeline=pipeline, **kwargs)
+	filtered = _filter_kwargs_for(train_diffusion_attack, kwargs)
+	return train_diffusion_attack(source_image=source_image, pipeline=pipeline, **filtered)
 
 
 def run_attack_and_build_image(

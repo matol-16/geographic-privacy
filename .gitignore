@@ -179,3 +179,7 @@ plonk/datasets/
 /game/select.csv
 notebooks
 .streamlit
+
+
+
+# specific adversarial eval files
