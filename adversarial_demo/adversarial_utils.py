@@ -34,6 +34,8 @@ def tensor_to_pil(tensor: torch.Tensor):
 
 def conditional_preprocessing(source_image, pipeline, device="cuda"):
     if ("YFCC" in pipeline.model_path) or ("iNaturalist" in pipeline.model_path): #dinov2
+        if source_image.mode != "RGB":
+            source_image = source_image.convert("RGB")
         tensor = (
             pipeline.cond_preprocessing.augmentation(source_image)
             .unsqueeze(0)

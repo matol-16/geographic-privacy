@@ -51,7 +51,7 @@ def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_per
     plt.figure(figsize=(8,6))
     ax = plt.axes(projection=ccrs.PlateCarree())
     ax.set_global()
-    ax.set_extent([-20, 180, -10, 90], crs=ccrs.PlateCarree())
+    ax.set_extent([-180, 180, -90, 90], crs=ccrs.PlateCarree())
 
     # Higher-contrast map colors for better point visibility
     ax.set_facecolor('#1f2a38')
@@ -283,12 +283,15 @@ def plot_gps_trajectories_on_map(
         src_tensor = torch.from_numpy(src)
         per_tensor = torch.from_numpy(per)
         displacement = trajectory_displacement(src_tensor, per_tensor, metric=metric)
-        mean_disp = np.nanmean(displacement, axis=1)
-        var_disp = np.nanvar(displacement, axis=1)
-        std_disp = np.sqrt(var_disp)
+        displacement_np = displacement.detach().cpu().numpy()
+        mean_disp = np.nanmean(displacement_np, axis=1)
+        median_disp = np.nanmedian(displacement_np, axis=1)
+        q25_disp = np.nanquantile(displacement_np, 0.25, axis=1)
+        q75_disp = np.nanquantile(displacement_np, 0.75, axis=1)
         steps = np.arange(num_steps)
-        disp_ax.plot(steps, mean_disp, color='crimson', linewidth=1.8, label='Mean displacement')
-        disp_ax.fill_between(steps, np.maximum(mean_disp - std_disp, 0), mean_disp + std_disp, color='crimson', alpha=0.2, label='±1 std')
+        disp_ax.plot(steps, mean_disp, color='black', linewidth=1.2, linestyle='--', alpha=0.8, label='Mean displacement')
+        disp_ax.plot(steps, median_disp, color='crimson', linewidth=1.8, label='Median displacement')
+        disp_ax.fill_between(steps, q25_disp, q75_disp, color='crimson', alpha=0.2, label='IQR (25-75%)')
         disp_ax.set_title('Perturbation effect over steps', fontsize=12)
         disp_ax.set_xlabel('Step')
         disp_ax.set_ylabel(f'Displacement {metric}')
@@ -319,54 +322,172 @@ def plot_gps_trajectories_clean(gps_traj_source, gps_traj_perturbed, perturb_bud
 import os
 
 def plot_transferability_results(results_dir, attack_budgets, plot_dir, dataset_name, metric, results=None):
-	if results is None and results_dir is not None:
-		results = torch.load(os.path.join(results_dir, f"{dataset_name}_results_transferability.pt"))
+    # if results is None and results_dir is not None:
+    # 	results = torch.load(os.path.join(results_dir, f"{dataset_name}_results_transferability.pt"))
 
-	plt.figure(figsize=(10,6))
-	for attack, res in results.items():
-		mean_metric = res.mean(dim=1)
-		std_metric = res.std(dim=1)
-		plt.plot(attack_budgets, mean_metric, label=attack)
-		plt.fill_between(attack_budgets, mean_metric-std_metric, mean_metric+std_metric, alpha=0.2)
+    # plt.figure(figsize=(10,6))
+    # for attack, res in results.items():
+    # 	mean_metric = res.mean(dim=1)
+    # 	std_metric = res.std(dim=1)
+    # 	plt.plot(attack_budgets, mean_metric, label=attack)
+    # 	plt.fill_between(attack_budgets, mean_metric-std_metric, mean_metric+std_metric, alpha=0.2)
 
-	plt.xlabel("Attack budget (eps)")
-	plt.ylabel(metric)
-	plt.title(f"Attack transferability evaluation on {dataset_name} dataset")
-	plt.legend()
-	if plot_dir is not None:
-		os.makedirs(plot_dir, exist_ok=True)
-		plt.savefig(os.path.join(plot_dir, f"{dataset_name}_transferability.png"))
-	else:
-		plt.show()
+    # plt.xlabel("Attack budget (eps)")
+    # plt.ylabel(metric)
+    # plt.title(f"Attack transferability evaluation on {dataset_name} dataset")
+    # plt.legend()
+    # if plot_dir is not None:
+    # 	os.makedirs(plot_dir, exist_ok=True)
+    # 	plt.savefig(os.path.join(plot_dir, f"{dataset_name}_transferability.png"))
+    # else:
+    # 	plt.show()
+ 
+    #instead, for each attack budget, plot a boxplot of the metric for each attack type, to better show the distribution of the metric across samples and attacks, which is more informative for transferability evaluation
+    if results is None and results_dir is not None:
+        results = torch.load(os.path.join(results_dir, f"{dataset_name}_results_transferability.pt"))
+    data_to_plot = []
+    attack_labels = []
+    for attack, res in results.items():
+        for i, budget in enumerate(attack_budgets):
+            data_to_plot.append(res[i].cpu().numpy())
+            attack_labels.append(f"{attack} (eps={budget:.3f})")
+    plt.figure(figsize=(12,6))
+    plt.boxplot(data_to_plot, labels=attack_labels, showfliers=False)
+    plt.xticks(rotation=45, ha='right')
+    plt.ylabel(metric)
+    plt.title(f"Attack transferability evaluation on {dataset_name} dataset")
+    plt.tight_layout()
+    if plot_dir is not None:
+        os.makedirs(plot_dir, exist_ok=True)
+        plt.savefig(os.path.join(plot_dir, f"{dataset_name}_transferability_boxplot.png"))
+    else:
+        plt.show()
  
   
 def plot_results(results_dir, attack_budgets, plot_dir, dataset_name, attack_types=None, attack_type=None, all_results=None, results=None, stored_metrics=["final_step_displacement", "final_loss"]):
-	# Support both old single-attack and new multi-attack signatures
-	if attack_types is None:
-		attack_types = [attack_type] if attack_type is not None else []
-	if all_results is None:
-		if results is not None:
-			all_results = {attack_types[0]: results}
-		elif results_dir is not None:
-			all_results = {}
-			for at in attack_types:
-				all_results[at] = torch.load(os.path.join(results_dir, f"{dataset_name}_{at}_results.pt"))
+    # Support both old single-attack and new multi-attack signatures
+    if attack_types is None:
+        attack_types = [attack_type] if attack_type is not None else []
+    if all_results is None:
+        if results is not None:
+            all_results = {attack_types[0]: results}
+        elif results_dir is not None:
+            all_results = {}
+            for at in attack_types:
+                all_results[at] = torch.load(os.path.join(results_dir, f"{dataset_name}_{at}_results.pt"))
 
-	for metric in stored_metrics:
-		plt.figure(figsize=(10,6))
-		for at, res in all_results.items():
-			mean_metric = res[metric].mean(dim=1)
-			std_metric = res[metric].std(dim=1)
-			plt.plot(attack_budgets, mean_metric, label=at)
-			plt.fill_between(attack_budgets, mean_metric-std_metric, mean_metric+std_metric, alpha=0.2)
-		plt.xlabel("Attack budget (eps)")
-		plt.ylabel(metric)
-		plt.title(f"{metric} on {dataset_name} dataset")
-		plt.legend()
-		if plot_dir is not None:
-			os.makedirs(plot_dir, exist_ok=True)
-			suffix = '_'.join(attack_types)
-			plt.savefig(os.path.join(plot_dir, f"{dataset_name}_{suffix}_{metric}.png"))
-		else:
-			plt.show()
-		plt.close()
+    for metric in stored_metrics:
+        plt.figure(figsize=(10,6))
+        for at, res in all_results.items():
+            metric_values = res[metric]
+            mean_metric = metric_values.mean(dim=1)
+            median_metric = torch.median(metric_values, dim=1).values
+            q25_metric = torch.quantile(metric_values, 0.25, dim=1)
+            q75_metric = torch.quantile(metric_values, 0.75, dim=1)
+            plt.plot(attack_budgets, mean_metric, linestyle='--', alpha=0.8, label=f"{at} mean")
+            plt.plot(attack_budgets, median_metric, label=f"{at} median")
+            plt.fill_between(attack_budgets, q25_metric, q75_metric, alpha=0.2, label= f"{at} IQR (25-75%)")
+        plt.xlabel("Attack budget (out of 255)")
+        plt.ylabel("Final step displacement (km)")
+        
+        #add note about log scale on y axis + quantiles
+        
+        #x and y axis should be log scale
+        plt.xscale("log")
+        plt.yscale("log")
+        
+        
+        plt.xticks(attack_budgets, [f"{eps*255:.0f}" for eps in attack_budgets])
+        #replace y ticks with nice values (1km, 10km, 100km, 1000km, 10000km)
+        # plt.yticks([1, 10, 100, 1000, 10000], ["1 km", "10 km", "100 km", "1,000 km", "10,000 km"])
+                
+        #add grid
+        plt.grid(which="both", linestyle="--", linewidth=0.5, alpha=0.7)
+        
+        plt.title(f"{dataset_name} dataset")
+        plt.legend()
+        if plot_dir is not None:
+            os.makedirs(plot_dir, exist_ok=True)
+            suffix = '_'.join(attack_types)
+            plt.savefig(os.path.join(plot_dir, f"{dataset_name}_{suffix}_{metric}.png"))
+        else:
+            plt.show()
+        plt.close()
+        
+        
+def plot_attack_success_rate(results_dir, attack_budgets, plot_dir, dataset_name, threshold_km=2500,attack_types=None, attack_type=None, all_results=None, results=None):
+    """
+    Takes same input as plot_results, but plots attack success rate instead of metrics. Attack success is defined as the fraction of samples for which the final step displacement is above a certain threshold (e.g. 100km), which indicates a successful attack that significantly changes the predicted location.
+    
+    """
+    if attack_types is None:
+        attack_types = [attack_type] if attack_type is not None else []
+    if all_results is None:
+        if results is not None:
+            all_results = {attack_types[0]: results}
+        elif results_dir is not None:
+            all_results = {}
+            for at in attack_types:
+                all_results[at] = torch.load(os.path.join(results_dir, f"{dataset_name}_{at}_results.pt"))
+
+    plt.figure(figsize=(10,6))
+    for at, res in all_results.items():
+        final_disp = res["final_step_displacement"]
+        success_rate = (final_disp > threshold_km).float().mean(dim=1)
+        plt.plot(attack_budgets, success_rate.cpu().numpy(), label=at)
+    plt.xlabel("Attack budget (eps)")
+    plt.ylabel(f"Attack Success Rate (disp > {threshold_km} km)")
+    plt.title(f"Attack Success Rate on {dataset_name} dataset")
+    plt.legend()
+    if plot_dir is not None:
+        os.makedirs(plot_dir, exist_ok=True)
+        suffix = '_'.join(attack_types)
+        plt.savefig(os.path.join(plot_dir, f"{dataset_name}_{suffix}_attack_success_rate.png"))
+    else:
+        plt.show()
+    plt.close()
+
+def plot_localizability_results(results_dir, attack_budgets, plot_dir, dataset_name, results=None):
+    """_Used in evaluate_localizability in adversarial_eval.py
+    Plots for each attack type attack strength vs localizability for each attack and attack budet
+    We plot boxplots for each localizability bucket (low/med/high) and each attack budget, and we can have one plot per attack type or all attack types in the same plot with different colors.
+    """
+    
+    if results is None:
+        results = torch.load(os.path.join(results_dir, f"{dataset_name}_results_localizability.pt"))
+
+    #colors should be the same for each localizability bucket across attack budgets, so we can use a colormap with 3 colors for the 3 buckets
+    colors = colormaps['Set1'](np.linspace(0, 1, 3))
+    for attack in results["attack_results"]:
+        plt.figure()
+        for j, eps in enumerate(attack_budgets):
+            localizability = results["localizability"]
+            attack_strength = results["attack_results"][attack][j]
+            #bucket localizability into low/med/high based on quantiles
+            low_thresh = torch.quantile(localizability, 0.33)
+            high_thresh = torch.quantile(localizability, 0.66)
+            buckets = torch.zeros_like(localizability, dtype=torch.long)
+            buckets[localizability <= low_thresh] = 0
+            buckets[(localizability > low_thresh) & (localizability <= high_thresh)] = 1
+            buckets[localizability > high_thresh] = 2
+            
+            data_to_plot = [attack_strength[buckets == 0].numpy(), attack_strength[buckets == 1].numpy(), attack_strength[buckets == 2].numpy()]
+            
+            
+            for i in range(3):
+                plt.boxplot(data_to_plot[i], positions=[j*3 + i], widths=0.6, boxprops=dict(color=colors[i]), medianprops=dict(color='black'))
+        plt.xticks([0.5 + i*3 for i in range(len(attack_budgets))], [f"{eps:.4f}" for eps in attack_budgets])
+        plt.xlabel("Attack budget (eps)")
+        plt.ylabel("Attack strength (final step displacement)")
+        plt.title(f"Attack strength vs localizability for {attack} attack on {dataset_name}")
+        plt.legend(["Low localizability", "Medium localizability", "High localizability"])
+        
+        if plot_dir is not None:
+            os.makedirs(plot_dir, exist_ok=True)
+            plt.savefig(os.path.join(plot_dir, f"{dataset_name}_{attack}_localizability.png"))
+        else:
+            plt.show()
+        plt.close()
+        
+    
+    
