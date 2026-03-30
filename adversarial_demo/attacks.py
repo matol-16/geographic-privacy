@@ -1,28 +1,12 @@
 from __future__ import annotations
 
-import inspect
 from typing import Any, Dict, Optional, cast
 
 import numpy as np
 from PIL import Image
 
+from adversarial_utils import filter_kwargs_for
 from encoder_attacks import train_encoder_attack
-
-
-def _filter_kwargs_for(func, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-	"""Return a subset of *kwargs* that *func* actually accepts.
-
-	If *func* has a ``**kwargs`` catch-all, no filtering is done.
-	"""
-	sig = inspect.signature(func)
-	params = sig.parameters
-
-	# If the function already accepts **kwargs, pass everything through.
-	if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-		return dict(kwargs)
-
-	accepted = set(params.keys())
-	return {k: v for k, v in kwargs.items() if k in accepted}
 
 
 def train_diffusion_attack(
@@ -140,10 +124,10 @@ def run_attack(
 		)
 
 	if normalized_type == "encoder":
-		filtered = _filter_kwargs_for(train_encoder_attack, kwargs)
+		filtered = filter_kwargs_for(train_encoder_attack, kwargs)
 		return train_encoder_attack(source_image=source_image, target_image=target_image, pipeline=pipeline, **filtered)
 
-	filtered = _filter_kwargs_for(train_diffusion_attack, kwargs)
+	filtered = filter_kwargs_for(train_diffusion_attack, kwargs)
 	return train_diffusion_attack(source_image=source_image, pipeline=pipeline, **filtered)
 
 

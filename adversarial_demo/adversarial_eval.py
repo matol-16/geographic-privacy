@@ -27,9 +27,12 @@ import matplotlib.pyplot as plt
 
 from pipe_trajectory import PlonkPipelineTrajectory
 
-from adversarial_utils import add_perturbation_to_image
-
-from plots_adversarial_attacks import plot_results, plot_transferability_results, plot_localizability_results
+from adversarial_utils import (
+    add_perturbation_to_image,
+    expand_per_budget_kwargs,
+    resolve_torch_device,
+    run_paired_pipeline_with_shared_noise,
+)
 
 
 
@@ -113,6 +116,47 @@ def retrieve_osv_images(n_images_to_eval: int = 100, use_real_gps: bool = False)
         source_gps = [(float(s["latitude"]), float(s["longitude"])) for s in samples]
     print(f"Loaded {len(source_images)} images from OSV-5M test set.")
     return source_images, source_gps
+
+
+def _evaluate_single_attack_task(
+    attack_type,
+    budget_index: int,
+    image_index: int,
+    image,
+    pipeline,
+    attack_budgets,
+    attack_kwargs,
+    stored_metrics,
+    use_cuda_streams: bool,
+):
+    eps = attack_budgets[budget_index]
+    kwargs = dict(attack_kwargs[budget_index])
+    worker_device = str(kwargs.get("device", getattr(pipeline, "device", "cpu")))
+
+    if use_cuda_streams and worker_device.startswith("cuda") and torch.cuda.is_available():
+        stream = torch.cuda.Stream(device=worker_device)
+        with torch.cuda.stream(stream):
+            attack_result = run_attack(
+                attack_type=attack_type,
+                source_image=image,
+                pipeline=pipeline,
+                eps_max=eps,
+                silent=True,
+                **kwargs,
+            )
+        stream.synchronize()
+    else:
+        attack_result = run_attack(
+            attack_type=attack_type,
+            source_image=image,
+            pipeline=pipeline,
+            eps_max=eps,
+            silent=True,
+            **kwargs,
+        )
+
+    metric_values = {metric: float(attack_result["best_metrics"][metric]) for metric in stored_metrics}
+    return attack_type, budget_index, image_index, metric_values
   
 def evaluate_attack_on_dataset(
     attack_types,
@@ -162,37 +206,6 @@ def evaluate_attack_on_dataset(
 
     run_in_parallel = parallel_workers > 1
 
-    def _run_single_eval(task):
-        attack_type, j, i, image = task
-        eps = attack_budgets[j]
-        kwargs = dict(attack_kwargs[j])  # hyperparameters are specific to each attack budget
-        worker_device = str(kwargs.get("device", getattr(pipeline, "device", "cpu")))
-
-        if use_cuda_streams and worker_device.startswith("cuda") and torch.cuda.is_available():
-            stream = torch.cuda.Stream(device=worker_device)
-            with torch.cuda.stream(stream):
-                attack_result = run_attack(
-                    attack_type=attack_type,
-                    source_image=image,
-                    pipeline=pipeline,
-                    eps_max=eps,
-                    silent=True,
-                    **kwargs,
-                )
-            stream.synchronize()
-        else:
-            attack_result = run_attack(
-                attack_type=attack_type,
-                source_image=image,
-                pipeline=pipeline,
-                eps_max=eps,
-                silent=True,
-                **kwargs,
-            )
-
-        metric_values = {metric: float(attack_result["best_metrics"][metric]) for metric in stored_metrics}
-        return attack_type, j, i, metric_values
-
     if run_in_parallel:
         tasks = [
             (attack_type, j, i, source_image)
@@ -202,7 +215,21 @@ def evaluate_attack_on_dataset(
         ]
 
         with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-            futures = [executor.submit(_run_single_eval, task) for task in tasks]
+            futures = [
+                executor.submit(
+                    _evaluate_single_attack_task,
+                    attack_type,
+                    j,
+                    i,
+                    source_image,
+                    pipeline,
+                    attack_budgets,
+                    attack_kwargs,
+                    stored_metrics,
+                    use_cuda_streams,
+                )
+                for attack_type, j, i, source_image in tasks
+            ]
             for future in as_completed(futures):
                 attack_type, j, i, metric_values = future.result()
                 for metric in stored_metrics:
@@ -282,12 +309,7 @@ def evaluate_attack_transferability(
     if source_image is None:
         source_image = images[0]
 
-    if len(attack_kwargs) not in (1, len(attack_budgets)):
-        raise ValueError(
-            f"attack_kwargs must have length 1 or len(attack_budgets)={len(attack_budgets)}, got {len(attack_kwargs)}"
-        )
-    if len(attack_kwargs) == 1 and len(attack_budgets) > 1:
-        attack_kwargs = attack_kwargs * len(attack_budgets)
+    attack_kwargs = expand_per_budget_kwargs(attack_kwargs, len(attack_budgets))
 
     results = {attack: torch.zeros((len(attack_budgets), len(images))) for attack in attacks}
     total = len(attacks) * len(attack_budgets) * (1 + len(images))  # 1 train + N evals per (attack, budget)
@@ -309,22 +331,18 @@ def evaluate_attack_transferability(
             for i, img in enumerate(images):
                 perturbed_image = add_perturbation_to_image(img, best_delta, pipeline)
 
-                generator = torch.Generator(device="cuda")
-                generator.manual_seed(int(eval_seed) + attack_idx * 1_000_000 + j * 10_000 + i)
-                x_N = torch.randn(int(eval_batch_size), 3, device="cuda", generator=generator)
-
-                eval_kwargs = {
-                    "batch_size": int(eval_batch_size),
-                    "cfg": float(eval_cfg),
-                    "x_N": x_N,
-                    "return_trajectories": True,
-                }
-                if eval_num_steps is not None:
-                    eval_kwargs["num_steps"] = int(eval_num_steps)
-
-                _, traj_source = pipeline(img, **eval_kwargs)
-                _, traj_perturbed = pipeline(perturbed_image, **eval_kwargs)
-                metrics = evaluate_displacement_metrics(traj_source, traj_perturbed)
+                eval_device = resolve_torch_device(kwargs_j.get("device", getattr(pipeline, "device", "cpu")))
+                eval_result = run_paired_pipeline_with_shared_noise(
+                    pipeline=pipeline,
+                    source_image=img,
+                    perturbed_image=perturbed_image,
+                    batch_size=int(eval_batch_size),
+                    cfg=float(eval_cfg),
+                    num_steps=eval_num_steps,
+                    seed=int(eval_seed) + attack_idx * 1_000_000 + j * 10_000 + i,
+                    device=eval_device,
+                )
+                metrics = eval_result["metrics"]
                 results[attack][j, i] = metrics[metric]
                 pbar.set_postfix(attack=attack, eps=f"{eps:.4f}", image=f"{i+1}/{len(images)}")
                 pbar.update(1)
@@ -416,9 +434,9 @@ if __name__ == "__main__":
     # download_osv5m_test()
  
     device = "cuda"
- 
-    # attack_budgets = [1/255,2/255,5/255,10/255,15/255,20/255,25/255,30/255, 50/255]
-    attack_budgets = [2/255, 20/255, 50/255]
+    # attack_budgets = [1/255,2/255,5/255,10/255,20/255,30/255, 50/255] #yfcc
+    attack_budgets = [1/255,2/255,5/255,10/255,15/255,20/255,25/255,30/255, 50/255]
+    # attack_budgets = [2/255, 20/255, 50/255]
     train_args = [{"n_steps":80,
         "train_batch_size":256,
         "lr":1e-3,
@@ -432,7 +450,7 @@ if __name__ == "__main__":
         "restart_eval_cfg": 10.0,
         "device": device} for _ in range(len(attack_budgets))]
     
-    pipeline = PlonkPipelineTrajectory("nicolas-dufour/PLONK_OSV_5M_diffusion").to(device)	
+    # pipeline = PlonkPipelineTrajectory("nicolas-dufour/PLONK_OSV_5M_diffusion").to(device)	
     # pipeline = PlonkPipelineTrajectory("nicolas-dufour/PLONK_YFCC_diffusion").to(device)
 
     # evaluate_attack_on_dataset(
@@ -467,15 +485,24 @@ if __name__ == "__main__":
     #     results=None
     # )
     
-    evaluate_attack_transferability(
-        source_image=None,
-        pipeline=pipeline,
-        dataset_name="yfcc",
-        attacks=["diffusion", "encoder"],
-        n_images_to_eval=100,
-        attack_kwargs=train_args,
-        metric="final_step_displacement",
+    # evaluate_attack_transferability(
+    #     source_image=None,
+    #     pipeline=pipeline,
+    #     dataset_name="osv",
+    #     attacks=["diffusion", "encoder"],
+    #     n_images_to_eval=100,
+    #     attack_kwargs=train_args,
+    #     metric="final_step_displacement",
+    #     results_dir="./results",
+    #     plot_dir="./plots",
+    # )
+    
+    plot_attack_success_rate(
         results_dir="./results",
+        attack_budgets=attack_budgets,
         plot_dir="./plots",
+        dataset_name="osv",
+        attack_types=["encoder", "diffusion"],
+        threshold_km=[500,1000,1500,2500]
     )
  

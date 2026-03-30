@@ -6,11 +6,15 @@ import torch
 import tqdm as tqdm
 from PIL import Image
 from adversarial_metrics import (
-    evaluate_displacement_metrics,
     select_displacement_score,
 )
 
-from adversarial_utils import (conditional_preprocessing, model_dependent_embedding)
+from adversarial_utils import (
+    add_perturbation_to_image,
+    conditional_preprocessing,
+    model_dependent_embedding,
+    run_paired_pipeline_with_shared_noise,
+)
 
 def _project_linf_(delta: torch.Tensor, eps_max: float) -> None:
     """In-place projection on the l_inf ball."""
@@ -75,8 +79,6 @@ def train_encoder_attack(
     restart_summaries = []
     best_metrics=None
 
-    from adversarial_utils import add_perturbation_to_image
-
     for restart_idx in range(int(num_restarts)):
         delta = torch.empty_like(source_tensor).uniform_(-float(eps_max), float(eps_max))
         delta.requires_grad_(True)
@@ -127,22 +129,17 @@ def train_encoder_attack(
                 pbar.set_postfix(loss=f"{loss.item():.6f}")
 
         perturbed_image = add_perturbation_to_image(source_image, delta.detach(), pipeline)
-        generator = torch.Generator(device=device)
-        generator.manual_seed(int(restart_eval_seed) + restart_idx)
-        x_n = torch.randn(int(restart_eval_batch_size), 3, device=device, generator=generator)
-
-        eval_kwargs = {
-            "batch_size": int(restart_eval_batch_size),
-            "cfg": float(restart_eval_cfg),
-            "x_N": x_n,
-            "return_trajectories": True,
-        }
-        if restart_eval_num_steps is not None:
-            eval_kwargs["num_steps"] = int(restart_eval_num_steps)
-
-        _, traj_source = pipeline(source_image, **eval_kwargs)
-        _, traj_perturbed = pipeline(perturbed_image, **eval_kwargs)
-        metrics = evaluate_displacement_metrics(traj_source, traj_perturbed)
+        eval_result = run_paired_pipeline_with_shared_noise(
+            pipeline=pipeline,
+            source_image=source_image,
+            perturbed_image=perturbed_image,
+            batch_size=int(restart_eval_batch_size),
+            cfg=float(restart_eval_cfg),
+            num_steps=restart_eval_num_steps,
+            seed=int(restart_eval_seed) + restart_idx,
+            device=device,
+        )
+        metrics = eval_result["metrics"]
         mean_step_displacement = metrics["mean_step_displacement"]
         final_step_displacement = metrics["final_step_displacement"]
         score = select_displacement_score(

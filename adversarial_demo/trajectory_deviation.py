@@ -12,7 +12,12 @@ from adversarial_metrics import (
     select_displacement_score,
     mean_final_prediction_distance,
 )
-from adversarial_utils import conditional_preprocessing, compute_embedding
+from adversarial_utils import (
+    add_perturbation_to_image,
+    conditional_preprocessing,
+    compute_embedding,
+    run_paired_pipeline_with_shared_noise,
+)
 
 ############################################################################################
 # Attempt 1 training pipeline: universal perturbation on a single source image
@@ -115,8 +120,6 @@ def train_diffusion_perturbation(
     best_restart = None
     best_metrics=None
 
-    from adversarial_utils import add_perturbation_to_image
-
     for restart_idx in range(int(num_restarts)):
         # Universal perturbation parameter (fresh start at each restart)
         delta = torch.zeros_like(source_tensor, requires_grad=True)
@@ -209,23 +212,17 @@ def train_diffusion_perturbation(
 
         # Evaluate restart quality on trajectory displacement with a shared initial noise.
         perturbed_image = add_perturbation_to_image(source_image, delta.detach(), pipeline)
-        generator = torch.Generator(device=device)
-        generator.manual_seed(int(restart_eval_seed) + restart_idx)
-        x_N = torch.randn(int(restart_eval_batch_size), 3, device=device, generator=generator)
-
-        eval_kwargs = {
-            "batch_size": int(restart_eval_batch_size),
-            "cfg": float(restart_eval_cfg),
-            "x_N": x_N,
-            "return_trajectories": True,
-        }
-        if restart_eval_num_steps is not None:
-            eval_kwargs["num_steps"] = int(restart_eval_num_steps)
-
-        _, traj_source = pipeline(source_image, **eval_kwargs)
-        _, traj_perturbed = pipeline(perturbed_image, **eval_kwargs)
-
-        metrics = evaluate_displacement_metrics(traj_source, traj_perturbed)
+        eval_result = run_paired_pipeline_with_shared_noise(
+            pipeline=pipeline,
+            source_image=source_image,
+            perturbed_image=perturbed_image,
+            batch_size=int(restart_eval_batch_size),
+            cfg=float(restart_eval_cfg),
+            num_steps=restart_eval_num_steps,
+            seed=int(restart_eval_seed) + restart_idx,
+            device=device,
+        )
+        metrics = eval_result["metrics"]
         mean_displacement = metrics["mean_step_displacement"]
         final_displacement = metrics["final_step_displacement"]
         score = select_displacement_score(
@@ -468,45 +465,21 @@ def run_diffusion_hparam_search(
             )
 
             # Build a perturbed image and evaluate perturbation effect on trajectories.
-            from adversarial_utils import add_perturbation_to_image
-
             perturbed_image = add_perturbation_to_image(source_image, delta, pipeline)
-            gen = torch.Generator(device=device)
-            gen.manual_seed(int(eval_seed) + trial_index * 1000 + restart_idx)
-            x_N = torch.randn(eval_batch_size, 3, device=device, generator=gen)
-
-            if eval_num_steps is None:
-                gps_source_eval, traj_source = pipeline(
-                    source_image,
-                    batch_size=eval_batch_size,
-                    cfg=eval_cfg,
-                    x_N=x_N.clone(),
-                    return_trajectories=True,
-                )
-                gps_perturbed_eval, traj_perturbed = pipeline(
-                    perturbed_image,
-                    batch_size=eval_batch_size,
-                    cfg=eval_cfg,
-                    x_N=x_N.clone(),
-                    return_trajectories=True,
-                )
-            else:
-                gps_source_eval, traj_source = pipeline(
-                    source_image,
-                    batch_size=eval_batch_size,
-                    cfg=eval_cfg,
-                    x_N=x_N.clone(),
-                    num_steps=eval_num_steps,
-                    return_trajectories=True,
-                )
-                gps_perturbed_eval, traj_perturbed = pipeline(
-                    perturbed_image,
-                    batch_size=eval_batch_size,
-                    cfg=eval_cfg,
-                    x_N=x_N.clone(),
-                    num_steps=eval_num_steps,
-                    return_trajectories=True,
-                )
+            eval_result = run_paired_pipeline_with_shared_noise(
+                pipeline=pipeline,
+                source_image=source_image,
+                perturbed_image=perturbed_image,
+                batch_size=eval_batch_size,
+                cfg=eval_cfg,
+                num_steps=eval_num_steps,
+                seed=int(eval_seed) + trial_index * 1000 + restart_idx,
+                device=device,
+            )
+            gps_source_eval = eval_result["gps_source"]
+            gps_perturbed_eval = eval_result["gps_perturbed"]
+            traj_source = eval_result["traj_source"]
+            traj_perturbed = eval_result["traj_perturbed"]
 
             if eval_metric == "mean_perturbation_effect_over_steps":
                 effect_score = compute_mean_perturbation_effect_over_steps(traj_source, traj_perturbed)
