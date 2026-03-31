@@ -1,7 +1,9 @@
+import os
+import torch
 from adversarial_eval import evaluate_attack_on_dataset, evaluate_attack_transferability
 from pipe_trajectory import PlonkPipelineTrajectory
-from plots_adversarial_attacks import plot_results
-from adversarial_eval import evaluate_localizability, plot_localizability_results
+from plots_adversarial_attacks import plot_results, plot_localizability_results
+from adversarial_eval import evaluate_localizability
 
 if __name__ == "__main__":
     # download_osv5m_test()
@@ -28,7 +30,7 @@ if __name__ == "__main__":
         "device": device} for _ in range(len(attack_budgets))]
     
     # pipeline = PlonkPipelineTrajectory("nicolas-dufour/PLONK_OSV_5M_diffusion").to(device)	
-    pipeline = PlonkPipelineTrajectory("nicolas-dufour/PLONK_YFCC_diffusion").to(device)
+    # pipeline = PlonkPipelineTrajectory("nicolas-dufour/PLONK_YFCC_diffusion").to(device)
 
     # evaluate_attack_on_dataset(
     #     attack_types=["encoder", "diffusion"],
@@ -43,22 +45,28 @@ if __name__ == "__main__":
     #     use_real_gps=False,
     # )
     
-    evaluate_localizability(
-        attack_types=["encoder", "diffusion"],
-        dataset_name="yfcc",
-        pipeline=pipeline, 
-        n_images_to_eval=100,
-        attack_budgets=attack_budgets,
-        attack_kwargs=train_args,
-        results_dir="./results",
-        plot_dir="./plots",
-    )
-    
-    # plot_localizability_results(
+    # evaluate_localizability(
+    #     attack_types=["encoder", "diffusion"],
+    #     dataset_name="yfcc",
+    #     pipeline=pipeline, 
+    #     n_images_to_eval=100,
+    #     attack_budgets=attack_budgets,
+    #     attack_kwargs=train_args,
     #     results_dir="./results",
-    #     attack_budgets=attack_budgets[0:2],
     #     plot_dir="./plots",
-    #     dataset_name="osv",
-    #     results=None
     # )
+    
+    attack_budget = 20/255
+    results_attack_budgets = [2/255, 20/255, 50/255]
+    results_dir = "./results"
+    all_datasets_results = {
+        ds: torch.load(os.path.join(results_dir, f"{ds}_results_localizability.pt"))
+        for ds in ["yfcc", "osv"]
+    }
+    plot_localizability_results(
+        attack_budgets=attack_budget,
+        plot_dir="./plots",
+        all_datasets_results=all_datasets_results,
+        results_attack_budgets=results_attack_budgets,
+    )
  

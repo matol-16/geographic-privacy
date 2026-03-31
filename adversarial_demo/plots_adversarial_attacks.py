@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 from matplotlib import colormaps
+from matplotlib.patches import Patch
 import cartopy.crs as ccrs
 import cartopy.feature as cfeature
 from torchvision import transforms
@@ -357,6 +358,8 @@ def plot_transferability_results(results_dir, attack_budgets, plot_dir, dataset_
     plt.ylabel(metric)
     plt.title(f"Attack transferability evaluation on {dataset_name} dataset")
     plt.tight_layout()
+    plt.xticks(attack_budgets, [f"{eps*255:.0f}" for eps in attack_budgets])
+
     if plot_dir is not None:
         os.makedirs(plot_dir, exist_ok=True)
         plt.savefig(os.path.join(plot_dir, f"{dataset_name}_transferability_boxplot.png"))
@@ -377,18 +380,19 @@ def plot_results(results_dir, attack_budgets, plot_dir, dataset_name, attack_typ
                 all_results[at] = torch.load(os.path.join(results_dir, f"{dataset_name}_{at}_results.pt"))
 
     for metric in stored_metrics:
-        plt.figure(figsize=(10,6))
+        plt.figure(figsize=(10,8))
         for at, res in all_results.items():
             metric_values = res[metric]
             mean_metric = metric_values.mean(dim=1)
             median_metric = torch.median(metric_values, dim=1).values
             q25_metric = torch.quantile(metric_values, 0.25, dim=1)
             q75_metric = torch.quantile(metric_values, 0.75, dim=1)
-            plt.plot(attack_budgets, mean_metric, linestyle='--', alpha=0.8, label=f"{at} mean")
-            plt.plot(attack_budgets, median_metric, label=f"{at} median")
-            plt.fill_between(attack_budgets, q25_metric, q75_metric, alpha=0.2, label= f"{at} IQR (25-75%)")
+            attack_name = "DTD" if at.lower() == "diffusion" else "encoder"
+            plt.plot(attack_budgets, mean_metric, linestyle='--', alpha=1.0,linewidth=3.0, label=f"{attack_name} mean")
+            # plt.plot(attack_budgets, median_metric, label=f"{at} median")
+            plt.fill_between(attack_budgets, q25_metric, q75_metric, alpha=0.3, label= f"{at} IQR (25-75%)")
         plt.xlabel("Attack budget (out of 255)")
-        plt.ylabel("Final step displacement (km)")
+        # plt.ylabel("Final step displacement (km)")
         
         #add note about log scale on y axis + quantiles
         
@@ -399,13 +403,13 @@ def plot_results(results_dir, attack_budgets, plot_dir, dataset_name, attack_typ
         
         plt.xticks(attack_budgets, [f"{eps*255:.0f}" for eps in attack_budgets])
         #replace y ticks with nice values (1km, 10km, 100km, 1000km, 10000km)
-        # plt.yticks([1, 10, 100, 1000, 10000], ["1 km", "10 km", "100 km", "1,000 km", "10,000 km"])
+        plt.yticks([1000, 2500,5000,10000], ["1,000 km", "2500 km","5,000 km", "10,000 km"], rotation = 90, va='center')  # Rotate y-tick labels for better readability
                 
         #add grid
         plt.grid(which="both", linestyle="--", linewidth=0.5, alpha=0.7)
         
         plt.title(f"{dataset_name} dataset")
-        plt.legend()
+        plt.legend(fontsize="x-large", markerscale=2)
         if plot_dir is not None:
             os.makedirs(plot_dir, exist_ok=True)
             suffix = '_'.join(attack_types)
@@ -429,16 +433,97 @@ def plot_attack_success_rate(results_dir, attack_budgets, plot_dir, dataset_name
             all_results = {}
             for at in attack_types:
                 all_results[at] = torch.load(os.path.join(results_dir, f"{dataset_name}_{at}_results.pt"))
+    if all_results is None:
+        raise ValueError("No results available to plot. Provide results/all_results or a valid results_dir.")
 
-    plt.figure(figsize=(10,6))
-    for at, res in all_results.items():
+    if isinstance(threshold_km, (int, float, np.integer, np.floating)):
+        thresholds = [float(threshold_km)]
+    else:
+        thresholds = np.asarray(threshold_km, dtype=np.float64).reshape(-1).tolist()
+    if len(thresholds) == 0:
+        raise ValueError("threshold_km list cannot be empty")
+
+    # Ensure higher thresholds are rendered darker, regardless of input order.
+    thresholds = sorted(set(thresholds))
+    
+    linewidths= np.linspace(0.5,3, len(thresholds))
+
+    def _darken_rgba(color_rgba, factor):
+        import matplotlib.colors as mcolors
+        rgb = np.asarray(mcolors.to_rgb(color_rgba))
+        rgb = np.clip(rgb * factor, 0.0, 1.0)
+        return (rgb[0], rgb[1], rgb[2], 1.0)
+
+    plt.figure(figsize=(10, 8))
+    attack_names = list(all_results.keys())
+    # Use fixed qualitative colors so the first two attacks are clearly distinct (blue, red).
+    attack_palette = [
+        '#1f77b4',  # blue
+        '#ff7f0e',  # orange
+        '#d62728',  # red
+        '#2ca02c',  # green
+        '#9467bd',  # purple
+        '#8c564b',  # brown
+    ]
+
+    for attack_index, (at, res) in enumerate(all_results.items()):
+        base_color = attack_palette[attack_index % len(attack_palette)]
         final_disp = res["final_step_displacement"]
-        success_rate = (final_disp > threshold_km).float().mean(dim=1)
-        plt.plot(attack_budgets, success_rate.cpu().numpy(), label=at)
-    plt.xlabel("Attack budget (eps)")
-    plt.ylabel(f"Attack Success Rate (disp > {threshold_km} km)")
+
+        success_curves = []
+        for t in thresholds:
+            success_rate = (final_disp > t).float().mean(dim=1).cpu().numpy()
+            success_curves.append(success_rate)
+
+        success_curves = np.asarray(success_curves)
+        if success_curves.shape[0] > 1:
+            low_curve = np.min(success_curves, axis=0)
+            high_curve = np.max(success_curves, axis=0)
+            plt.fill_between(
+                attack_budgets,
+                low_curve,
+                high_curve,
+                color=base_color,
+                alpha=0.30,
+                linewidth=0,
+            )
+
+        n_thresholds = len(thresholds)
+        threshold_linestyles = ['solid', 'dashed', 'dashdot', 'dotted', (0, (3, 1, 1, 1, 1, 1))]
+        for threshold_index, t in enumerate(thresholds):
+            if n_thresholds == 1:
+                shade_factor = 0.85
+            else:
+                # Highest threshold gets the darkest shade.
+                shade_factor = 1.0 - 0.55 * (threshold_index / (n_thresholds - 1))
+            line_color = _darken_rgba(base_color, shade_factor)
+            linestyle = threshold_linestyles[threshold_index % len(threshold_linestyles)]
+            
+            attack_name = "DTD" if at.lower() == "diffusion" else "encoder"
+
+            plt.plot(
+                attack_budgets,
+                success_curves[threshold_index],
+                color=line_color,
+                linewidth=linewidths[threshold_index],
+                linestyle=linestyle,
+                alpha=0.95,
+                label=f"{attack_name} > {t:.0f} km",
+            )
+
+    plt.xlabel("Attack budget out of 255 (log scale))")
+    # if len(thresholds) == 1:
+    #     plt.ylabel(f"Attack Success Rate (disp > {thresholds[0]:.0f} km)")
+    # else:
+    #     plt.ylabel("Attack Success Rate")
     plt.title(f"Attack Success Rate on {dataset_name} dataset")
-    plt.legend()
+    # plt.ylim(0.0, 1.0)
+    plt.grid(alpha=0.25, linestyle='--', linewidth=0.6)
+    plt.legend(ncol=2, fontsize='x-large')
+    plt.xscale("log")
+    plt.xticks(attack_budgets, [f"{eps*255:.0f}" for eps in attack_budgets])
+
+
     if plot_dir is not None:
         os.makedirs(plot_dir, exist_ok=True)
         suffix = '_'.join(attack_types)
@@ -447,47 +532,122 @@ def plot_attack_success_rate(results_dir, attack_budgets, plot_dir, dataset_name
         plt.show()
     plt.close()
 
-def plot_localizability_results(results_dir, attack_budgets, plot_dir, dataset_name, results=None):
-    """_Used in evaluate_localizability in adversarial_eval.py
-    Plots for each attack type attack strength vs localizability for each attack and attack budet
-    We plot boxplots for each localizability bucket (low/med/high) and each attack budget, and we can have one plot per attack type or all attack types in the same plot with different colors.
-    """
-    
-    if results is None:
-        results = torch.load(os.path.join(results_dir, f"{dataset_name}_results_localizability.pt"))
+def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, results_attack_budgets):
+    """Produces a 2×2 grid: rows = datasets, columns = attacks.
 
-    #colors should be the same for each localizability bucket across attack budgets, so we can use a colormap with 3 colors for the 3 buckets
+    Args:
+        attack_budgets: single float (or length-1 iterable) — the budget to plot.
+        plot_dir: directory to save the figure, or None to show interactively.
+        all_datasets_results: dict[dataset_name -> results] with two entries.
+        results_attack_budgets: list of budgets used when running evaluate_localizability,
+            used to map ``attack_budgets`` to the correct row index in the results tensors.
+    """
+
+    if isinstance(attack_budgets, (int, float, np.integer, np.floating)):
+        selected_budget = float(attack_budgets)
+    else:
+        budgets_arr = np.asarray(attack_budgets, dtype=np.float64).reshape(-1)
+        if budgets_arr.size != 1:
+            raise ValueError("plot_localizability_results expects a single budget (float)")
+        selected_budget = float(budgets_arr[0])
+
+    budget_arr = np.asarray(results_attack_budgets, dtype=np.float64).reshape(-1)
+    budget_idx = int(np.argmin(np.abs(budget_arr - selected_budget)))
+    if not np.isclose(budget_arr[budget_idx], selected_budget, rtol=1e-4):
+        raise ValueError(
+            f"Budget {selected_budget:.6f} not found in results_attack_budgets "
+            f"{[f'{b:.6f}' for b in budget_arr]}. Closest is {budget_arr[budget_idx]:.6f}."
+        )
+
+    bucket_names = ["Low", "Medium", "High"]
     colors = colormaps['Set1'](np.linspace(0, 1, 3))
-    for attack in results["attack_results"]:
-        plt.figure()
-        for j, eps in enumerate(attack_budgets):
-            localizability = results["localizability"]
-            attack_strength = results["attack_results"][attack][j]
-            #bucket localizability into low/med/high based on quantiles
-            low_thresh = torch.quantile(localizability, 0.33)
-            high_thresh = torch.quantile(localizability, 0.66)
-            buckets = torch.zeros_like(localizability, dtype=torch.long)
-            buckets[localizability <= low_thresh] = 0
-            buckets[(localizability > low_thresh) & (localizability <= high_thresh)] = 1
-            buckets[localizability > high_thresh] = 2
-            
-            data_to_plot = [attack_strength[buckets == 0].numpy(), attack_strength[buckets == 1].numpy(), attack_strength[buckets == 2].numpy()]
-            
-            
-            for i in range(3):
-                plt.boxplot(data_to_plot[i], positions=[j*3 + i], widths=0.6, boxprops=dict(color=colors[i]), medianprops=dict(color='black'))
-        plt.xticks([0.5 + i*3 for i in range(len(attack_budgets))], [f"{eps:.4f}" for eps in attack_budgets])
-        plt.xlabel("Attack budget (eps)")
-        plt.ylabel("Attack strength (final step displacement)")
-        plt.title(f"Attack strength vs localizability for {attack} attack on {dataset_name}")
-        plt.legend(["Low localizability", "Medium localizability", "High localizability"])
-        
-        if plot_dir is not None:
-            os.makedirs(plot_dir, exist_ok=True)
-            plt.savefig(os.path.join(plot_dir, f"{dataset_name}_{attack}_localizability.png"))
-        else:
-            plt.show()
-        plt.close()
-        
-    
+    y_tick_values = [1000, 2500, 5000, 10000]
+    y_tick_labels = ["1,000 km", "2,500 km", "5,000 km", "10,000 km"]
+
+    def _get_buckets(res):
+        loc = res["localizability"].detach().cpu()
+        low_t = torch.quantile(loc, 0.33)
+        high_t = torch.quantile(loc, 0.66)
+        b = torch.zeros_like(loc, dtype=torch.long)
+        b[(loc > low_t) & (loc <= high_t)] = 1
+        b[loc > high_t] = 2
+        return b
+
+    def _get_attack_strength(res, attack):
+        t = res["attack_results"][attack].detach().cpu()
+        if t.ndim == 1:
+            return t
+        if t.ndim == 2:
+            return t[budget_idx]
+        raise ValueError(f"Unexpected tensor shape {tuple(t.shape)} for attack '{attack}'")
+
+    def _fill_ax(ax, res, attack, row_label=None):
+        buckets = _get_buckets(res)
+        strength = _get_attack_strength(res, attack)
+        data = [strength[buckets == k].numpy() for k in range(3)]
+        box = ax.boxplot(
+            data,
+            positions=np.arange(3),
+            widths=0.9,
+            showfliers=False,
+            patch_artist=True,
+            medianprops=dict(color='black', linewidth=1.5),
+        )
+        for i, patch in enumerate(box['boxes']):
+            patch.set_facecolor(colors[i])
+            patch.set_edgecolor(colors[i])
+            patch.set_alpha(0.5)
+        attack_name = "DTD" if attack.lower() == "diffusion" else "Encoder"
+        ax.set_title(f"{attack_name} attack")
+        # ax.set_xlabel(f"Budget = {selected_budget * 255:.0f}/255")
+        ax.set_xticks(np.arange(3))
+        ax.set_xticklabels(bucket_names)
+        ax.grid(axis='y', linestyle='--', linewidth=0.5, alpha=0.7)
+        if row_label is not None:
+            ax.set_ylabel(f"{row_label}")
+        return np.concatenate([v for v in data if len(v) > 0]) if any(len(v) > 0 for v in data) else np.array([])
+
+    dataset_names = list(all_datasets_results.keys())
+    attacks = list(next(iter(all_datasets_results.values()))["attack_results"].keys())
+    n_rows = len(dataset_names)
+    n_cols = len(attacks)
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 4 * n_rows), sharey='row')
+    axes = np.atleast_2d(axes)
+
+    all_values = []
+    for r, ds in enumerate(dataset_names):
+        res = all_datasets_results[ds]
+        ds_name = "YFCC4K" if ds == "yfcc" else "OSV-5M"
+
+        for c, attack in enumerate(attacks):
+            ax = axes[r, c]
+            vals = _fill_ax(ax, res, attack, row_label=ds_name if c == 0 else None)
+            all_values.append(vals)
+
+    flat = np.concatenate([v for v in all_values if v.size > 0]) if any(v.size > 0 for v in all_values) else np.array([])
+    if flat.size > 0 and np.nanmax(flat) >= y_tick_values[0]:
+        for r in range(n_rows):
+            axes[r, 0].set_yticks(y_tick_values)
+            axes[r, 0].set_yticklabels(y_tick_labels, rotation=90, va='center')
+            axes[r,0].set_yscale('log')
+    legend_handles = [
+        Patch(facecolor=colors[i], edgecolor=colors[i], alpha=0.5, label=f"{bucket_names[i]} localizability")
+        for i in range(3)
+    ]
+    fig.legend(handles=legend_handles, loc='upper center', ncol=3, frameon=False, bbox_to_anchor=(0.5, 1.02))
+    # fig.suptitle(f"Attack strength vs localizability — budget = {selected_budget * 255:.0f}/255", y=1.05)
+    fig.tight_layout()
+
+    if plot_dir is not None:
+        os.makedirs(plot_dir, exist_ok=True)
+        plt.savefig(
+            os.path.join(plot_dir, f"localizability_budget_{selected_budget * 255:.0f}.png"),
+            bbox_inches='tight',
+        )
+    else:
+        plt.show()
+    plt.close(fig)
+
+
     

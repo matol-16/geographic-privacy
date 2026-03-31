@@ -10,7 +10,7 @@ if __name__ == "__main__":
     attack_budgets = [1/255,2/255,5/255,10/255,20/255,30/255, 50/255]
     # attack_budgets = [2/255,25/255]
     
-    attack_budgets = [1/255,2/255,5/255,10/255,15/255,20/255,25/255,30/255, 50/255]
+    # attack_budgets = [1/255,2/255,5/255,10/255,15/255,20/255,25/255,30/255, 50/255]
 
     
     train_args = [{"n_steps":60,
@@ -27,7 +27,7 @@ if __name__ == "__main__":
         "device": device} for _ in range(len(attack_budgets))]
     
     # pipeline = PlonkPipelineTrajectory("nicolas-dufour/PLONK_OSV_5M_diffusion").to(device)	
-    pipeline = PlonkPipelineTrajectory("nicolas-dufour/PLONK_YFCC_diffusion").to(device)
+    # pipeline = PlonkPipelineTrajectory("nicolas-dufour/PLONK_YFCC_diffusion").to(device)
 
     # evaluate_attack_on_dataset(
     # 	attack_types=["diffusion"],
@@ -44,16 +44,16 @@ if __name__ == "__main__":
     # 	use_real_gps=False,
     # )
  
-    #plot all attacks together
+    # #plot all attacks together
     plot_results(
         results_dir="./results",
         attack_budgets=attack_budgets,
         plot_dir="./plots",
-        dataset_name="osv",
+        dataset_name="yfcc",
         attack_types=["encoder", "diffusion"],
         all_results=None,
         stored_metrics=["final_step_displacement"])
- 
+    
 
     # evaluate_attack_transferability(
     # 	source_image=source_image,

@@ -419,13 +419,11 @@ def evaluate_localizability(
         os.makedirs(results_dir, exist_ok=True)
         torch.save(results, os.path.join(results_dir, f"{dataset_name}_results_localizability.pt"))
 
-    #plot results
-    plot_localizability_results(
-        results_dir=results_dir,
-        attack_budgets=attack_budgets,
-        plot_dir=plot_dir,
-        dataset_name=dataset_name,
-        results=results)
+    # #plot results
+    # plot_localizability_results(
+    #     attack_budgets=attack_budgets,
+    #     plot_dir=plot_dir,
+    #     all_datasets_results==results)
     
     
 
