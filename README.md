@@ -39,7 +39,7 @@ It is organized as follows ($\dagger$ specifies if the given code was coded with
 
 
 **Code used**:
-- *adversarial_eval.py* implements the code to evaluate our attacks on YFCC4K and OSV-5M.
+- *adversarial_eval.py $\dagger$* implements the code to evaluate our attacks on YFCC4K and OSV-5M.
 - *adversarial_metrics.py* and *adversarial_utils.py* provide basic functions sued throughout our code. The metrics implemented are the ones described in section 4 of our report
 - *attacks.py* coordinates the attack scripts, which are contained in *encoder_attacks.py* and *trajectory_attacks.py* for Encoder and Diffusion Trajectory Deviation respectively. It provides a single method to evaluate both attacks on an image.
 - *pipe_trajectory* implements a hereditary class of *Plonk*'s *PlonkPipeline* class, which returns diffusion trajectories when calling the pipeline. This allowed testing our attack's effect on whole trajectories, not just predicted locations.
