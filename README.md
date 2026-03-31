@@ -26,7 +26,9 @@ pip install -e .
 
 ## Code structure
 
-As mentioned above, all the new code in is *adversarial_demo*. It is organized as follows:
+As mentioned above, all the new code in is *adversarial_demo*. 
+
+It is organized as follows ($\dagger$ specifies if the given code was coded with the help of an AI coding assistant):
 
 **Evaluation scripts**:
 - *eval_notebook_attacks.ipynb* is a simple notebook that allows testing our adversarial framework on an image saved in plonk/.media
@@ -39,8 +41,8 @@ As mentioned above, all the new code in is *adversarial_demo*. It is organized a
 - *adversarial_metrics.py* and *adversarial_utils.py* provide basic functions sued throughout our code. The metrics implemented are the ones described in section 4 of our report
 - *attacks.py* coordinates the attack scripts, which are contained in *encoder_attacks.py* and *trajectory_attacks.py* for Encoder and Diffusion Trajectory Deviation respectively. It provides a single method to evaluate both attacks on an image.
 - *pipe_trajectory* implements a hereditary class of *Plonk*'s *PlonkPipeline* class, which returns diffusion trajectories when calling the pipeline. This allowed testing our attack's effect on whole trajectories, not just predicted locations.
-- *plots_adversarial_attacks.py* provides the functions to plot the figures that present the results of attack evaluationsin the paper.
-- *build_yfcc4k_from_revisiting_im2gps.py* allows downloading the YFCC4K dataset (only needs to run once)
+- *plots_adversarial_attacks.py $\dagger$* provides the functions to plot the figures that present the results of attack evaluationsin the paper.
+- *build_yfcc4k_from_revisiting_im2gps.py $\dagger$* allows downloading the YFCC4K dataset (only needs to run once)
 
 **Others**
 - Evaluation results are stored in the *results* folder. One can run directly our plotting methods that retrieve stored results.
