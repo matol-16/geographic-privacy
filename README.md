@@ -11,7 +11,7 @@ It is aimed at researching adversarial methods to prevent images from being loca
 
 All the new contributions are in the the *adversarial_demo* folder, which is added at the root of the *plonk* project.
 
-The [project paper](geographic-privacy/adversarial_demo/Geographic privacy paper.pdf) and [poster](Attacking geolocation - Thorel Ollu - poster.pdf) are also in the *adversarial_demo* folder.
+The project paper and poster are also in the *adversarial_demo* folder.
 
 Occasional additions are made to the requirements.txt file.
 
