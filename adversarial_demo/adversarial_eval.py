@@ -36,7 +36,7 @@ from adversarial_utils import (
 
 
 
-def load_osv5m_test(local_dir="datasets/osv5m"):
+def load_osv5m_test(local_dir: str = "Data/mathias.ollu/hf_cache/datasets//osv5m"):
     #only download if the data is not already present
     if os.path.exists(os.path.join(local_dir, "images", "test")) and \
        any(os.path.isdir(os.path.join(local_dir, "images", "test", d)) for d in os.listdir(os.path.join(local_dir, "images", "test"))):
@@ -53,7 +53,13 @@ def load_osv5m_test(local_dir="datasets/osv5m"):
                 z.extractall(img_dir)
     return
 
-def retrieve_yfcc_images(n_images_to_eval: int = 100, use_real_gps: bool = False, local_dir: str = "datasets/YFCC100M/yfcc4k"):
+def retrieve_yfcc_images(
+    n_images_to_eval: int = 100,
+    use_real_gps: bool = False,
+    local_dir: Optional[str] = None,
+):
+    if local_dir is None:
+        local_dir = "/Data/mathias.ollu/hf_cache/datasets/YFCC100M/yfcc4k"
     info_path = os.path.join(local_dir, "info.txt")
     img_dir = os.path.join(local_dir, "images")
     if not os.path.exists(info_path):
@@ -83,8 +89,13 @@ def retrieve_yfcc_images(n_images_to_eval: int = 100, use_real_gps: bool = False
     return source_images, source_gps
 
 
-def retrieve_osv_images(n_images_to_eval: int = 100, use_real_gps: bool = False):
-    local_dir = "datasets/osv5m"
+def retrieve_osv_images(
+    n_images_to_eval: int = 100,
+    use_real_gps: bool = False,
+    local_dir: Optional[str] = None,
+):
+    if local_dir is None:
+        local_dir = "Data/mathias.ollu/hf_cache/datasets/osv5m"
     load_osv5m_test(local_dir=local_dir)  # download & extract if needed
 
     # Load test metadata from CSV
@@ -132,6 +143,7 @@ def evaluate_attack_on_dataset(
     attack_kwargs: list[Dict[str, Any]] = [{}],
     parallel_workers: int = 1,
     use_cuda_streams: bool = True,
+    dataset_roots: Optional[Dict[str, str]] = None,
 ):
     """
         Evaluate one or more attacks on images from a test dataset.
@@ -146,6 +158,10 @@ def evaluate_attack_on_dataset(
             **kwargs: forwarded to the corresponding attack function.
     """
     from core import EvaluationConfig, EvaluationRunner, run_evaluation
+
+    dataset_roots = dataset_roots or {}
+    results_dir = results_dir or "/results"
+    plot_dir = plot_dir or "/plots"
     
     if isinstance(attack_types, str):
         attack_types = [attack_types]
@@ -206,6 +222,7 @@ def evaluate_attack_transferability(
     eval_cfg: float = 10.0,
     eval_num_steps: Optional[int] = None,
     eval_seed: int = 1234,
+    dataset_roots: Optional[Dict[str, str]] = None,
 ):
     """
         Evaluates the transferability of an attack. It trains a perturbation on a source_image,
@@ -215,10 +232,18 @@ def evaluate_attack_transferability(
         NOTE: This evaluation is NOT supported through the CLI (main.py).
         It is kept here for direct Python API usage.
     """
+    dataset_roots = dataset_roots or {}
+
     if dataset_name == "osv":
-        images, source_gps = retrieve_osv_images(n_images_to_eval=n_images_to_eval)
+        images, source_gps = retrieve_osv_images(
+            n_images_to_eval=n_images_to_eval,
+            local_dir=dataset_roots.get("osv"),
+        )
     elif dataset_name == "yfcc":
-        images, source_gps = retrieve_yfcc_images(n_images_to_eval=n_images_to_eval)
+        images, source_gps = retrieve_yfcc_images(
+            n_images_to_eval=n_images_to_eval,
+            local_dir=dataset_roots.get("yfcc"),
+        )
     else:
         raise ValueError(f"Unknown dataset_name={dataset_name}. Expected one of ['osv', 'yfcc']")
 
@@ -289,6 +314,7 @@ def evaluate_localizability(
     results_dir: Optional[str] = "/results",
     attack_budgets: list[float] = [2/255, 15/255, 50/255],
     attack_kwargs: list[Dict[str, Any]] = [{}],
+    dataset_roots: Optional[Dict[str, str]] = None,
 ):
     """ 
     Evaluates how strong an attack is depending on the localizability of the source image.
@@ -298,12 +324,15 @@ def evaluate_localizability(
     This evaluation is done for each attack type and attack budget, to see if some attacks are more effective on low-localizability images than others, and if this trend is stronger for higher attack budgets.
     """
     from core import EvaluationConfig, EvaluationRunner, sequential_evaluate_attacks, ImageLoader
+
+    dataset_roots = dataset_roots or {}
     
     # Load images
     print(f"Loading {n_images_to_eval} images from {dataset_name} dataset...")
     source_images, source_gps = ImageLoader.load_images(
         dataset=dataset_name,
         n_images=n_images_to_eval,
+        dataset_roots=dataset_roots,
     )
     
     # Normalize attack_kwargs
@@ -319,6 +348,8 @@ def evaluate_localizability(
     pbar.close()
     
     # Run evaluation using standard config
+    results_dir = results_dir or "/results"
+    plot_dir = plot_dir or "/plots"
     config = EvaluationConfig(
         dataset=dataset_name,
         attack_types=attack_types,
@@ -420,6 +451,6 @@ if __name__ == "__main__":
         plot_dir="./plots",
         dataset_name="osv",
         attack_types=["encoder", "diffusion"],
-        threshold_km=[25,200,750,2500]
+        threshold_km=2500,
     )
  

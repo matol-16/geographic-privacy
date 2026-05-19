@@ -166,8 +166,9 @@ def run_paired_pipeline_with_shared_noise(
     if num_steps is not None:
         eval_kwargs["num_steps"] = int(num_steps)
 
-    gps_source, traj_source = pipeline(source_image, **eval_kwargs)
-    gps_perturbed, traj_perturbed = pipeline(perturbed_image, **eval_kwargs)
+    with torch.inference_mode():
+        gps_source, traj_source = pipeline(source_image, **eval_kwargs)
+        gps_perturbed, traj_perturbed = pipeline(perturbed_image, **eval_kwargs)
     metrics = evaluate_displacement_metrics(traj_source, traj_perturbed)
 
     return {

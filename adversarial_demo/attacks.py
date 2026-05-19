@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import torch
 from PIL import Image
@@ -11,6 +11,66 @@ from PIL import Image
 from adversarial_utils import filter_kwargs_for, add_perturbation_to_image, resolve_torch_device
 from encoder_attacks import EncoderAttack
 from trajectory_deviation import DiffusionAttack
+
+
+def _run_restartable_attack(
+	attack,
+	attack_type: str,
+	optimizer_fn: Callable[[list], torch.optim.Optimizer],
+	show_progress: bool,
+	early_stopping_patience: int,
+	restart_eval_batch_size: int,
+	restart_eval_cfg: float,
+	restart_eval_num_steps: Optional[int],
+	restart_eval_seed: int,
+	num_restart_workers: int,
+	finalize_kwargs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+	"""Train, evaluate, and select the best restart for a restartable attack."""
+	finalize_kwargs = finalize_kwargs or {}
+
+	def run_single_restart(restart_idx: int):
+		"""Run one restart end-to-end."""
+		delta, history = attack.train_restart(
+			restart_idx=restart_idx,
+			n_steps=attack.n_steps,
+			optimizer_fn=optimizer_fn,
+			show_progress=show_progress,
+			early_stopping_patience=early_stopping_patience,
+		)
+
+		eval_result = attack.evaluate_restart(
+			delta=delta,
+			restart_idx=restart_idx,
+			batch_size=restart_eval_batch_size,
+			cfg=restart_eval_cfg,
+			num_steps=restart_eval_num_steps,
+			seed=restart_eval_seed,
+		)
+
+		return restart_idx, delta, history, eval_result["metrics"]
+
+	if num_restart_workers > 1:
+		with ThreadPoolExecutor(max_workers=num_restart_workers) as executor:
+			results = list(executor.map(run_single_restart, range(attack.restart_manager.num_restarts)))
+		for restart_idx, delta, history, metrics in results:
+			attack.restart_manager.update_best(
+				restart_idx=restart_idx,
+				delta=delta,
+				history=history,
+				metrics=metrics,
+			)
+	else:
+		for restart_idx in range(attack.restart_manager.num_restarts):
+			restart_idx, delta, history, metrics = run_single_restart(restart_idx)
+			attack.restart_manager.update_best(
+				restart_idx=restart_idx,
+				delta=delta,
+				history=history,
+				metrics=metrics,
+			)
+
+	return attack.finalize_result(attack_type=attack_type, **finalize_kwargs)
 
 
 def run_attack(
@@ -118,57 +178,22 @@ def _run_encoder_attack(
 	)
 	attack.restart_manager.print_results = print_restart_results
 	
-	def run_single_restart(restart_idx):
-		"""Helper: run training and evaluation for a single restart."""
-		delta, history = attack.train_restart(
-			restart_idx=restart_idx,
-			n_steps=n_steps,
-			optimizer_fn=lambda params: torch.optim.Adam(params, lr=lr),
-			show_progress=show_progress,
-			early_stopping_patience=early_stopping_patience,
-		)
-		
-		eval_result = attack.evaluate_restart(
-			delta=delta,
-			restart_idx=restart_idx,
-			batch_size=restart_eval_batch_size,
-			cfg=restart_eval_cfg,
-			num_steps=restart_eval_num_steps,
-			seed=restart_eval_seed,
-		)
-		
-		return restart_idx, delta, history, eval_result["metrics"]
-	
-	# Run restarts (parallel or sequential based on num_restart_workers)
-	if num_restart_workers > 1:
-		# Parallel execution
-		with ThreadPoolExecutor(max_workers=num_restart_workers) as executor:
-			results = list(executor.map(run_single_restart, range(attack.restart_manager.num_restarts)))
-		
-		# Update restart_manager sequentially with results (maintains order and thread safety)
-		for restart_idx, delta, history, metrics in results:
-			attack.restart_manager.update_best(
-				restart_idx=restart_idx,
-				delta=delta,
-				history=history,
-				metrics=metrics,
-			)
-	else:
-		# Sequential execution
-		for restart_idx in range(attack.restart_manager.num_restarts):
-			restart_idx, delta, history, metrics = run_single_restart(restart_idx)
-			attack.restart_manager.update_best(
-				restart_idx=restart_idx,
-				delta=delta,
-				history=history,
-				metrics=metrics,
-			)
-	
-	return attack.finalize_result(
+	return _run_restartable_attack(
+		attack=attack,
 		attack_type="encoder",
-		attack_mode=attack.attack_mode,
-		z_source=attack.z_source,
-		z_target=attack.z_target,
+		optimizer_fn=lambda params: torch.optim.Adam(params, lr=lr),
+		show_progress=show_progress,
+		early_stopping_patience=early_stopping_patience,
+		restart_eval_batch_size=restart_eval_batch_size,
+		restart_eval_cfg=restart_eval_cfg,
+		restart_eval_num_steps=restart_eval_num_steps,
+		restart_eval_seed=restart_eval_seed,
+		num_restart_workers=num_restart_workers,
+		finalize_kwargs={
+			"attack_mode": attack.attack_mode,
+			"z_source": attack.z_source,
+			"z_target": attack.z_target,
+		},
 	)
 
 
@@ -232,53 +257,18 @@ def _run_diffusion_attack(
 	)
 	attack.restart_manager.print_results = print_restart_results
 	
-	def run_single_restart(restart_idx):
-		"""Helper: run training and evaluation for a single restart."""
-		delta, history = attack.train_restart(
-			restart_idx=restart_idx,
-			n_steps=n_steps,
-			optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
-			show_progress=show_progress,
-			early_stopping_patience=early_stopping_patience,
-		)
-		
-		eval_result = attack.evaluate_restart(
-			delta=delta,
-			restart_idx=restart_idx,
-			batch_size=restart_eval_batch_size,
-			cfg=restart_eval_cfg,
-			num_steps=restart_eval_num_steps,
-			seed=restart_eval_seed,
-		)
-		
-		return restart_idx, delta, history, eval_result["metrics"]
-	
-	# Run restarts (parallel or sequential based on num_restart_workers)
-	if num_restart_workers > 1:
-		# Parallel execution
-		with ThreadPoolExecutor(max_workers=num_restart_workers) as executor:
-			results = list(executor.map(run_single_restart, range(attack.restart_manager.num_restarts)))
-		
-		# Update restart_manager sequentially with results (maintains order and thread safety)
-		for restart_idx, delta, history, metrics in results:
-			attack.restart_manager.update_best(
-				restart_idx=restart_idx,
-				delta=delta,
-				history=history,
-				metrics=metrics,
-			)
-	else:
-		# Sequential execution
-		for restart_idx in range(attack.restart_manager.num_restarts):
-			restart_idx, delta, history, metrics = run_single_restart(restart_idx)
-			attack.restart_manager.update_best(
-				restart_idx=restart_idx,
-				delta=delta,
-				history=history,
-				metrics=metrics,
-			)
-	
-	return attack.finalize_result(attack_type="diffusion")
+	return _run_restartable_attack(
+		attack=attack,
+		attack_type="diffusion",
+		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
+		show_progress=show_progress,
+		early_stopping_patience=early_stopping_patience,
+		restart_eval_batch_size=restart_eval_batch_size,
+		restart_eval_cfg=restart_eval_cfg,
+		restart_eval_num_steps=restart_eval_num_steps,
+		restart_eval_seed=restart_eval_seed,
+		num_restart_workers=num_restart_workers,
+	)
 
 
 def run_attack_and_build_image(

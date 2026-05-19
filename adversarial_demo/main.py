@@ -33,15 +33,29 @@ from plots_adversarial_attacks import (
     plot_results,
     plot_attack_success_rate,
 )
-from adversarial_utils import expand_per_budget_kwargs
 
 
-def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
+DEFAULT_RESULTS_DIR = Path(__file__).with_name("results")
+DEFAULT_PLOTS_DIR = Path(__file__).with_name("plots")
+DEFAULT_ATTACK_TYPES = ["encoder", "diffusion"]
+DEFAULT_STORED_METRICS = ["final_step_displacement"]
+DEFAULT_SUCCESS_RATE_THRESHOLDS = [200, 750, 2500]
+
+
+def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     """Load YAML configuration file."""
-    if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Config file not found: {config_path}")
+    config_file = Path(config_path) if config_path is not None else DEFAULT_CONFIG_PATH
+
+    if not config_file.is_absolute() and not config_file.exists():
+        candidate = DEFAULT_CONFIG_PATH.parent / config_file
+        if candidate.exists():
+            config_file = candidate
+
+    if not config_file.exists():
+        raise FileNotFoundError(f"Config file not found: {config_file}")
     
-    with open(config_path, "r") as f:
+    with open(config_file, "r") as f:
         config = yaml.safe_load(f)
     
     return config
@@ -92,6 +106,25 @@ def parse_override_arg(arg: str) -> tuple[str, Any]:
     return key, value
 
 
+def get_nested_config(config: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    """Read a nested configuration value with a fallback."""
+    current: Any = config
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def pick_value(arg_value: Any, config_value: Any, default: Any) -> Any:
+    """Prefer CLI input, then config, then a final fallback."""
+    if arg_value is not None:
+        return arg_value
+    if config_value is not None:
+        return config_value
+    return default
+
+
 def get_device(config: Dict[str, Any]) -> str:
     """Get device from config, defaulting to cuda if available."""
     device = config.get("device", "cuda")
@@ -116,46 +149,40 @@ def get_pipeline(config: Dict[str, Any], dataset: str) -> PlonkPipelineTrajector
     return pipeline
 
 
-def expand_attack_kwargs(
+def get_attack_kwargs(
     config: Dict[str, Any],
     dataset: str,
-    attack_budgets: List[float],
 ) -> List[Dict[str, Any]]:
-    """
-    Expand attack training arguments to match the number of attack budgets.
-    
-    Takes the baseline attack config and replicates it for each budget, adding device.
-    """
+    """Return the base attack kwargs for the selected dataset."""
     device = get_device(config)
     
     base_kwargs = config.get("attack_train_args", {}).get(dataset, {})
     base_kwargs = dict(base_kwargs)  # Make a copy
     base_kwargs["device"] = device
     
-    # Expand to match number of budgets
-    return expand_per_budget_kwargs([base_kwargs], len(attack_budgets))
+    return [base_kwargs]
 
 
 def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
     """Execute evaluate-dataset command."""
     # Get parameters from args or config
-    dataset = args.dataset or config.get("dataset", "yfcc")
-    attack_types = args.attack_types or config.get("attack_types", ["encoder", "diffusion"])
-    n_images = args.n_images or config.get("n_images_to_eval", 100)
-    parallel_workers = args.parallel_workers or config.get("parallel_workers", 1)
+    dataset = pick_value(args.dataset, config.get("dataset"), "yfcc")
+    attack_types = pick_value(args.attack_types, config.get("attack_types"), DEFAULT_ATTACK_TYPES)
+    n_images = pick_value(args.n_images, config.get("n_images_to_eval"), 100)
+    parallel_workers = pick_value(args.parallel_workers, config.get("parallel_workers"), 1)
     
     attack_budgets = config.get("attack_budgets", {}).get(dataset)
     if not attack_budgets:
         raise ValueError(f"No attack budgets configured for dataset: {dataset}")
     
-    results_dir = args.results_dir or config.get("results_dir", "./results")
-    plots_dir = args.plots_dir or config.get("plots_dir", "./plots")
+    results_dir = pick_value(args.results_dir, config.get("results_dir"), str(DEFAULT_RESULTS_DIR))
+    plots_dir = pick_value(args.plots_dir, config.get("plots_dir"), str(DEFAULT_PLOTS_DIR))
     
     # Get pipeline
     pipeline = get_pipeline(config, dataset)
     
     # Expand attack kwargs
-    attack_kwargs = expand_attack_kwargs(config, dataset, attack_budgets)
+    attack_kwargs = get_attack_kwargs(config, dataset)
     
     print(f"\n{'='*60}")
     print(f"Evaluating attacks on {dataset.upper()} dataset")
@@ -174,15 +201,21 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
         pipeline=pipeline,
         dataset_name=dataset,
         source_image=None,
-        use_real_gps=args.use_real_gps,
+        use_real_gps=pick_value(args.use_real_gps, config.get("use_real_gps"), False),
         n_images_to_eval=n_images,
         plot_dir=plots_dir,
         results_dir=results_dir,
         attack_budgets=attack_budgets,
-        stored_metrics=config.get("plot", {}).get("stored_metrics", ["final_step_displacement"]),
+        stored_metrics=get_nested_config(
+            config,
+            "plot",
+            "stored_metrics",
+            default=DEFAULT_STORED_METRICS,
+        ),
         attack_kwargs=attack_kwargs,
         parallel_workers=parallel_workers,
-        use_cuda_streams=config.get("use_cuda_streams", True),
+        use_cuda_streams=bool(config.get("use_cuda_streams", True)),
+        dataset_roots=config.get("data_dirs", {}),
     )
     
     print(f"\nEvaluation complete! Results saved to: {results_dir}")
@@ -192,22 +225,22 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
 def cmd_evaluate_localizability(args, config: Dict[str, Any]) -> None:
     """Execute evaluate-localizability command."""
     # Get parameters from args or config
-    dataset = args.dataset or config.get("dataset", "yfcc")
-    attack_types = args.attack_types or config.get("attack_types", ["encoder", "diffusion"])
-    n_images = args.n_images or config.get("n_images_to_eval", 100)
+    dataset = pick_value(args.dataset, config.get("dataset"), "yfcc")
+    attack_types = pick_value(args.attack_types, config.get("attack_types"), DEFAULT_ATTACK_TYPES)
+    n_images = pick_value(args.n_images, config.get("n_images_to_eval"), 100)
     
     attack_budgets = config.get("attack_budgets", {}).get(dataset)
     if not attack_budgets:
         raise ValueError(f"No attack budgets configured for dataset: {dataset}")
     
-    results_dir = args.results_dir or config.get("results_dir", "./results")
-    plots_dir = args.plots_dir or config.get("plots_dir", "./plots")
+    results_dir = pick_value(args.results_dir, config.get("results_dir"), str(DEFAULT_RESULTS_DIR))
+    plots_dir = pick_value(args.plots_dir, config.get("plots_dir"), str(DEFAULT_PLOTS_DIR))
     
     # Get pipeline
     pipeline = get_pipeline(config, dataset)
     
     # Expand attack kwargs
-    attack_kwargs = expand_attack_kwargs(config, dataset, attack_budgets)
+    attack_kwargs = get_attack_kwargs(config, dataset)
     
     print(f"\n{'='*60}")
     print(f"Evaluating localizability on {dataset.upper()} dataset")
@@ -229,6 +262,7 @@ def cmd_evaluate_localizability(args, config: Dict[str, Any]) -> None:
         results_dir=results_dir,
         attack_budgets=attack_budgets,
         attack_kwargs=attack_kwargs,
+        dataset_roots=config.get("data_dirs", {}),
     )
     
     print(f"\nEvaluation complete! Results saved to: {results_dir}")
@@ -237,10 +271,10 @@ def cmd_evaluate_localizability(args, config: Dict[str, Any]) -> None:
 
 def cmd_plot(args, config: Dict[str, Any]) -> None:
     """Execute plot command."""
-    plot_type = args.plot_type or "results"
-    dataset = args.dataset or config.get("dataset", "yfcc")
-    results_dir = args.results_dir or config.get("results_dir", "./results")
-    plots_dir = args.plots_dir or config.get("plots_dir", "./plots")
+    plot_type = pick_value(args.plot_type, config.get("plot_type"), "results")
+    dataset = pick_value(args.dataset, config.get("dataset"), "yfcc")
+    results_dir = pick_value(args.results_dir, config.get("results_dir"), str(DEFAULT_RESULTS_DIR))
+    plots_dir = pick_value(args.plots_dir, config.get("plots_dir"), str(DEFAULT_PLOTS_DIR))
     
     # Ensure plots directory exists
     os.makedirs(plots_dir, exist_ok=True)
@@ -257,7 +291,7 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         if not attack_budgets:
             raise ValueError(f"No attack budgets configured for dataset: {dataset}")
         
-        attack_types = args.attack_types or config.get("attack_types", ["encoder", "diffusion"])
+        attack_types = pick_value(args.attack_types, config.get("attack_types"), DEFAULT_ATTACK_TYPES)
         
         print(f"Plotting results for attacks: {attack_types}")
         
@@ -268,7 +302,12 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
             dataset_name=dataset,
             attack_types=attack_types,
             all_results=None,
-            stored_metrics=config.get("plot", {}).get("stored_metrics", ["final_step_displacement"]),
+            stored_metrics=get_nested_config(
+                config,
+                "plot",
+                "stored_metrics",
+                default=DEFAULT_STORED_METRICS,
+            ),
         )
     
     elif plot_type == "success-rate":
@@ -276,7 +315,12 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         if not attack_budgets:
             raise ValueError(f"No attack budgets configured for dataset: {dataset}")
         
-        thresholds = config.get("plot", {}).get("attack_success_rate_thresholds", [200, 750, 2500])
+        thresholds = get_nested_config(
+            config,
+            "plot",
+            "attack_success_rate_thresholds",
+            default=DEFAULT_SUCCESS_RATE_THRESHOLDS,
+        )
         
         print(f"Plotting attack success rates with distance thresholds: {thresholds} km")
         
@@ -360,8 +404,8 @@ Examples:
     # Global arguments
     parser.add_argument(
         "--config",
-        default="config.yaml",
-        help="Path to config file (default: config.yaml)",
+        default=str(DEFAULT_CONFIG_PATH),
+        help=f"Path to config file (default: {DEFAULT_CONFIG_PATH})",
     )
     parser.add_argument(
         "--override",
@@ -396,6 +440,7 @@ Examples:
     eval_dataset.add_argument(
         "--use-real-gps",
         action="store_true",
+        default=None,
         help="Use real GPS coordinates from dataset instead of clean predictions",
     )
     eval_dataset.add_argument(

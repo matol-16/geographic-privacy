@@ -6,13 +6,25 @@ device: "cuda"
 # Dataset configuration
 dataset: "yfcc" # Options: "yfcc" or "osv"
 n_images_to_eval: 100
+data_root: "/Data/mathias.ollu/hf_cache/datasets"
+data_dirs:
+  yfcc: "/Data/mathias.ollu/hf_cache/datasets/YFCC100M/yfcc4k"
+  osv: "/Data/mathias.ollu/hf_cache/datasets/osv5m"
+
+# Dataset builder configuration
+build_yfcc4k:
+  yfcc_dirname: "YFCC100M"
+  downloads_dirname: "downloads"
+  dataset_dirname: "yfcc4k"
+  images_zip_name: "yfcc4k.zip"
+  imagedata_txt_name: "0aaaa.r.imagedata.txt"
 
 # Evaluation directories
-results_dir: "./results"
-plots_dir: "./plots"
+results_dir: "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results_1905"
+plots_dir: "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/plots_1905"
 
 # Parallel processing
-parallel_workers: 1
+parallel_workers: 4
 use_cuda_streams: true
 
 # Pipeline models per dataset
@@ -22,7 +34,8 @@ pipelines:
 
 # Attack budgets (epsilon values) per dataset
 attack_budgets:
-  yfcc: [0.00392, 0.00784, 0.01961, 0.03922, 0.07843, 0.11765, 0.19608] # [1/255, 2/255, 5/255, 10/255, 20/255, 30/255, 50/255]
+  # yfcc: [0.00392, 0.00784, 0.01961, 0.03922, 0.07843, 0.11765, 0.19608] # [1/255, 2/255, 5/255, 10/255, 20/255, 30/255, 50/255]
+  yfcc: [0.01961]
   osv: [
       0.00392,
       0.00784,

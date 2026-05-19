@@ -5,6 +5,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+import yaml
 from PIL import Image
 from tqdm import tqdm
 
@@ -12,6 +13,42 @@ from tqdm import tqdm
 #urls retrieved from https://github.com/lugiavn/revisiting-im2gps?tab=readme-ov-file
 IMAGES_PAGE_URL = "http://www.mediafire.com/file/3og8y3o6c9de3ye/yfcc4k.zip"
 METADATA_PAGE_URL = "http://www.mediafire.com/file/8v2j565997i5jed/0aaaa.r.imagedata.txt"
+
+DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
+
+
+def load_config(config_path: str) -> dict:
+    config_file = Path(config_path)
+    if not config_file.is_absolute():
+        config_file = Path(__file__).resolve().parent / config_file
+    with open(config_file, "r", encoding="utf-8") as file:
+        return yaml.safe_load(file) or {}
+
+
+def resolve_path(value: str, base_dir: Path, label: str) -> Path:
+    if not value:
+        raise ValueError(f"Missing required config value for {label}")
+
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return (base_dir / path).resolve()
+
+
+def build_default_paths(config: dict) -> dict:
+    data_root = Path(config.get("data_root", "/Data/mathias.ollu/hf_cache/datasets")).expanduser()
+    build_config = config.get("build_yfcc4k", {})
+
+    yfcc_dirname = build_config.get("yfcc_dirname", "YFCC100M")
+    downloads_dirname = build_config.get("downloads_dirname", "downloads")
+    dataset_dirname = build_config.get("dataset_dirname", "yfcc4k")
+
+    yfcc_root = data_root / yfcc_dirname
+    return {
+        "images_zip": yfcc_root / downloads_dirname / build_config.get("images_zip_name", "yfcc4k.zip"),
+        "imagedata_txt": yfcc_root / downloads_dirname / build_config.get("imagedata_txt_name", "0aaaa.r.imagedata.txt"),
+        "output_dir": yfcc_root / dataset_dirname,
+    }
 
 
 def download(url, destination):
@@ -75,12 +112,18 @@ def parse_metadata_line(line):
 
 
 def main(args):
-    output_dir = Path(args.output_dir)
+    config = load_config(args.config)
+    build_config = config.get("build_yfcc4k", {})
+
+    default_paths = build_default_paths(config)
+    config_dir = Path(args.config).expanduser().resolve().parent if args.config else DEFAULT_CONFIG_PATH.parent
+
+    images_zip = resolve_path(args.images_zip or str(default_paths["images_zip"]), config_dir, "build_yfcc4k.images_zip")
+    imagedata_txt = resolve_path(args.imagedata_txt or str(default_paths["imagedata_txt"]), config_dir, "build_yfcc4k.imagedata_txt")
+    output_dir = resolve_path(args.output_dir or str(default_paths["output_dir"]), config_dir, "build_yfcc4k.output_dir")
+
     images_dir = output_dir / "images"
     extract_dir = output_dir / "_tmp_extract"
-
-    images_zip = Path(args.images_zip)
-    imagedata_txt = Path(args.imagedata_txt)
 
     ensure_source_file(images_zip, IMAGES_PAGE_URL, is_zip=True)
     ensure_source_file(imagedata_txt, METADATA_PAGE_URL, is_zip=False)
@@ -128,21 +171,27 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Build YFCC4k dataset in Baseline(yfcc4k) format.")
     parser.add_argument(
+        "--config",
+        type=str,
+        default=str(DEFAULT_CONFIG_PATH),
+        help=f"Path to config file (default: {DEFAULT_CONFIG_PATH}).",
+    )
+    parser.add_argument(
         "--images_zip",
         type=str,
-        default="datasets/YFCC100M/downloads/yfcc4k.zip",
+        default=None,
         help="Path to yfcc4k.zip.",
     )
     parser.add_argument(
         "--imagedata_txt",
         type=str,
-        default="datasets/YFCC100M/downloads/0aaaa.r.imagedata.txt",
+        default=None,
         help="Path to 0aaaa.r.imagedata.txt.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="datasets/YFCC100M/yfcc4k",
+        default=None,
         help="Output folder compatible with Baseline(yfcc4k).",
     )
     parser.add_argument(

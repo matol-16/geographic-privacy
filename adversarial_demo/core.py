@@ -47,14 +47,25 @@ class ImageLoader:
         dataset: str,
         n_images: int,
         use_real_gps: bool = False,
+        dataset_roots: Optional[Dict[str, str]] = None,
     ) -> Tuple[List[Image.Image], Optional[List[Tuple[float, float]]]]:
         """Load images and optional GPS coordinates for a dataset."""
         from adversarial_eval import retrieve_yfcc_images, retrieve_osv_images
+
+        dataset_roots = dataset_roots or {}
         
         if dataset == "yfcc":
-            return retrieve_yfcc_images(n_images_to_eval=n_images, use_real_gps=use_real_gps)
+            return retrieve_yfcc_images(
+                n_images_to_eval=n_images,
+                use_real_gps=use_real_gps,
+                local_dir=dataset_roots.get("yfcc"),
+            )
         elif dataset == "osv":
-            return retrieve_osv_images(n_images_to_eval=n_images, use_real_gps=use_real_gps)
+            return retrieve_osv_images(
+                n_images_to_eval=n_images,
+                use_real_gps=use_real_gps,
+                local_dir=dataset_roots.get("osv"),
+            )
         else:
             raise ValueError(f"Unknown dataset: {dataset}")
 
@@ -231,26 +242,6 @@ class EvaluationRunner:
             use_real_gps=config.use_real_gps,
         )
     
-    def run_single_attack(
-        self,
-        attack_type: str,
-        source_image: Image.Image,
-        eps: float,
-        attack_kwargs: Dict[str, Any],
-        silent: bool = True,
-    ) -> Dict[str, Any]:
-        """Run a single attack with given parameters."""
-        from attacks import run_attack
-        
-        return run_attack(
-            attack_type=attack_type,
-            source_image=source_image,
-            pipeline=self.pipeline,
-            eps_max=eps,
-            silent=silent,
-            **attack_kwargs,
-        )
-    
     def save_results(self) -> None:
         """Save collected results and attack arguments."""
         results = self.metrics_collector.get_results()
@@ -274,6 +265,7 @@ def parallel_evaluate_attacks(
 ) -> None:
     """Run attacks in parallel with thread pool."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
+    from attacks import run_attack
     
     config = runner.config
     total = len(attack_configs)
@@ -291,10 +283,24 @@ def parallel_evaluate_attacks(
             import torch
             stream = torch.cuda.Stream(device=kwargs.get("device", "cuda"))
             with torch.cuda.stream(stream):
-                result = runner.run_single_attack(attack_type, image, eps, kwargs)
+                result = run_attack(
+                    attack_type=attack_type,
+                    source_image=image,
+                    pipeline=runner.pipeline,
+                    eps_max=eps,
+                    silent=True,
+                    **kwargs,
+                )
             stream.synchronize()
         else:
-            result = runner.run_single_attack(attack_type, image, eps, kwargs)
+            result = run_attack(
+                attack_type=attack_type,
+                source_image=image,
+                pipeline=runner.pipeline,
+                eps_max=eps,
+                silent=True,
+                **kwargs,
+            )
         
         return attack_type, budget_idx, image_idx, result
     
@@ -324,6 +330,7 @@ def sequential_evaluate_attacks(
     runner: EvaluationRunner,
 ) -> None:
     """Run attacks sequentially."""
+    from attacks import run_attack
     config = runner.config
     total = len(config.attack_types) * len(config.attack_budgets) * len(runner.source_images)
     
@@ -334,7 +341,14 @@ def sequential_evaluate_attacks(
             for image_idx, image in enumerate(runner.source_images):
                 kwargs = dict(config.attack_kwargs[budget_idx])
                 
-                result = runner.run_single_attack(attack_type, image, eps, kwargs)
+                result = run_attack(
+                    attack_type=attack_type,
+                    source_image=image,
+                    pipeline=runner.pipeline,
+                    eps_max=eps,
+                    silent=True,
+                    **kwargs,
+                )
                 runner.metrics_collector.record_attack_result(
                     attack_type, budget_idx, image_idx, result
                 )

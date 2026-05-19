@@ -27,6 +27,12 @@ conda activate plonk
 pip install -e .
 '''
 
+## Datasets
+
+You can download the YFCC4k dataset by running the dedicated *build_yfcc4k_from_revisiting_im2gps.py* python file. You can specify you dataset folders through the argument parser. 
+
+The OSV datasets downloads automatically when calling an evaluation using it.
+
 ## Code structure
 
 As mentioned above, all the new code in is *adversarial_demo*. 
