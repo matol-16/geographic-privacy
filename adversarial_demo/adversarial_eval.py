@@ -118,46 +118,6 @@ def retrieve_osv_images(n_images_to_eval: int = 100, use_real_gps: bool = False)
     return source_images, source_gps
 
 
-def _evaluate_single_attack_task(
-    attack_type,
-    budget_index: int,
-    image_index: int,
-    image,
-    pipeline,
-    attack_budgets,
-    attack_kwargs,
-    stored_metrics,
-    use_cuda_streams: bool,
-):
-    eps = attack_budgets[budget_index]
-    kwargs = dict(attack_kwargs[budget_index])
-    worker_device = str(kwargs.get("device", getattr(pipeline, "device", "cpu")))
-
-    if use_cuda_streams and worker_device.startswith("cuda") and torch.cuda.is_available():
-        stream = torch.cuda.Stream(device=worker_device)
-        with torch.cuda.stream(stream):
-            attack_result = run_attack(
-                attack_type=attack_type,
-                source_image=image,
-                pipeline=pipeline,
-                eps_max=eps,
-                silent=True,
-                **kwargs,
-            )
-        stream.synchronize()
-    else:
-        attack_result = run_attack(
-            attack_type=attack_type,
-            source_image=image,
-            pipeline=pipeline,
-            eps_max=eps,
-            silent=True,
-            **kwargs,
-        )
-
-    metric_values = {metric: float(attack_result["best_metrics"][metric]) for metric in stored_metrics}
-    return attack_type, budget_index, image_index, metric_values
-  
 def evaluate_attack_on_dataset(
     attack_types,
     pipeline,
@@ -185,87 +145,41 @@ def evaluate_attack_on_dataset(
             use_cuda_streams: If True and running on CUDA, each worker uses its own CUDA stream.
             **kwargs: forwarded to the corresponding attack function.
     """
+    from core import EvaluationConfig, EvaluationRunner, run_evaluation
+    
     if isinstance(attack_types, str):
         attack_types = [attack_types]
-
-    if source_image is not None:
-        source_images = [source_image]
-    elif dataset_name == "osv":
-        source_images, source_gps = retrieve_osv_images(n_images_to_eval=n_images_to_eval, use_real_gps=use_real_gps)
-    elif dataset_name == "yfcc":
-        source_images, source_gps = retrieve_yfcc_images(n_images_to_eval=n_images_to_eval, use_real_gps=use_real_gps)
-    else:
-        raise ValueError(f"Unknown dataset_name={dataset_name}. Expected one of ['osv', 'yfcc']")
-
-    total = len(attack_types) * len(attack_budgets) * len(source_images)
-    pbar = tqdm_module.tqdm(total=total, desc="Evaluating attacks")
-    all_results = {
-        attack_type: {metric: torch.zeros((len(attack_budgets), len(source_images))) for metric in stored_metrics}
-        for attack_type in attack_types
-    }
-
-    run_in_parallel = parallel_workers > 1
-
-    if run_in_parallel:
-        tasks = [
-            (attack_type, j, i, source_image)
-            for attack_type in attack_types
-            for j in range(len(attack_budgets))
-            for i, source_image in enumerate(source_images)
-        ]
-
-        with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-            futures = [
-                executor.submit(
-                    _evaluate_single_attack_task,
-                    attack_type,
-                    j,
-                    i,
-                    source_image,
-                    pipeline,
-                    attack_budgets,
-                    attack_kwargs,
-                    stored_metrics,
-                    use_cuda_streams,
-                )
-                for attack_type, j, i, source_image in tasks
-            ]
-            for future in as_completed(futures):
-                attack_type, j, i, metric_values = future.result()
-                for metric in stored_metrics:
-                    all_results[attack_type][metric][j, i] = metric_values[metric]
-                pbar.set_postfix(attack=attack_type, eps=f"{attack_budgets[j]:.4f}", image=f"{i+1}/{len(source_images)}")
-                pbar.update(1)
-    else:
-        for attack_type in attack_types:
-            for j, eps in enumerate(attack_budgets):
-                for i, source_image in enumerate(source_images):
-                    attack_result = run_attack(
-                        attack_type=attack_type,
-                        source_image=source_image,
-                        pipeline=pipeline,
-                        eps_max=eps,
-                        silent=True,
-                        **attack_kwargs[j], #hyperparameters are specific to each attack budget
-                    )
-                    for metric in stored_metrics:
-                        all_results[attack_type][metric][j, i] = attack_result["best_metrics"][metric]
-                    pbar.set_postfix(attack=attack_type, eps=f"{eps:.4f}", image=f"{i+1}/{len(source_images)}")
-                    pbar.update(1)
-
-    for attack_type in attack_types:
-        #store metrics separately per attack
-        if results_dir is not None:
-            os.makedirs(results_dir, exist_ok=True)
-            torch.save(all_results[attack_type], os.path.join(results_dir, f"{dataset_name}_{attack_type}_results.pt"))
-    pbar.close()
     
-    #also save attack args
-    attack_args = {"attack_budgets": attack_budgets, "attack_kwargs": attack_kwargs}
-    if results_dir is not None:
-        torch.save(attack_args, os.path.join(results_dir, f"{dataset_name}_attack_args.pt"))
-
-    #plot all attacks together
+    # Handle custom source image
+    if source_image is not None:
+        # For single source image, use a custom path
+        raise NotImplementedError("Custom source image not yet supported in refactored code")
+    
+    # Normalize attack_kwargs
+    attack_kwargs = expand_per_budget_kwargs(attack_kwargs, len(attack_budgets))
+    
+    # Create configuration
+    config = EvaluationConfig(
+        dataset=dataset_name,
+        attack_types=attack_types,
+        attack_budgets=attack_budgets,
+        attack_kwargs=attack_kwargs,
+        n_images=n_images_to_eval,
+        results_dir=results_dir,
+        plots_dir=plot_dir,
+        stored_metrics=stored_metrics,
+        parallel_workers=parallel_workers,
+        use_cuda_streams=use_cuda_streams,
+        use_real_gps=use_real_gps,
+    )
+    
+    # Run evaluation
+    runner = EvaluationRunner(config, pipeline)
+    run_evaluation(runner)
+    runner.save_results()
+    
+    # Plot results
+    all_results = runner.metrics_collector.get_results()
     plot_results(
         results_dir=results_dir,
         attack_budgets=attack_budgets,
@@ -273,10 +187,10 @@ def evaluate_attack_on_dataset(
         dataset_name=dataset_name,
         attack_types=attack_types,
         all_results=all_results,
-        stored_metrics=stored_metrics)
- 
- 
- 
+        stored_metrics=stored_metrics,
+    )
+
+
 def evaluate_attack_transferability(
     source_image, #can be None; in that case the first image from the dataset is used
     pipeline,
@@ -297,6 +211,9 @@ def evaluate_attack_transferability(
         Evaluates the transferability of an attack. It trains a perturbation on a source_image,
         then applies the same perturbation to a set of source images from a dataset and evaluates
         the attack success metrics on the perturbed images.
+        
+        NOTE: This evaluation is NOT supported through the CLI (main.py).
+        It is kept here for direct Python API usage.
     """
     if dataset_name == "osv":
         images, source_gps = retrieve_osv_images(n_images_to_eval=n_images_to_eval)
@@ -371,7 +288,8 @@ def evaluate_localizability(
     plot_dir: Optional[str] = "/plots",
     results_dir: Optional[str] = "/results",
     attack_budgets: list[float] = [2/255, 15/255, 50/255],
-    attack_kwargs: list[Dict[str, Any]] = [{}],):
+    attack_kwargs: list[Dict[str, Any]] = [{}],
+):
     """ 
     Evaluates how strong an attack is depending on the localizability of the source image.
     
@@ -379,51 +297,52 @@ def evaluate_localizability(
     
     This evaluation is done for each attack type and attack budget, to see if some attacks are more effective on low-localizability images than others, and if this trend is stronger for higher attack budgets.
     """
+    from core import EvaluationConfig, EvaluationRunner, sequential_evaluate_attacks, ImageLoader
     
-    if dataset_name == "osv":
-        images, source_gps = retrieve_osv_images(n_images_to_eval=n_images_to_eval)
-
-    elif dataset_name == "yfcc":
-        images, source_gps = retrieve_yfcc_images(n_images_to_eval=n_images_to_eval)
-    else:
-        raise ValueError(f"Unknown dataset_name={dataset_name}. Expected one of ['osv', 'yfcc']")
+    # Load images
+    print(f"Loading {n_images_to_eval} images from {dataset_name} dataset...")
+    source_images, source_gps = ImageLoader.load_images(
+        dataset=dataset_name,
+        n_images=n_images_to_eval,
+    )
     
-    results = {"attack_results" : {attack: torch.zeros((len(attack_budgets), len(images))) for attack in attack_types}, "localizability" : torch.zeros(len(images))}
-
-    pbar = tqdm_module.tqdm(total=len(images), desc="Computing localizability")    
-    for i, img in enumerate(images):
-        results["localizability"][i] = pipeline.compute_localizability(img, number_monte_carlo_samples=256).item()
+    # Normalize attack_kwargs
+    attack_kwargs = expand_per_budget_kwargs(attack_kwargs, len(attack_budgets))
+    
+    # Compute localizability for all images
+    print("Computing localizability scores...")
+    localizability = torch.zeros(len(source_images))
+    pbar = tqdm_module.tqdm(total=len(source_images), desc="Computing localizability")
+    for i, img in enumerate(source_images):
+        localizability[i] = pipeline.compute_localizability(img, number_monte_carlo_samples=256).item()
         pbar.update(1)
     pbar.close()
     
-    total = len(attack_types) * len(attack_budgets) * len(images)
-    pbar = tqdm_module.tqdm(total=total, desc="Evaluating localizability")
-    for attack in attack_types:
-        for j, eps in enumerate(attack_budgets):
-            for i, img in enumerate(images):
-                attack_result = run_attack(
-                    attack_type=attack,
-                    source_image=img,
-                    pipeline=pipeline,
-                    eps_max=eps,
-                    silent=True,
-                    **attack_kwargs[j],
-                )
-                results["attack_results"][attack][j, i] = attack_result["best_metrics"]["final_step_displacement"]
-                pbar.set_postfix(attack=attack, eps=f"{eps:.4f}", image=f"{i+1}/{len(images)}")
-                pbar.update(1)
-    pbar.close()
+    # Run evaluation using standard config
+    config = EvaluationConfig(
+        dataset=dataset_name,
+        attack_types=attack_types,
+        attack_budgets=attack_budgets,
+        attack_kwargs=attack_kwargs,
+        n_images=n_images_to_eval,
+        results_dir=results_dir,
+        plots_dir=plot_dir,
+        stored_metrics=["final_step_displacement"],
+        parallel_workers=1,  # Use sequential for localizability
+        use_cuda_streams=False,
+    )
     
-        #store results
-    if results_dir is not None:
-        os.makedirs(results_dir, exist_ok=True)
-        torch.save(results, os.path.join(results_dir, f"{dataset_name}_results_localizability.pt"))
-
-    # #plot results
-    # plot_localizability_results(
-    #     attack_budgets=attack_budgets,
-    #     plot_dir=plot_dir,
-    #     all_datasets_results==results)
+    runner = EvaluationRunner(config, pipeline)
+    sequential_evaluate_attacks(runner)
+    
+    # Combine results with localizability
+    results = {
+        "attack_results": runner.metrics_collector.get_results(),
+        "localizability": localizability,
+    }
+    
+    # Save results
+    runner.results_manager.save_metrics(results, dataset_name, suffix="_localizability")
     
     
 
@@ -501,6 +420,6 @@ if __name__ == "__main__":
         plot_dir="./plots",
         dataset_name="osv",
         attack_types=["encoder", "diffusion"],
-        threshold_km=[500,1000,1500,2500]
+        threshold_km=[25,200,750,2500]
     )
  

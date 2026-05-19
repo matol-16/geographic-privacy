@@ -1,3 +1,13 @@
+"""
+Utility functions for adversarial attack training and evaluation.
+
+Organized into sections:
+1. Device and noise utilities (GPU/CPU handling, RNG)
+2. Image processing utilities (preprocessing, perturbation, conversion)
+3. Embedding utilities (model-dependent embedding extraction)
+4. Pipeline utilities (paired evaluation with shared noise)
+5. Configuration utilities (argument handling)
+"""
 
 from __future__ import annotations
 
@@ -10,17 +20,9 @@ from PIL import Image
 from adversarial_metrics import evaluate_displacement_metrics
 
 
-def filter_kwargs_for(func: Callable[..., Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Return the subset of kwargs accepted by func."""
-    sig = inspect.signature(func)
-    params = sig.parameters
-
-    # Pass through untouched when func accepts arbitrary kwargs.
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return dict(kwargs)
-
-    accepted = set(params.keys())
-    return {k: v for k, v in kwargs.items() if k in accepted}
+############################################################################################
+# Section 1: Device and Noise Utilities
+############################################################################################
 
 
 def resolve_torch_device(device: Any = "cuda") -> str:
@@ -41,6 +43,105 @@ def make_shared_initial_noise(
     generator = torch.Generator(device=resolved_device)
     generator.manual_seed(int(seed))
     return torch.randn(int(batch_size), 3, device=resolved_device, generator=generator)
+
+
+############################################################################################
+# Section 2: Image Processing Utilities
+############################################################################################
+
+
+def conditional_preprocessing(source_image, pipeline, device="cuda"):
+    """Preprocess image based on model type (DINOv2 vs CLIP)."""
+    if ("YFCC" in pipeline.model_path) or ("iNaturalist" in pipeline.model_path): 
+        # DINOv2-based model
+        if source_image.mode != "RGB":
+            source_image = source_image.convert("RGB")
+        tensor = (
+            pipeline.cond_preprocessing.augmentation(source_image)
+            .unsqueeze(0)
+            .to(device)
+        )  # [1, 3, H, W]
+    else:  
+        # CLIP-based model
+        tensor = pipeline.cond_preprocessing.processor(
+            images=source_image, return_tensors="pt"
+        )["pixel_values"].to(device)  # [1, 3, H, W]
+    return tensor
+
+
+def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
+    """Convert tensor back to PIL image with proper denormalization."""
+    # Unnormalize (assuming normalization with mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    unnormalize = transforms.Normalize(
+        mean=[-0.5 / 0.5, -0.5 / 0.5, -0.5 / 0.5],
+        std=[1 / 0.5, 1 / 0.5, 1 / 0.5]
+    )
+    unnormalized_tensor = unnormalize(tensor.squeeze(0)).clamp(0, 1)
+    
+    # Convert to PIL image
+    pil_image = transforms.ToPILImage()(unnormalized_tensor.cpu())
+    return pil_image
+
+
+def add_perturbation_to_image(image: Image.Image, perturbation: torch.Tensor, pipeline) -> Image.Image:
+    """Apply perturbation to image and convert back to PIL format."""
+    # Convert the image to a tensor
+    image_tensor = conditional_preprocessing(image, pipeline, device=perturbation.device)  # [1, 3, H, W]
+    # Add the perturbation to the image tensor
+    perturbed_tensor = image_tensor + perturbation
+    # Convert back to PIL
+    perturbed_image = tensor_to_pil(perturbed_tensor)
+    return perturbed_image
+
+
+############################################################################################
+# Section 3: Embedding Utilities
+############################################################################################
+
+
+def compute_embedding(image_tensor, batch_size, pipeline, device="cuda", track_grad=True):
+    """Extract embedding from image tensor, handling model-specific variations."""
+    if ("YFCC" in pipeline.model_path) or ("iNaturalist" in pipeline.model_path):
+        # DINOv2 model
+        emb_single = pipeline.cond_preprocessing.emb_model(image_tensor)
+    else:
+        # CLIP model
+        input_dict = {"pixel_values": image_tensor}
+        if track_grad:
+            outputs = pipeline.cond_preprocessing.emb_model(**input_dict)
+        else:
+            with torch.no_grad():
+                outputs = pipeline.cond_preprocessing.emb_model(**input_dict)
+        emb_single = outputs.last_hidden_state[:, 0]
+    
+    # Repeat to batch size
+    emb = emb_single.repeat(batch_size, 1)
+    return emb
+
+
+def model_dependent_embedding(image_tensor, pipeline, track_grad=True):
+    """Extract single embedding from image tensor (no batching)."""
+    if "YFCC" in pipeline.model_path or "iNaturalist" in pipeline.model_path:
+        # DINOv2 model
+        if track_grad:
+            z_source = pipeline.cond_preprocessing.emb_model(image_tensor)
+        else:
+            with torch.no_grad():
+                z_source = pipeline.cond_preprocessing.emb_model(image_tensor)
+    else:  
+        # CLIP model
+        if track_grad:
+            z_source = pipeline.cond_preprocessing.emb_model(image_tensor)["last_hidden_state"][:, 0]
+        else:
+            with torch.no_grad():
+                z_source = pipeline.cond_preprocessing.emb_model(pixel_values=image_tensor)["last_hidden_state"][:, 0]
+    
+    return z_source
+
+
+############################################################################################
+# Section 4: Pipeline Utilities
+############################################################################################
 
 
 def run_paired_pipeline_with_shared_noise(
@@ -77,77 +178,23 @@ def run_paired_pipeline_with_shared_noise(
         "metrics": metrics,
     }
 
-def add_perturbation_to_image(image: Image, perturbation: torch.Tensor, pipeline):
-    # Convert the image to a tensor
-    image_tensor = conditional_preprocessing(image, pipeline, device=perturbation.device)  # [1, 3, H, W]
-    # Add the perturbation to the image tensor
-    perturbed_tensor = image_tensor + perturbation
 
-    # Convert the perturbed tensor back to an image. cond_prepocesser has no deprocess method, so we need to implement it ourselves. We just need to unnormalize the image and convert it back to PIL format.
-    perturbed_image = tensor_to_pil(perturbed_tensor.squeeze(0))
-
-    return perturbed_image
-
-def tensor_to_pil(tensor: torch.Tensor):
-    # Unnormalize the tensor (assuming it was normalized with mean=[0.5, 0.5, 0.5] and std=[0.5, 0.5, 0.5])
-    unnormalize = transforms.Normalize(
-        mean=[-0.5 / 0.5, -0.5 / 0.5, -0.5 / 0.5],
-        std=[1 / 0.5, 1 / 0.5, 1 / 0.5]
-    )
-    unnormalized_tensor = unnormalize(tensor.squeeze(0)).clamp(0, 1)
-
-    # Convert to PIL image
-    pil_image = transforms.ToPILImage()(unnormalized_tensor.cpu())
-    return pil_image
+############################################################################################
+# Section 5: Configuration Utilities
+############################################################################################
 
 
-def conditional_preprocessing(source_image, pipeline, device="cuda"):
-    if ("YFCC" in pipeline.model_path) or ("iNaturalist" in pipeline.model_path): #dinov2
-        if source_image.mode != "RGB":
-            source_image = source_image.convert("RGB")
-        tensor = (
-            pipeline.cond_preprocessing.augmentation(source_image)
-            .unsqueeze(0)
-            .to(device)
-        )  # [1, 3, H, W]
-        
-    else: #clip 
-        tensor = pipeline.cond_preprocessing.processor(
-            images=source_image, return_tensors="pt"
-        )["pixel_values"].to(device)  # [1, 3, H, W]
-    return tensor
+def filter_kwargs_for(func: Callable[..., Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the subset of kwargs accepted by func."""
+    sig = inspect.signature(func)
+    params = sig.parameters
 
+    # Pass through untouched when func accepts arbitrary kwargs.
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return dict(kwargs)
 
-def compute_embedding(image_tensor, batch_size, pipeline, device="cuda", track_grad=True):
-    #Conditional embedding depends on the embedder
-    if ("YFCC" in pipeline.model_path) or ("iNaturalist" in pipeline.model_path):
-        emb_single = pipeline.cond_preprocessing.emb_model(image_tensor)
-    else:
-        input_dict = {"pixel_values": image_tensor}
-        if track_grad:
-            outputs = pipeline.cond_preprocessing.emb_model(**input_dict)
-        else:
-            with torch.no_grad():
-                outputs = pipeline.cond_preprocessing.emb_model(**input_dict)
-        emb_single = outputs.last_hidden_state[:, 0]
-    emb = emb_single.repeat(batch_size, 1)
-    return emb
-
-
-def model_dependent_embedding(image_tensor, pipeline, track_grad=True):
-    if "YFCC" in pipeline.model_path or "iNaturalist" in pipeline.model_path:
-        if track_grad:
-            z_source = pipeline.cond_preprocessing.emb_model(image_tensor)
-        else:
-            with torch.no_grad():
-                z_source = pipeline.cond_preprocessing.emb_model(image_tensor)
-    else: #clip
-        if track_grad:
-            z_source = pipeline.cond_preprocessing.emb_model(image_tensor)["last_hidden_state"][:, 0]
-        else:
-            with torch.no_grad():
-                z_source = pipeline.cond_preprocessing.emb_model(pixel_values=image_tensor)["last_hidden_state"][:, 0]
-    return z_source
+    accepted = set(params.keys())
+    return {k: v for k, v in kwargs.items() if k in accepted}
 
 
 def expand_per_budget_kwargs(attack_kwargs: list[Dict[str, Any]], n_budgets: int) -> list[Dict[str, Any]]:

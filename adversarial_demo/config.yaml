@@ -1,0 +1,75 @@
+# Baseline configuration for adversarial attack experiments
+
+# Device configuration
+device: "cuda"
+
+# Dataset configuration
+dataset: "yfcc" # Options: "yfcc" or "osv"
+n_images_to_eval: 100
+
+# Evaluation directories
+results_dir: "./results"
+plots_dir: "./plots"
+
+# Parallel processing
+parallel_workers: 1
+use_cuda_streams: true
+
+# Pipeline models per dataset
+pipelines:
+  yfcc: "nicolas-dufour/PLONK_YFCC_diffusion"
+  osv: "nicolas-dufour/PLONK_OSV_5M_diffusion"
+
+# Attack budgets (epsilon values) per dataset
+attack_budgets:
+  yfcc: [0.00392, 0.00784, 0.01961, 0.03922, 0.07843, 0.11765, 0.19608] # [1/255, 2/255, 5/255, 10/255, 20/255, 30/255, 50/255]
+  osv: [
+      0.00392,
+      0.00784,
+      0.01961,
+      0.03922,
+      0.05882,
+      0.07843,
+      0.09804,
+      0.11765,
+      0.19608,
+    ] # [1/255, 2/255, 5/255, 10/255, 15/255, 20/255, 25/255, 30/255, 50/255]
+
+# Baseline attack training arguments
+attack_train_args:
+  yfcc:
+    n_steps: 80
+    train_batch_size: 256
+    lr: 0.001
+    anchor_samples: 512
+    clean_num_steps: 100
+    target_pure_noise: false
+    dot_product_loss: "absolute"
+    reconstruction_loss_weight: 0.0
+    num_restarts: 6
+    restart_selection_metric: "final_step_displacement"
+    restart_eval_cfg: 10.0
+  osv:
+    n_steps: 80
+    train_batch_size: 256
+    lr: 0.001
+    anchor_samples: 512
+    clean_num_steps: 100
+    target_pure_noise: false
+    dot_product_loss: "absolute"
+    reconstruction_loss_weight: 0.0
+    num_restarts: 6
+    restart_selection_metric: "final_step_displacement"
+    restart_eval_cfg: 10.0
+
+# Default attack types to evaluate
+attack_types: ["encoder", "diffusion"]
+
+# Localizability evaluation options
+localizability:
+  monte_carlo_samples: 256
+
+# Plotting options
+plot:
+  attack_success_rate_thresholds: [200, 750, 2500] # Distance thresholds in km
+  stored_metrics: ["final_step_displacement"]

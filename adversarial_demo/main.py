@@ -1,0 +1,522 @@
+#!/usr/bin/env python3
+"""
+Command-line interface for adversarial attack experiments.
+
+Supports:
+  - evaluate-dataset: Evaluate attacks on a dataset
+  - evaluate-localizability: Evaluate attack effectiveness by image localizability
+  - plot: Plot saved results or attack success rates
+  - list-configs: List available config parameters
+
+Usage:
+  python main.py evaluate-dataset --dataset yfcc --attack-types encoder diffusion
+  python main.py evaluate-localizability --dataset osv
+  python main.py plot success-rate --dataset yfcc
+"""
+
+import argparse
+import os
+import sys
+import yaml
+from typing import Any, Dict, List, Optional
+from pathlib import Path
+
+import torch
+from PIL import Image
+
+from pipe_trajectory import PlonkPipelineTrajectory
+from adversarial_eval import (
+    evaluate_attack_on_dataset,
+    evaluate_localizability,
+)
+from plots_adversarial_attacks import (
+    plot_results,
+    plot_attack_success_rate,
+)
+from adversarial_utils import expand_per_budget_kwargs
+
+
+def load_config(config_path: str = "config.yaml") -> Dict[str, Any]:
+    """Load YAML configuration file."""
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with open(config_path, "r") as f:
+        config = yaml.safe_load(f)
+    
+    return config
+
+
+def merge_overrides(config: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Merge command-line overrides into config dictionary.
+    
+    Handles nested keys with dot notation, e.g., 'attack_budgets.yfcc' or 'plot.stored_metrics'.
+    """
+    for key, value in overrides.items():
+        if "." in key:
+            # Handle nested keys
+            parts = key.split(".")
+            current = config
+            for part in parts[:-1]:
+                if part not in current:
+                    current[part] = {}
+                current = current[part]
+            current[parts[-1]] = value
+        else:
+            config[key] = value
+    
+    return config
+
+
+def parse_override_arg(arg: str) -> tuple[str, Any]:
+    """
+    Parse a single override argument of the form 'key=value'.
+    
+    Attempts to parse value as YAML (numbers, booleans, lists, etc.).
+    """
+    if "=" not in arg:
+        raise ValueError(f"Invalid override format: {arg}. Expected 'key=value'")
+    
+    key, value_str = arg.split("=", 1)
+    key = key.strip()
+    value_str = value_str.strip()
+    
+    # Try to parse as YAML to handle numbers, booleans, lists, etc.
+    try:
+        value = yaml.safe_load(value_str)
+    except yaml.YAMLError:
+        # Fallback to string
+        value = value_str
+    
+    return key, value
+
+
+def get_device(config: Dict[str, Any]) -> str:
+    """Get device from config, defaulting to cuda if available."""
+    device = config.get("device", "cuda")
+    if device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU")
+        device = "cpu"
+    return device
+
+
+def get_pipeline(config: Dict[str, Any], dataset: str) -> PlonkPipelineTrajectory:
+    """Load and initialize PLONK pipeline for the given dataset."""
+    device = get_device(config)
+    
+    pipelines = config.get("pipelines", {})
+    if dataset not in pipelines:
+        raise ValueError(f"No pipeline configuration for dataset: {dataset}")
+    
+    model_name = pipelines[dataset]
+    print(f"Loading pipeline: {model_name}")
+    pipeline = PlonkPipelineTrajectory(model_name).to(device)
+    
+    return pipeline
+
+
+def expand_attack_kwargs(
+    config: Dict[str, Any],
+    dataset: str,
+    attack_budgets: List[float],
+) -> List[Dict[str, Any]]:
+    """
+    Expand attack training arguments to match the number of attack budgets.
+    
+    Takes the baseline attack config and replicates it for each budget, adding device.
+    """
+    device = get_device(config)
+    
+    base_kwargs = config.get("attack_train_args", {}).get(dataset, {})
+    base_kwargs = dict(base_kwargs)  # Make a copy
+    base_kwargs["device"] = device
+    
+    # Expand to match number of budgets
+    return expand_per_budget_kwargs([base_kwargs], len(attack_budgets))
+
+
+def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
+    """Execute evaluate-dataset command."""
+    # Get parameters from args or config
+    dataset = args.dataset or config.get("dataset", "yfcc")
+    attack_types = args.attack_types or config.get("attack_types", ["encoder", "diffusion"])
+    n_images = args.n_images or config.get("n_images_to_eval", 100)
+    parallel_workers = args.parallel_workers or config.get("parallel_workers", 1)
+    
+    attack_budgets = config.get("attack_budgets", {}).get(dataset)
+    if not attack_budgets:
+        raise ValueError(f"No attack budgets configured for dataset: {dataset}")
+    
+    results_dir = args.results_dir or config.get("results_dir", "./results")
+    plots_dir = args.plots_dir or config.get("plots_dir", "./plots")
+    
+    # Get pipeline
+    pipeline = get_pipeline(config, dataset)
+    
+    # Expand attack kwargs
+    attack_kwargs = expand_attack_kwargs(config, dataset, attack_budgets)
+    
+    print(f"\n{'='*60}")
+    print(f"Evaluating attacks on {dataset.upper()} dataset")
+    print(f"{'='*60}")
+    print(f"Attack types: {attack_types}")
+    print(f"Attack budgets: {attack_budgets}")
+    print(f"Images to evaluate: {n_images}")
+    print(f"Results directory: {results_dir}")
+    print(f"Plots directory: {plots_dir}")
+    print(f"Parallel workers: {parallel_workers}")
+    print(f"{'='*60}\n")
+    
+    # Run evaluation
+    evaluate_attack_on_dataset(
+        attack_types=attack_types,
+        pipeline=pipeline,
+        dataset_name=dataset,
+        source_image=None,
+        use_real_gps=args.use_real_gps,
+        n_images_to_eval=n_images,
+        plot_dir=plots_dir,
+        results_dir=results_dir,
+        attack_budgets=attack_budgets,
+        stored_metrics=config.get("plot", {}).get("stored_metrics", ["final_step_displacement"]),
+        attack_kwargs=attack_kwargs,
+        parallel_workers=parallel_workers,
+        use_cuda_streams=config.get("use_cuda_streams", True),
+    )
+    
+    print(f"\nEvaluation complete! Results saved to: {results_dir}")
+    print(f"Plots saved to: {plots_dir}")
+
+
+def cmd_evaluate_localizability(args, config: Dict[str, Any]) -> None:
+    """Execute evaluate-localizability command."""
+    # Get parameters from args or config
+    dataset = args.dataset or config.get("dataset", "yfcc")
+    attack_types = args.attack_types or config.get("attack_types", ["encoder", "diffusion"])
+    n_images = args.n_images or config.get("n_images_to_eval", 100)
+    
+    attack_budgets = config.get("attack_budgets", {}).get(dataset)
+    if not attack_budgets:
+        raise ValueError(f"No attack budgets configured for dataset: {dataset}")
+    
+    results_dir = args.results_dir or config.get("results_dir", "./results")
+    plots_dir = args.plots_dir or config.get("plots_dir", "./plots")
+    
+    # Get pipeline
+    pipeline = get_pipeline(config, dataset)
+    
+    # Expand attack kwargs
+    attack_kwargs = expand_attack_kwargs(config, dataset, attack_budgets)
+    
+    print(f"\n{'='*60}")
+    print(f"Evaluating localizability on {dataset.upper()} dataset")
+    print(f"{'='*60}")
+    print(f"Attack types: {attack_types}")
+    print(f"Attack budgets: {attack_budgets}")
+    print(f"Images to evaluate: {n_images}")
+    print(f"Results directory: {results_dir}")
+    print(f"Plots directory: {plots_dir}")
+    print(f"{'='*60}\n")
+    
+    # Run evaluation
+    evaluate_localizability(
+        attack_types=attack_types,
+        pipeline=pipeline,
+        dataset_name=dataset,
+        n_images_to_eval=n_images,
+        plot_dir=plots_dir,
+        results_dir=results_dir,
+        attack_budgets=attack_budgets,
+        attack_kwargs=attack_kwargs,
+    )
+    
+    print(f"\nEvaluation complete! Results saved to: {results_dir}")
+    print(f"Plots saved to: {plots_dir}")
+
+
+def cmd_plot(args, config: Dict[str, Any]) -> None:
+    """Execute plot command."""
+    plot_type = args.plot_type or "results"
+    dataset = args.dataset or config.get("dataset", "yfcc")
+    results_dir = args.results_dir or config.get("results_dir", "./results")
+    plots_dir = args.plots_dir or config.get("plots_dir", "./plots")
+    
+    # Ensure plots directory exists
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    print(f"\n{'='*60}")
+    print(f"Generating {plot_type} plots for {dataset.upper()}")
+    print(f"{'='*60}")
+    print(f"Results directory: {results_dir}")
+    print(f"Plots directory: {plots_dir}")
+    print(f"{'='*60}\n")
+    
+    if plot_type == "results":
+        attack_budgets = config.get("attack_budgets", {}).get(dataset)
+        if not attack_budgets:
+            raise ValueError(f"No attack budgets configured for dataset: {dataset}")
+        
+        attack_types = args.attack_types or config.get("attack_types", ["encoder", "diffusion"])
+        
+        print(f"Plotting results for attacks: {attack_types}")
+        
+        plot_results(
+            results_dir=results_dir,
+            attack_budgets=attack_budgets,
+            plot_dir=plots_dir,
+            dataset_name=dataset,
+            attack_types=attack_types,
+            all_results=None,
+            stored_metrics=config.get("plot", {}).get("stored_metrics", ["final_step_displacement"]),
+        )
+    
+    elif plot_type == "success-rate":
+        attack_budgets = config.get("attack_budgets", {}).get(dataset)
+        if not attack_budgets:
+            raise ValueError(f"No attack budgets configured for dataset: {dataset}")
+        
+        thresholds = config.get("plot", {}).get("attack_success_rate_thresholds", [200, 750, 2500])
+        
+        print(f"Plotting attack success rates with distance thresholds: {thresholds} km")
+        
+        plot_attack_success_rate(
+            results_dir=results_dir,
+            attack_budgets=attack_budgets,
+            plot_dir=plots_dir,
+            dataset_name=dataset,
+        )
+    
+    else:
+        raise ValueError(f"Unknown plot type: {plot_type}")
+    
+    print(f"\nPlots saved to: {plots_dir}")
+
+
+def cmd_list_configs(args, config: Dict[str, Any]) -> None:
+    """List available configuration parameters."""
+    print("\n" + "="*60)
+    print("BASELINE CONFIGURATION")
+    print("="*60)
+    print(yaml.dump(config, default_flow_style=False, sort_keys=False))
+    print("\n" + "="*60)
+    print("CONFIGURATION OVERRIDE EXAMPLES")
+    print("="*60)
+    print("""
+Examples of using --override flag:
+
+  # Change device
+  --override device=cpu
+  
+  # Change number of images to evaluate
+  --override n_images_to_eval=50
+  
+  # Change attack budgets for YFCC (using list syntax)
+  --override 'attack_budgets.yfcc=[0.01, 0.05, 0.1]'
+  
+  # Change parallel workers
+  --override parallel_workers=4
+  
+  # Change directories
+  --override results_dir=./custom_results plots_dir=./custom_plots
+  
+  # Disable CUDA streams
+  --override use_cuda_streams=false
+""")
+
+
+def create_parser() -> argparse.ArgumentParser:
+    """Create and configure argument parser."""
+    parser = argparse.ArgumentParser(
+        description="Adversarial attack experiments CLI",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Evaluate attacks on YFCC dataset
+  python main.py evaluate-dataset --dataset yfcc
+  
+  # Evaluate on OSV with custom parameters
+  python main.py evaluate-dataset --dataset osv --n-images 50
+  
+  # Evaluate localizability
+  python main.py evaluate-localizability --dataset yfcc
+  
+  # Plot results
+  python main.py plot results --dataset yfcc
+  
+  # Plot attack success rates
+  python main.py plot success-rate --dataset osv
+  
+  # Override config parameters
+  python main.py evaluate-dataset --dataset yfcc \\
+    --override 'attack_budgets.yfcc=[0.01, 0.05]' \\
+    --override parallel_workers=4
+  
+  # Use custom config file
+  python main.py --config custom_config.yaml evaluate-dataset --dataset yfcc
+        """,
+    )
+    
+    # Global arguments
+    parser.add_argument(
+        "--config",
+        default="config.yaml",
+        help="Path to config file (default: config.yaml)",
+    )
+    parser.add_argument(
+        "--override",
+        action="append",
+        default=[],
+        help="Override config parameters (format: key=value). Can be used multiple times.",
+    )
+    
+    # Subcommands
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    
+    # evaluate-dataset command
+    eval_dataset = subparsers.add_parser(
+        "evaluate-dataset",
+        help="Evaluate attacks on a dataset",
+    )
+    eval_dataset.add_argument(
+        "--dataset",
+        choices=["yfcc", "osv"],
+        help="Dataset to evaluate on",
+    )
+    eval_dataset.add_argument(
+        "--attack-types",
+        nargs="+",
+        help="Attack types to evaluate (default: encoder diffusion)",
+    )
+    eval_dataset.add_argument(
+        "--n-images",
+        type=int,
+        help="Number of images to evaluate",
+    )
+    eval_dataset.add_argument(
+        "--use-real-gps",
+        action="store_true",
+        help="Use real GPS coordinates from dataset instead of clean predictions",
+    )
+    eval_dataset.add_argument(
+        "--results-dir",
+        help="Directory to save results",
+    )
+    eval_dataset.add_argument(
+        "--plots-dir",
+        help="Directory to save plots",
+    )
+    eval_dataset.add_argument(
+        "--parallel-workers",
+        type=int,
+        help="Number of parallel workers for evaluation",
+    )
+    
+    # evaluate-localizability command
+    eval_local = subparsers.add_parser(
+        "evaluate-localizability",
+        help="Evaluate attack effectiveness by image localizability",
+    )
+    eval_local.add_argument(
+        "--dataset",
+        choices=["yfcc", "osv"],
+        help="Dataset to evaluate on",
+    )
+    eval_local.add_argument(
+        "--attack-types",
+        nargs="+",
+        help="Attack types to evaluate (default: encoder diffusion)",
+    )
+    eval_local.add_argument(
+        "--n-images",
+        type=int,
+        help="Number of images to evaluate",
+    )
+    eval_local.add_argument(
+        "--results-dir",
+        help="Directory to save results",
+    )
+    eval_local.add_argument(
+        "--plots-dir",
+        help="Directory to save plots",
+    )
+    
+    # plot command
+    plot_cmd = subparsers.add_parser(
+        "plot",
+        help="Plot saved results",
+    )
+    plot_cmd.add_argument(
+        "plot_type",
+        nargs="?",
+        choices=["results", "success-rate"],
+        help="Type of plot to generate",
+    )
+    plot_cmd.add_argument(
+        "--dataset",
+        choices=["yfcc", "osv"],
+        help="Dataset to plot",
+    )
+    plot_cmd.add_argument(
+        "--attack-types",
+        nargs="+",
+        help="Attack types to plot (for 'results' plot type)",
+    )
+    plot_cmd.add_argument(
+        "--results-dir",
+        help="Directory containing saved results",
+    )
+    plot_cmd.add_argument(
+        "--plots-dir",
+        help="Directory to save plots",
+    )
+    
+    # list-configs command
+    subparsers.add_parser(
+        "list-configs",
+        help="List available configuration parameters",
+    )
+    
+    return parser
+
+
+def main():
+    """Main entry point."""
+    parser = create_parser()
+    args = parser.parse_args()
+    
+    # Load configuration
+    try:
+        config = load_config(args.config)
+    except FileNotFoundError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    
+    # Apply overrides
+    if args.override:
+        overrides = {}
+        for override_arg in args.override:
+            try:
+                key, value = parse_override_arg(override_arg)
+                overrides[key] = value
+            except ValueError as e:
+                print(f"Error parsing override: {e}", file=sys.stderr)
+                sys.exit(1)
+        config = merge_overrides(config, overrides)
+    
+    # Execute command
+    if args.command == "evaluate-dataset":
+        cmd_evaluate_dataset(args, config)
+    elif args.command == "evaluate-localizability":
+        cmd_evaluate_localizability(args, config)
+    elif args.command == "plot":
+        cmd_plot(args, config)
+    elif args.command == "list-configs":
+        cmd_list_configs(args, config)
+    else:
+        parser.print_help()
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
