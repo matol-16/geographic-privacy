@@ -29,6 +29,7 @@ def _compute_dot_alignment_loss(eps_reference, eps_prediction, dot_product_loss=
         "abs": "absolute",
         "absolute": "absolute",
         "absolute_dot": "absolute",
+        "cosine_similarity": "cosine_similarity",
     }
     normalized_metric = metric_aliases.get(str(dot_product_loss).lower())
     if normalized_metric is None:
@@ -39,6 +40,11 @@ def _compute_dot_alignment_loss(eps_reference, eps_prediction, dot_product_loss=
     dot = torch.sum(eps_reference * eps_prediction, dim=-1)
     if normalized_metric == "squared":
         return (dot ** 2).mean()
+    if normalized_metric == "cosine_similarity":
+        eps_reference_norm = torch.norm(eps_reference, dim=-1)
+        eps_prediction_norm = torch.norm(eps_prediction, dim=-1)
+        cosine_sim = dot / (eps_reference_norm * eps_prediction_norm + 1e-8)
+        return cosine_sim.mean()
     return torch.abs(dot).mean()
 
 

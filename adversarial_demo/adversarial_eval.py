@@ -36,7 +36,7 @@ from adversarial_utils import (
 
 
 
-def load_osv5m_test(local_dir: str = "Data/mathias.ollu/hf_cache/datasets//osv5m"):
+def load_osv5m_test(local_dir: str = "/Data/mathias.ollu/hf_cache/datasets/osv5m"):
     #only download if the data is not already present
     if os.path.exists(os.path.join(local_dir, "images", "test")) and \
        any(os.path.isdir(os.path.join(local_dir, "images", "test", d)) for d in os.listdir(os.path.join(local_dir, "images", "test"))):
@@ -95,7 +95,7 @@ def retrieve_osv_images(
     local_dir: Optional[str] = None,
 ):
     if local_dir is None:
-        local_dir = "Data/mathias.ollu/hf_cache/datasets/osv5m"
+        local_dir = "/Data/mathias.ollu/hf_cache/datasets/osv5m"
     load_osv5m_test(local_dir=local_dir)  # download & extract if needed
 
     # Load test metadata from CSV
