@@ -48,26 +48,28 @@ def _run_restartable_attack(
 			seed=restart_eval_seed,
 		)
 
-		return restart_idx, delta, history, eval_result["metrics"]
+		return restart_idx, delta, history, eval_result
 
 	if num_restart_workers > 1:
 		with ThreadPoolExecutor(max_workers=num_restart_workers) as executor:
 			results = list(executor.map(run_single_restart, range(attack.restart_manager.num_restarts)))
-		for restart_idx, delta, history, metrics in results:
+		for restart_idx, delta, history, eval_result in results:
 			attack.restart_manager.update_best(
 				restart_idx=restart_idx,
 				delta=delta,
 				history=history,
-				metrics=metrics,
+				metrics=eval_result["metrics"],
+				eval_result=eval_result,
 			)
 	else:
 		for restart_idx in range(attack.restart_manager.num_restarts):
-			restart_idx, delta, history, metrics = run_single_restart(restart_idx)
+			restart_idx, delta, history, eval_result = run_single_restart(restart_idx)
 			attack.restart_manager.update_best(
 				restart_idx=restart_idx,
 				delta=delta,
 				history=history,
-				metrics=metrics,
+				metrics=eval_result["metrics"],
+				eval_result=eval_result,
 			)
 
 	return attack.finalize_result(attack_type=attack_type, **finalize_kwargs)

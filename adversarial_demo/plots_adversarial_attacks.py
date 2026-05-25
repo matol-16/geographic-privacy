@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+from typing import Any
 from matplotlib import colormaps
 from matplotlib.patches import Patch
 import cartopy.crs as ccrs
@@ -46,6 +47,70 @@ def _plot_valid_path(ax, lat_lon_traj, **plot_kwargs):
                 seg = traj[start:end]
                 ax.plot(seg[:, 1], seg[:, 0], **plot_kwargs)
             start = None
+
+
+def _metric_aliases(metric_name):
+    if metric_name == "final_step_displacement_predicted":
+        return ["final_step_displacement_predicted", "final_step_displacement", "final_step_displacement_clean"]
+    if metric_name == "final_step_displacement_true":
+        return ["final_step_displacement_true"]
+    if metric_name == "final_step_displacement":
+        return ["final_step_displacement", "final_step_displacement_predicted", "final_step_displacement_clean"]
+    return [metric_name]
+
+
+def _get_metric_tensor(attack_results, metric_name):
+    for alias in _metric_aliases(metric_name):
+        tensor = attack_results.get(alias)
+        if isinstance(tensor, torch.Tensor):
+            return tensor
+    return None
+
+
+def _get_metric_samples_by_budget(attack_results, metric_name):
+    tensor = _get_metric_tensor(attack_results, metric_name)
+    if tensor is not None:
+        tensor = tensor.detach().cpu()
+        return [tensor[i].reshape(-1).numpy() for i in range(tensor.shape[0])]
+
+    restart_results = attack_results.get("restart_results")
+    if restart_results is None:
+        return None
+
+    samples_by_budget = []
+    for budget_results in restart_results:
+        budget_samples = []
+        for image_results in budget_results:
+            if not image_results:
+                continue
+            for restart_result in image_results:
+                value = restart_result.get(metric_name)
+                if value is None:
+                    for alias in _metric_aliases(metric_name):
+                        value = restart_result.get(alias)
+                        if value is not None:
+                            break
+                if value is not None:
+                    budget_samples.append(float(value))
+        samples_by_budget.append(np.asarray(budget_samples, dtype=np.float64))
+    return samples_by_budget
+
+
+def _summarize_samples(samples: np.ndarray) -> tuple[float, float, float, float]:
+    finite = samples[np.isfinite(samples)]
+    if finite.size == 0:
+        return np.nan, np.nan, np.nan, np.nan
+
+    with np.errstate(all="ignore"):
+        mean_value = float(np.mean(finite))
+        median_value = float(np.median(finite))
+        q25_value = float(np.quantile(finite, 0.25))
+        q75_value = float(np.quantile(finite, 0.75))
+    return mean_value, median_value, q25_value, q75_value
+
+
+def _select_displacement_metric(gps_true: bool) -> str:
+    return "final_step_displacement_true" if gps_true else "final_step_displacement_predicted"
 
 
 def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_perturbed, perturb_budget = None, cfg=None, point_size=100):
@@ -353,12 +418,11 @@ def plot_transferability_results(results_dir, attack_budgets, plot_dir, dataset_
             data_to_plot.append(res[i].cpu().numpy())
             attack_labels.append(f"{attack} (eps={budget:.3f})")
     plt.figure(figsize=(12,6))
-    plt.boxplot(data_to_plot, labels=attack_labels, showfliers=False)
-    plt.xticks(rotation=45, ha='right')
+    plt.boxplot(data_to_plot, showfliers=False)
+    plt.xticks(range(1, len(attack_labels) + 1), attack_labels, rotation=45, ha='right')
     plt.ylabel(metric)
     plt.title(f"Attack transferability evaluation on {dataset_name} dataset")
     plt.tight_layout()
-    plt.xticks(attack_budgets, [f"{eps*255:.0f}" for eps in attack_budgets])
 
     if plot_dir is not None:
         os.makedirs(plot_dir, exist_ok=True)
@@ -367,10 +431,23 @@ def plot_transferability_results(results_dir, attack_budgets, plot_dir, dataset_
         plt.show()
  
   
-def plot_results(results_dir, attack_budgets, plot_dir, dataset_name, attack_types=None, attack_type=None, all_results=None, results=None, stored_metrics=["final_step_displacement", "final_loss"]):
+def plot_results(
+    results_dir,
+    attack_budgets,
+    plot_dir,
+    dataset_name,
+    attack_types=None,
+    attack_type=None,
+    all_results=None,
+    results=None,
+    stored_metrics=None,
+    gps_true: bool = False,
+):
     # Support both old single-attack and new multi-attack signatures
     if attack_types is None:
         attack_types = [attack_type] if attack_type is not None else []
+    if stored_metrics is None:
+        stored_metrics = [_select_displacement_metric(gps_true)]
     if all_results is None:
         if results is not None:
             all_results = {attack_types[0]: results}
@@ -381,16 +458,30 @@ def plot_results(results_dir, attack_budgets, plot_dir, dataset_name, attack_typ
 
     for metric in stored_metrics:
         plt.figure(figsize=(10,8))
+        plotted_any = False
         for at, res in all_results.items():
-            metric_values = res[metric]
-            mean_metric = metric_values.mean(dim=1)
-            median_metric = torch.median(metric_values, dim=1).values
-            q25_metric = torch.quantile(metric_values, 0.25, dim=1)
-            q75_metric = torch.quantile(metric_values, 0.75, dim=1)
+            budget_samples = _get_metric_samples_by_budget(res, metric)
+            if budget_samples is None:
+                continue
+
+            summary = np.asarray([
+                _summarize_samples(samples)
+                for samples in budget_samples
+            ], dtype=np.float64)
+            mean_metric = summary[:, 0]
+            median_metric = summary[:, 1]
+            q25_metric = summary[:, 2]
+            q75_metric = summary[:, 3]
+
             attack_name = "DTD" if at.lower() == "diffusion" else "encoder"
             plt.plot(attack_budgets, mean_metric, linestyle='--', alpha=1.0,linewidth=3.0, label=f"{attack_name} mean")
             # plt.plot(attack_budgets, median_metric, label=f"{at} median")
             plt.fill_between(attack_budgets, q25_metric, q75_metric, alpha=0.3, label= f"{at} IQR (25-75%)")
+            plotted_any = True
+        if not plotted_any:
+            plt.close()
+            continue
+
         plt.xlabel("Attack budget (out of 255)")
         # plt.ylabel("Final step displacement (km)")
         
@@ -419,7 +510,18 @@ def plot_results(results_dir, attack_budgets, plot_dir, dataset_name, attack_typ
         plt.close()
         
         
-def plot_attack_success_rate(results_dir, attack_budgets, plot_dir, dataset_name, threshold_km=2500,attack_types=None, attack_type=None, all_results=None, results=None):
+def plot_attack_success_rate(
+    results_dir,
+    attack_budgets,
+    plot_dir,
+    dataset_name,
+    threshold_km: Any = 2500,
+    attack_types=None,
+    attack_type=None,
+    all_results=None,
+    results=None,
+    gps_true: bool = False,
+):
     """
     Takes same input as plot_results, but plots attack success rate instead of metrics. Attack success is defined as the fraction of samples for which the final step displacement is above a certain threshold (e.g. 100km), which indicates a successful attack that significantly changes the predicted location.
     
@@ -468,11 +570,17 @@ def plot_attack_success_rate(results_dir, attack_budgets, plot_dir, dataset_name
 
     for attack_index, (at, res) in enumerate(all_results.items()):
         base_color = attack_palette[attack_index % len(attack_palette)]
-        final_disp = res["final_step_displacement"]
+        metric_name = _select_displacement_metric(gps_true)
+        budget_samples = _get_metric_samples_by_budget(res, metric_name)
+        if budget_samples is None:
+            continue
 
         success_curves = []
         for t in thresholds:
-            success_rate = (final_disp > t).float().mean(dim=1).cpu().numpy()
+            success_rate = np.asarray([
+                float((samples > t).mean()) if samples.size > 0 else np.nan
+                for samples in budget_samples
+            ])
             success_curves.append(success_rate)
 
         success_curves = np.asarray(success_curves)
@@ -574,7 +682,19 @@ def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, 
         return b
 
     def _get_attack_strength(res, attack):
-        t = res["attack_results"][attack].detach().cpu()
+        attack_result = res["attack_results"][attack]
+        if isinstance(attack_result, dict):
+            t = _get_metric_tensor(attack_result, "final_step_displacement_predicted")
+            if t is None:
+                t = _get_metric_tensor(attack_result, "final_step_displacement")
+            if t is None:
+                tensor_values = [value for value in attack_result.values() if isinstance(value, torch.Tensor)]
+                if not tensor_values:
+                    raise ValueError(f"No tensor-valued attack results found for attack '{attack}'")
+                t = tensor_values[0]
+        else:
+            t = attack_result
+        t = t.detach().cpu()
         if t.ndim == 1:
             return t
         if t.ndim == 2:

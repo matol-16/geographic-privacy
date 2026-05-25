@@ -60,7 +60,7 @@ if __name__ == "__main__":
         dataset_name="yfcc",
         attack_types=["encoder", "diffusion"],
         all_results=None,
-        stored_metrics=["final_step_displacement"])
+        stored_metrics=["final_step_displacement_predicted"])
     
     
     #### Code to evaluate localizability

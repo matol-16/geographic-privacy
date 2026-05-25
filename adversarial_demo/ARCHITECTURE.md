@@ -187,7 +187,7 @@ config = EvaluationConfig(
     n_images=100,
     results_dir="./results",
     plots_dir="./plots",
-    stored_metrics=["final_step_displacement"],
+    stored_metrics=["final_step_displacement_predicted"],
 )
 
 # Load pipeline

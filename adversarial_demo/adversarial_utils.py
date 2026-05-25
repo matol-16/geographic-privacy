@@ -52,10 +52,11 @@ def make_shared_initial_noise(
 
 def conditional_preprocessing(source_image, pipeline, device="cuda"):
     """Preprocess image based on model type (DINOv2 vs CLIP)."""
+    if source_image.mode != "RGB":
+        source_image = source_image.convert("RGB")
+
     if ("YFCC" in pipeline.model_path) or ("iNaturalist" in pipeline.model_path): 
         # DINOv2-based model
-        if source_image.mode != "RGB":
-            source_image = source_image.convert("RGB")
         tensor = (
             pipeline.cond_preprocessing.augmentation(source_image)
             .unsqueeze(0)

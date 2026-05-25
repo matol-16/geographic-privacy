@@ -93,6 +93,7 @@ class RestartManager:
         self.best_score = -float("inf")
         self.best_metrics: Optional[Dict[str, float]] = None
         self.restart_summaries: List[Dict[str, Any]] = []
+        self.restart_evaluations: List[Dict[str, Any]] = []
 
     def update_best(
         self,
@@ -100,7 +101,8 @@ class RestartManager:
         delta: torch.Tensor,
         history: List[float],
         metrics: Dict[str, float],
-        loss_value: float = None,
+        loss_value: Optional[float] = None,
+        eval_result: Optional[Dict[str, Any]] = None,
     ) -> None:
         """
         Update best restart tracking if this restart improved the score.
@@ -151,6 +153,8 @@ class RestartManager:
             self.best_restart = restart_idx
             self.best_metrics = dict(metrics)
 
+        self.restart_evaluations.append(eval_result or {})
+
     def finalize(self) -> Dict[str, Any]:
         """
         Finalize restart selection and return summary.
@@ -173,6 +177,7 @@ class RestartManager:
             "best_score": float(self.best_score),
             "best_metrics": self.best_metrics,
             "restart_summaries": self.restart_summaries,
+            "restart_evaluations": self.restart_evaluations,
         }
 
 
@@ -188,6 +193,7 @@ class AttackResult:
         best_metrics: Optional[Dict[str, float]] = None,
         best_restart: int = 0,
         restart_summaries: Optional[List[Dict[str, Any]]] = None,
+        restart_evaluations: Optional[List[Dict[str, Any]]] = None,
         attack_mode: str = "untargeted",
         z_source: Optional[torch.Tensor] = None,
         z_target: Optional[torch.Tensor] = None,
@@ -204,6 +210,7 @@ class AttackResult:
             best_metrics: Best restart metrics dict
             best_restart: Index of best restart
             restart_summaries: List of restart summary dicts
+            restart_evaluations: List of raw per-restart evaluation dicts
             attack_mode: "targeted" or "untargeted"
             z_source: Source embedding (for encoder attacks)
             z_target: Target embedding (for encoder attacks)
@@ -225,6 +232,7 @@ class AttackResult:
             "best_metrics": best_metrics,
             "best_restart": int(best_restart),
             "restart_summaries": restart_summaries or [],
+            "restart_evaluations": restart_evaluations or [],
         }
         
         # Add encoder-specific fields
@@ -416,6 +424,7 @@ class AttackBase(ABC):
             best_metrics=restart_summary["best_metrics"],
             best_restart=restart_summary["best_restart"],
             restart_summaries=restart_summary["restart_summaries"],
+            restart_evaluations=restart_summary["restart_evaluations"],
             attack_mode=attack_mode,
             z_source=z_source,
             z_target=z_target,

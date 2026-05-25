@@ -20,6 +20,8 @@ import numpy as np
 from PIL import Image
 import tqdm as tqdm_module
 
+from adversarial_metrics import trajectory_displacement
+
 # Note: adversarial_eval imports and attacks imports are deferred to avoid circular imports
 
 
@@ -166,20 +168,68 @@ class MetricsCollector:
         attack_budgets: List[float],
         n_images: int,
         stored_metrics: List[str],
+        source_gps: Optional[List[Tuple[float, float]]] = None,
     ):
         self.attack_types = attack_types
         self.attack_budgets = attack_budgets
         self.n_images = n_images
         self.stored_metrics = stored_metrics
+        self.source_gps = source_gps
         
         # Initialize result tensors for each attack type and metric
         self.results = {
             attack_type: {
-                metric: torch.zeros((len(attack_budgets), n_images))
+                metric: torch.full((len(attack_budgets), n_images), float("nan"))
                 for metric in stored_metrics
             }
             for attack_type in attack_types
         }
+        self.restart_results: Dict[str, List[List[Optional[List[Dict[str, Any]]]]]] = {
+            attack_type: [[None for _ in range(n_images)] for _ in attack_budgets]
+            for attack_type in attack_types
+        }
+        self.location_results: Dict[str, List[List[Optional[Dict[str, Any]]]]] = {
+            attack_type: [[None for _ in range(n_images)] for _ in attack_budgets]
+            for attack_type in attack_types
+        }
+
+    @staticmethod
+    def _to_cpu_tensor(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+        if isinstance(value, np.ndarray):
+            return torch.from_numpy(value).cpu()
+        return value
+
+    def _normalize_restart_result(
+        self,
+        restart_result: Dict[str, Any],
+        true_gps: Optional[Tuple[float, float]] = None,
+    ) -> Dict[str, Any]:
+        normalized: Dict[str, Any] = {
+            "metrics": dict(restart_result.get("metrics", {})),
+            "gps_source": self._to_cpu_tensor(restart_result.get("gps_source")),
+            "gps_perturbed": self._to_cpu_tensor(restart_result.get("gps_perturbed")),
+            "traj_source": self._to_cpu_tensor(restart_result.get("traj_source")),
+            "traj_perturbed": self._to_cpu_tensor(restart_result.get("traj_perturbed")),
+        }
+
+        clean_metric = normalized["metrics"].get("final_step_displacement")
+        if clean_metric is not None:
+            normalized["final_step_displacement_predicted"] = float(clean_metric)
+
+        if true_gps is not None and normalized["gps_perturbed"] is not None:
+            perturbed = normalized["gps_perturbed"]
+            if isinstance(perturbed, torch.Tensor) and perturbed.ndim == 2 and perturbed.shape[-1] == 2:
+                source_coords = torch.tensor(true_gps, dtype=perturbed.dtype).view(1, 1, 2)
+                source_coords = source_coords.expand(1, perturbed.shape[0], 2)
+                perturbed_traj = perturbed.unsqueeze(0)
+                true_disp = trajectory_displacement(source_coords, perturbed_traj)
+                normalized["final_step_displacement_true"] = float(true_disp.mean().item())
+
+        normalized["true_gps"] = torch.tensor(true_gps, dtype=torch.float32) if true_gps is not None else None
+
+        return normalized
     
     def record_metric(
         self,
@@ -204,16 +254,73 @@ class MetricsCollector:
         """Record all metrics from an attack result."""
         if "best_metrics" not in attack_result:
             raise ValueError("Attack result missing 'best_metrics' key")
+
+        true_gps = self.source_gps[image_index] if self.source_gps is not None else None
         
         best_metrics = attack_result["best_metrics"]
+        restart_results = [
+            self._normalize_restart_result(restart_result, true_gps=true_gps)
+            for restart_result in attack_result.get("restart_evaluations", [])
+        ]
+        self.restart_results[attack_type][budget_index][image_index] = restart_results
+
+        best_restart = attack_result.get("best_restart")
+        best_restart_result = None
+        if isinstance(best_restart, int) and 0 <= best_restart < len(restart_results):
+            best_restart_result = restart_results[best_restart]
+
+        location_result: Dict[str, Any] = {
+            "best_restart": int(best_restart) if isinstance(best_restart, int) else None,
+            "true_gps": torch.tensor(true_gps, dtype=torch.float32) if true_gps is not None else None,
+            "predicted_gps_source": None,
+            "predicted_gps_perturbed": None,
+        }
+        if best_restart_result is not None:
+            location_result["predicted_gps_source"] = best_restart_result.get("gps_source")
+            location_result["predicted_gps_perturbed"] = best_restart_result.get("gps_perturbed")
+        self.location_results[attack_type][budget_index][image_index] = location_result
+
         for metric in self.stored_metrics:
-            if metric in best_metrics:
-                value = float(best_metrics[metric])
-                self.record_metric(attack_type, budget_index, image_index, metric, value)
+            if metric == "final_step_displacement_predicted" and "final_step_displacement" in best_metrics:
+                self.record_metric(
+                    attack_type,
+                    budget_index,
+                    image_index,
+                    metric,
+                    float(best_metrics["final_step_displacement"]),
+                )
+            elif metric == "final_step_displacement_true" and best_restart_result is not None:
+                true_metric = best_restart_result.get("final_step_displacement_true")
+                if true_metric is not None:
+                    self.record_metric(attack_type, budget_index, image_index, metric, float(true_metric))
+            elif metric in best_metrics:
+                self.record_metric(
+                    attack_type,
+                    budget_index,
+                    image_index,
+                    metric,
+                    float(best_metrics[metric]),
+                )
+            elif metric == "final_step_displacement" and "final_step_displacement" in best_metrics:
+                self.record_metric(
+                    attack_type,
+                    budget_index,
+                    image_index,
+                    metric,
+                    float(best_metrics["final_step_displacement"]),
+                )
     
-    def get_results(self) -> Dict[str, Dict[str, torch.Tensor]]:
+    def get_results(self) -> Dict[str, Dict[str, Any]]:
         """Get all collected results."""
-        return self.results
+        combined_results: Dict[str, Dict[str, Any]] = {}
+        for attack_type in self.attack_types:
+            attack_results: Dict[str, Any] = {
+                metric: tensor for metric, tensor in self.results[attack_type].items()
+            }
+            attack_results["restart_results"] = self.restart_results[attack_type]
+            attack_results["location_results"] = self.location_results[attack_type]
+            combined_results[attack_type] = attack_results
+        return combined_results
     
     def get_attack_type_results(self, attack_type: str) -> Dict[str, torch.Tensor]:
         """Get results for a specific attack type."""
@@ -227,12 +334,6 @@ class EvaluationRunner:
         self.config = config
         self.pipeline = pipeline
         self.results_manager = ResultsManager(config.results_dir, config.plots_dir)
-        self.metrics_collector = MetricsCollector(
-            attack_types=config.attack_types,
-            attack_budgets=config.attack_budgets,
-            n_images=config.n_images,
-            stored_metrics=config.stored_metrics,
-        )
         
         # Load images
         print(f"Loading {config.n_images} images from {config.dataset} dataset...")
@@ -240,6 +341,14 @@ class EvaluationRunner:
             dataset=config.dataset,
             n_images=config.n_images,
             use_real_gps=config.use_real_gps,
+        )
+
+        self.metrics_collector = MetricsCollector(
+            attack_types=config.attack_types,
+            attack_budgets=config.attack_budgets,
+            n_images=config.n_images,
+            stored_metrics=config.stored_metrics,
+            source_gps=self.source_gps,
         )
     
     def save_results(self) -> None:
@@ -313,7 +422,10 @@ def parallel_evaluate_attacks(
         for future in as_completed(futures):
             attack_type, budget_idx, image_idx, result = future.result()
             runner.metrics_collector.record_attack_result(
-                attack_type, budget_idx, image_idx, result
+                attack_type,
+                budget_idx,
+                image_idx,
+                result,
             )
             eps = config.attack_budgets[budget_idx]
             pbar.set_postfix(
@@ -350,7 +462,10 @@ def sequential_evaluate_attacks(
                     **kwargs,
                 )
                 runner.metrics_collector.record_attack_result(
-                    attack_type, budget_idx, image_idx, result
+                    attack_type,
+                    budget_idx,
+                    image_idx,
+                    result,
                 )
                 
                 pbar.set_postfix(

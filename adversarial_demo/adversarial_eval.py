@@ -7,7 +7,6 @@ import numpy as np
 import torch
 
 
-from attacks import run_attack
 from adversarial_metrics import evaluate_displacement_metrics, select_displacement_score
 from plots_adversarial_attacks import plot_results, plot_transferability_results, plot_localizability_results, plot_attack_success_rate
 
@@ -81,10 +80,8 @@ def retrieve_yfcc_images(
     rng = random.Random(42)
     samples = rng.sample(rows, min(n_images_to_eval, len(rows)))
 
-    source_images = [Image.open(s["path"]) for s in samples]
-    source_gps = None
-    if use_real_gps:
-        source_gps = [(s["latitude"], s["longitude"]) for s in samples]
+    source_images = [Image.open(s["path"]).convert("RGB") for s in samples]
+    source_gps = [(s["latitude"], s["longitude"]) for s in samples]
     print(f"Loaded {len(source_images)} images from YFCC4k.")
     return source_images, source_gps
 
@@ -121,10 +118,8 @@ def retrieve_osv_images(
     rng = random.Random(42)
     samples = rng.sample(rows, min(n_images_to_eval, len(rows)))
 
-    source_images = [Image.open(id_to_path[s["id"]]) for s in samples]
-    source_gps = None
-    if use_real_gps:
-        source_gps = [(float(s["latitude"]), float(s["longitude"])) for s in samples]
+    source_images = [Image.open(id_to_path[s["id"]]).convert("RGB") for s in samples]
+    source_gps = [(float(s["latitude"]), float(s["longitude"])) for s in samples]
     print(f"Loaded {len(source_images)} images from OSV-5M test set.")
     return source_images, source_gps
 
@@ -139,11 +134,14 @@ def evaluate_attack_on_dataset(
     plot_dir: Optional[str] = "/plots",
     results_dir: Optional[str] = "/results",
     attack_budgets: list[float] = [2/255, 15/255, 50/255],
-    stored_metrics = ["final_step_displacement"],
+    stored_metrics = ["final_step_displacement_predicted", "final_step_displacement_true"],
     attack_kwargs: list[Dict[str, Any]] = [{}],
     parallel_workers: int = 1,
     use_cuda_streams: bool = True,
     dataset_roots: Optional[Dict[str, str]] = None,
+    plot_success_rate: bool = False,
+    plot_success_rate_thresholds: Optional[list[float]] = None,
+    plot_gps_true: bool = False,
 ):
     """
         Evaluate one or more attacks on images from a test dataset.
@@ -206,105 +204,19 @@ def evaluate_attack_on_dataset(
         stored_metrics=stored_metrics,
     )
 
-
-def evaluate_attack_transferability(
-    source_image, #can be None; in that case the first image from the dataset is used
-    pipeline,
-    dataset_name,
-    attacks: list[str] = ["encoder", "diffusion"],
-    n_images_to_eval: int = 100,
-    plot_dir: Optional[str] = "/plots",
-    results_dir: Optional[str] = "/results",
-    attack_budgets: list[float] = [2/255, 15/255, 50/255],
-    metric="final_step_displacement",
-    attack_kwargs: list[Dict[str, Any]] = [{}],
-    eval_batch_size: int = 256,
-    eval_cfg: float = 10.0,
-    eval_num_steps: Optional[int] = None,
-    eval_seed: int = 1234,
-    dataset_roots: Optional[Dict[str, str]] = None,
-):
-    """
-        Evaluates the transferability of an attack. It trains a perturbation on a source_image,
-        then applies the same perturbation to a set of source images from a dataset and evaluates
-        the attack success metrics on the perturbed images.
-        
-        NOTE: This evaluation is NOT supported through the CLI (main.py).
-        It is kept here for direct Python API usage.
-    """
-    dataset_roots = dataset_roots or {}
-
-    if dataset_name == "osv":
-        images, source_gps = retrieve_osv_images(
-            n_images_to_eval=n_images_to_eval,
-            local_dir=dataset_roots.get("osv"),
+    if plot_success_rate:
+        plot_attack_success_rate(
+            results_dir=results_dir,
+            attack_budgets=attack_budgets,
+            plot_dir=plot_dir,
+            dataset_name=dataset_name,
+            attack_types=attack_types,
+            all_results=all_results,
+            threshold_km=plot_success_rate_thresholds or [2500],
+            gps_true=plot_gps_true,
         )
-    elif dataset_name == "yfcc":
-        images, source_gps = retrieve_yfcc_images(
-            n_images_to_eval=n_images_to_eval,
-            local_dir=dataset_roots.get("yfcc"),
-        )
-    else:
-        raise ValueError(f"Unknown dataset_name={dataset_name}. Expected one of ['osv', 'yfcc']")
 
 
-    if source_image is None:
-        source_image = images[0]
-
-    attack_kwargs = expand_per_budget_kwargs(attack_kwargs, len(attack_budgets))
-
-    results = {attack: torch.zeros((len(attack_budgets), len(images))) for attack in attacks}
-    total = len(attacks) * len(attack_budgets) * (1 + len(images))  # 1 train + N evals per (attack, budget)
-    pbar = tqdm_module.tqdm(total=total, desc="Evaluating transferability")
-    for attack_idx, attack in enumerate(attacks):
-        for j, eps in enumerate(attack_budgets):
-            kwargs_j = dict(attack_kwargs[j])
-            attack_result = run_attack(
-                attack_type=attack,
-                source_image=source_image,
-                pipeline=pipeline,
-                eps_max=eps,
-                silent=True,
-                **kwargs_j,
-            )
-            pbar.update(1)
-            best_delta = attack_result["delta"]
-            #evaluate on images:
-            for i, img in enumerate(images):
-                perturbed_image = add_perturbation_to_image(img, best_delta, pipeline)
-
-                eval_device = resolve_torch_device(kwargs_j.get("device", getattr(pipeline, "device", "cpu")))
-                eval_result = run_paired_pipeline_with_shared_noise(
-                    pipeline=pipeline,
-                    source_image=img,
-                    perturbed_image=perturbed_image,
-                    batch_size=int(eval_batch_size),
-                    cfg=float(eval_cfg),
-                    num_steps=eval_num_steps,
-                    seed=int(eval_seed) + attack_idx * 1_000_000 + j * 10_000 + i,
-                    device=eval_device,
-                )
-                metrics = eval_result["metrics"]
-                results[attack][j, i] = metrics[metric]
-                pbar.set_postfix(attack=attack, eps=f"{eps:.4f}", image=f"{i+1}/{len(images)}")
-                pbar.update(1)
-    pbar.close()
-
-    #store results
-    if results_dir is not None:
-        os.makedirs(results_dir, exist_ok=True)
-        torch.save(results, os.path.join(results_dir, f"{dataset_name}_results_transferability.pt"))
-        
-
-    #plot results
-    plot_transferability_results(
-        results_dir=results_dir,
-        attack_budgets=attack_budgets,
-        plot_dir=plot_dir,
-        dataset_name=dataset_name,
-        metric=metric,
-        results=results)
- 
 def evaluate_localizability(
     attack_types,
     pipeline,
@@ -358,7 +270,7 @@ def evaluate_localizability(
         n_images=n_images_to_eval,
         results_dir=results_dir,
         plots_dir=plot_dir,
-        stored_metrics=["final_step_displacement"],
+        stored_metrics=["final_step_displacement_predicted"],
         parallel_workers=1,  # Use sequential for localizability
         use_cuda_streams=False,
     )

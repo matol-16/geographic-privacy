@@ -40,12 +40,13 @@ def _compute_dot_alignment_loss(eps_reference, eps_prediction, dot_product_loss=
     dot = torch.sum(eps_reference * eps_prediction, dim=-1)
     if normalized_metric == "squared":
         return (dot ** 2).mean()
+    abs_dot= torch.abs(dot)
     if normalized_metric == "cosine_similarity":
         eps_reference_norm = torch.norm(eps_reference, dim=-1)
         eps_prediction_norm = torch.norm(eps_prediction, dim=-1)
-        cosine_sim = dot / (eps_reference_norm * eps_prediction_norm + 1e-8)
+        cosine_sim = abs_dot / (eps_reference_norm * eps_prediction_norm + 1e-8)
         return cosine_sim.mean()
-    return torch.abs(dot).mean()
+    return abs_dot.mean()
 
 
 def build_x0_bank_from_clean_model(

@@ -39,7 +39,7 @@ DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
 DEFAULT_RESULTS_DIR = Path(__file__).with_name("results")
 DEFAULT_PLOTS_DIR = Path(__file__).with_name("plots")
 DEFAULT_ATTACK_TYPES = ["encoder", "diffusion"]
-DEFAULT_STORED_METRICS = ["final_step_displacement"]
+DEFAULT_STORED_METRICS = ["final_step_displacement_predicted", "final_step_displacement_true"]
 DEFAULT_SUCCESS_RATE_THRESHOLDS = [200, 750, 2500]
 
 
@@ -183,6 +183,14 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
     
     # Expand attack kwargs
     attack_kwargs = get_attack_kwargs(config, dataset)
+    plot_gps_true = bool(get_nested_config(config, "plot", "gps_true", default=False))
+    plot_success_rate = bool(get_nested_config(config, "plot", "plot_success_rate", default=False))
+    success_rate_thresholds = get_nested_config(
+        config,
+        "plot",
+        "attack_success_rate_thresholds",
+        default=DEFAULT_SUCCESS_RATE_THRESHOLDS,
+    )
     
     print(f"\n{'='*60}")
     print(f"Evaluating attacks on {dataset.upper()} dataset")
@@ -216,6 +224,9 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
         parallel_workers=parallel_workers,
         use_cuda_streams=bool(config.get("use_cuda_streams", True)),
         dataset_roots=config.get("data_dirs", {}),
+        plot_success_rate=plot_success_rate,
+        plot_success_rate_thresholds=success_rate_thresholds,
+        plot_gps_true=plot_gps_true,
     )
     
     print(f"\nEvaluation complete! Results saved to: {results_dir}")
@@ -292,6 +303,14 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
             raise ValueError(f"No attack budgets configured for dataset: {dataset}")
         
         attack_types = pick_value(args.attack_types, config.get("attack_types"), DEFAULT_ATTACK_TYPES)
+        gps_true = bool(get_nested_config(config, "plot", "gps_true", default=False))
+        plot_success_rate = bool(get_nested_config(config, "plot", "plot_success_rate", default=False))
+        success_rate_thresholds = get_nested_config(
+            config,
+            "plot",
+            "attack_success_rate_thresholds",
+            default=DEFAULT_SUCCESS_RATE_THRESHOLDS,
+        )
         
         print(f"Plotting results for attacks: {attack_types}")
         
@@ -309,6 +328,17 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
                 default=DEFAULT_STORED_METRICS,
             ),
         )
+
+        if plot_success_rate:
+            plot_attack_success_rate(
+                results_dir=results_dir,
+                attack_budgets=attack_budgets,
+                plot_dir=plots_dir,
+                dataset_name=dataset,
+                attack_types=attack_types,
+                gps_true=gps_true,
+                threshold_km=success_rate_thresholds,
+            )
     
     elif plot_type == "success-rate":
         attack_budgets = config.get("attack_budgets", {}).get(dataset)
@@ -323,12 +353,14 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         )
         
         print(f"Plotting attack success rates with distance thresholds: {thresholds} km")
+        gps_true = bool(get_nested_config(config, "plot", "gps_true", default=False))
         
         plot_attack_success_rate(
             results_dir=results_dir,
             attack_budgets=attack_budgets,
             plot_dir=plots_dir,
             dataset_name=dataset,
+            gps_true=gps_true,
         )
     
     else:
