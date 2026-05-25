@@ -7,8 +7,8 @@ from typing import Any, Dict, Optional
 import torch
 from PIL import Image
 
-from attacks_core import AttackBase
-from adversarial_utils import (
+from attacks.attacks_core import AttackBase
+from utils.adversarial_utils import (
     conditional_preprocessing,
     model_dependent_embedding,
 )

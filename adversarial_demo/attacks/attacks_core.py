@@ -15,8 +15,8 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 from PIL import Image
 
-from adversarial_metrics import select_displacement_score
-from adversarial_utils import (
+from utils.adversarial_metrics import select_displacement_score
+from utils.adversarial_utils import (
     add_perturbation_to_image,
     conditional_preprocessing,
     run_paired_pipeline_with_shared_noise,

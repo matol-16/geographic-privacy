@@ -11,6 +11,7 @@ Consolidates common patterns for:
 from __future__ import annotations
 
 import os
+import yaml
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -20,7 +21,8 @@ import numpy as np
 from PIL import Image
 import tqdm as tqdm_module
 
-from adversarial_metrics import trajectory_displacement
+from utils.adversarial_metrics import trajectory_displacement
+from utils.adversarial_eval import retrieve_yfcc_images, retrieve_osv_images
 
 # Note: adversarial_eval imports and attacks imports are deferred to avoid circular imports
 
@@ -52,7 +54,6 @@ class ImageLoader:
         dataset_roots: Optional[Dict[str, str]] = None,
     ) -> Tuple[List[Image.Image], Optional[List[Tuple[float, float]]]]:
         """Load images and optional GPS coordinates for a dataset."""
-        from adversarial_eval import retrieve_yfcc_images, retrieve_osv_images
 
         dataset_roots = dataset_roots or {}
         
@@ -93,6 +94,11 @@ class ResultsManager:
     def get_metrics_path(self, dataset: str, suffix: str = "") -> str:
         """Get the path for saving metrics."""
         filename = f"{dataset}_metrics{suffix}.pt"
+        return os.path.join(self.results_dir, filename)
+
+    def get_run_config_path(self, dataset: str, suffix: str = "") -> str:
+        """Get the path for saving the resolved experiment config."""
+        filename = f"{dataset}_run_config{suffix}.yaml"
         return os.path.join(self.results_dir, filename)
     
     def save_results(
@@ -150,6 +156,18 @@ class ResultsManager:
         path = self.get_metrics_path(dataset, suffix)
         torch.save(metrics, path)
         print(f"Saved metrics to: {path}")
+
+    def save_run_config(
+        self,
+        run_config: Dict[str, Any],
+        dataset: str,
+        suffix: str = "",
+    ) -> None:
+        """Save the resolved experiment configuration used for a run."""
+        path = self.get_run_config_path(dataset, suffix)
+        with open(path, "w") as f:
+            yaml.safe_dump(run_config, f, sort_keys=False)
+        print(f"Saved run config to: {path}")
     
     def load_metrics(self, dataset: str, suffix: str = "") -> Dict[str, Any]:
         """Load saved metrics."""
@@ -367,6 +385,10 @@ class EvaluationRunner:
             self.config.dataset,
         )
 
+    def save_run_config(self, run_config: Dict[str, Any], suffix: str = "") -> None:
+        """Save the resolved experiment configuration used for the run."""
+        self.results_manager.save_run_config(run_config, self.config.dataset, suffix=suffix)
+
 
 def parallel_evaluate_attacks(
     runner: EvaluationRunner,
@@ -374,7 +396,7 @@ def parallel_evaluate_attacks(
 ) -> None:
     """Run attacks in parallel with thread pool."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from attacks import run_attack
+    from attacks.attacks import run_attack
     
     config = runner.config
     total = len(attack_configs)
@@ -442,7 +464,7 @@ def sequential_evaluate_attacks(
     runner: EvaluationRunner,
 ) -> None:
     """Run attacks sequentially."""
-    from attacks import run_attack
+    from attacks.attacks import run_attack
     config = runner.config
     total = len(config.attack_types) * len(config.attack_budgets) * len(runner.source_images)
     

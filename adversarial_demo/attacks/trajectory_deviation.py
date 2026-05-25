@@ -6,8 +6,8 @@ import torch
 import numpy as np
 from typing import Any, Dict, List, Optional
 
-from attacks_core import AttackBase
-from adversarial_utils import (
+from attacks.attacks_core import AttackBase
+from utils.adversarial_utils import (
     conditional_preprocessing,
     compute_embedding,
 )

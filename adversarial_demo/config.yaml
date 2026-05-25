@@ -27,15 +27,17 @@ plots_dir: "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/resul
 parallel_workers: 4
 use_cuda_streams: true
 
+model_type: "diffusion" # Options: "diffusion", "flow" or "" - i.e. riemannian flow matching
+
 # Pipeline models per dataset
 pipelines:
-  yfcc: "nicolas-dufour/PLONK_YFCC_diffusion"
-  osv: "nicolas-dufour/PLONK_OSV_5M_diffusion"
+  yfcc: "nicolas-dufour/PLONK_YFCC"
+  osv: "nicolas-dufour/PLONK_OSV_5M"
 
 # Attack budgets (epsilon values) per dataset
 attack_budgets:
-  yfcc: [0.0157, 0.0314] #4,8,16/255
-  osv: [0.0157, 0.0314] #4,8,16/255
+  yfcc: [0.0157, 0.0314, 0.0628] #4,8,16/255
+  osv: [0.0157, 0.0314, 0.0628] #4,8,16/255
 
 # Baseline attack training arguments
 attack_train_args:

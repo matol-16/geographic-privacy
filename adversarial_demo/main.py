@@ -24,12 +24,12 @@ from pathlib import Path
 import torch
 from PIL import Image
 
-from pipe_trajectory import PlonkPipelineTrajectory
-from adversarial_eval import (
+from utils.pipe_trajectory import PlonkPipelineTrajectory
+from utils.adversarial_eval import (
     evaluate_attack_on_dataset,
     evaluate_localizability,
 )
-from plots_adversarial_attacks import (
+from utils.plots_adversarial_attacks import (
     plot_results,
     plot_attack_success_rate,
 )
@@ -143,6 +143,12 @@ def get_pipeline(config: Dict[str, Any], dataset: str) -> PlonkPipelineTrajector
         raise ValueError(f"No pipeline configuration for dataset: {dataset}")
     
     model_name = pipelines[dataset]
+    # If a model_type is configured, append it as a suffix to the pipeline name
+    model_type = config.get("model_type", "")
+    if model_type:
+        suffix = f"_{model_type}" if model_type !="" else "" #riemannian FM is just ""
+        if not model_name.endswith(suffix):
+            model_name = model_name + suffix
     print(f"Loading pipeline: {model_name}")
     pipeline = PlonkPipelineTrajectory(model_name).to(device)
     
@@ -227,6 +233,7 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
         plot_success_rate=plot_success_rate,
         plot_success_rate_thresholds=success_rate_thresholds,
         plot_gps_true=plot_gps_true,
+        config_dump=config,
     )
     
     print(f"\nEvaluation complete! Results saved to: {results_dir}")
@@ -274,6 +281,7 @@ def cmd_evaluate_localizability(args, config: Dict[str, Any]) -> None:
         attack_budgets=attack_budgets,
         attack_kwargs=attack_kwargs,
         dataset_roots=config.get("data_dirs", {}),
+        config_dump=config,
     )
     
     print(f"\nEvaluation complete! Results saved to: {results_dir}")

@@ -9,7 +9,7 @@ import torch
 from PIL import Image
 import numpy as np
 
-from adversarial_metrics import trajectory_displacement
+from utils.adversarial_metrics import trajectory_displacement
 
 
 def _sanitize_lon_lat(coords):

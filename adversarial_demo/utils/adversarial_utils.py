@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, Optional
 from torchvision import transforms
 import torch
 from PIL import Image
-from adversarial_metrics import evaluate_displacement_metrics
+from utils.adversarial_metrics import evaluate_displacement_metrics
 
 
 ############################################################################################

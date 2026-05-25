@@ -8,9 +8,9 @@ from typing import Any, Callable, Dict, Optional
 import torch
 from PIL import Image
 
-from adversarial_utils import filter_kwargs_for, add_perturbation_to_image, resolve_torch_device
-from encoder_attacks import EncoderAttack
-from trajectory_deviation import DiffusionAttack
+from utils.adversarial_utils import filter_kwargs_for, add_perturbation_to_image, resolve_torch_device
+from attacks.encoder_attacks import EncoderAttack
+from attacks.trajectory_deviation import DiffusionAttack
 
 
 def _run_restartable_attack(
@@ -225,7 +225,7 @@ def _run_diffusion_attack(
 	**kwargs,  # Absorb unused kwargs
 ) -> Dict[str, Any]:
 	"""Run diffusion attack with optimizations: shared x0_bank, early stopping, and parallel restarts."""
-	from trajectory_deviation import build_x0_bank_from_clean_model
+	from attacks.trajectory_deviation import build_x0_bank_from_clean_model
 	
 	# Build x0_bank once and reuse across all restarts (KEY OPTIMIZATION)
 	if show_progress:
