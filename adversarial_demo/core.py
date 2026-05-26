@@ -10,6 +10,7 @@ Consolidates common patterns for:
 
 from __future__ import annotations
 
+import json
 import os
 import yaml
 from typing import Any, Dict, List, Optional, Tuple
@@ -31,6 +32,7 @@ from utils.adversarial_eval import retrieve_yfcc_images, retrieve_osv_images
 class EvaluationConfig:
     """Configuration for an evaluation run."""
     dataset: str
+    seed: int
     attack_types: List[str]
     attack_budgets: List[float]
     attack_kwargs: List[Dict[str, Any]]
@@ -41,6 +43,8 @@ class EvaluationConfig:
     parallel_workers: int = 1
     use_cuda_streams: bool = True
     use_real_gps: bool = False
+    dataset_roots: Optional[Dict[str, str]] = None
+    state_suffix: str = ""
 
 
 class ImageLoader:
@@ -50,22 +54,25 @@ class ImageLoader:
     def load_images(
         dataset: str,
         n_images: int,
+        seed: int = 0,
         use_real_gps: bool = False,
         dataset_roots: Optional[Dict[str, str]] = None,
-    ) -> Tuple[List[Image.Image], Optional[List[Tuple[float, float]]]]:
-        """Load images and optional GPS coordinates for a dataset."""
+    ) -> Tuple[List[Image.Image], Optional[List[Tuple[float, float]]], List[str]]:
+        """Load images, optional GPS coordinates, and stable dataset image IDs."""
 
         dataset_roots = dataset_roots or {}
         
         if dataset == "yfcc":
             return retrieve_yfcc_images(
                 n_images_to_eval=n_images,
+                seed=seed,
                 use_real_gps=use_real_gps,
                 local_dir=dataset_roots.get("yfcc"),
             )
         elif dataset == "osv":
             return retrieve_osv_images(
                 n_images_to_eval=n_images,
+                seed=seed,
                 use_real_gps=use_real_gps,
                 local_dir=dataset_roots.get("osv"),
             )
@@ -99,6 +106,11 @@ class ResultsManager:
     def get_run_config_path(self, dataset: str, suffix: str = "") -> str:
         """Get the path for saving the resolved experiment config."""
         filename = f"{dataset}_run_config{suffix}.yaml"
+        return os.path.join(self.results_dir, filename)
+
+    def get_state_path(self, dataset: str, seed: int, suffix: str = "") -> str:
+        """Get the path for saving incremental evaluation state."""
+        filename = f"{dataset}_seed{seed}_eval_state{suffix}.pt"
         return os.path.join(self.results_dir, filename)
     
     def save_results(
@@ -168,6 +180,32 @@ class ResultsManager:
         with open(path, "w") as f:
             yaml.safe_dump(run_config, f, sort_keys=False)
         print(f"Saved run config to: {path}")
+
+    def save_state(
+        self,
+        state: Dict[str, Any],
+        dataset: str,
+        seed: int,
+        suffix: str = "",
+    ) -> None:
+        """Persist incremental evaluation state atomically."""
+        path = self.get_state_path(dataset, seed, suffix)
+        tmp_path = f"{path}.tmp"
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, path)
+        print(f"Saved evaluation state to: {path}")
+
+    def load_state(
+        self,
+        dataset: str,
+        seed: int,
+        suffix: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Load incremental evaluation state if it exists."""
+        path = self.get_state_path(dataset, seed, suffix)
+        if not os.path.exists(path):
+            return None
+        return torch.load(path, map_location="cpu")
     
     def load_metrics(self, dataset: str, suffix: str = "") -> Dict[str, Any]:
         """Load saved metrics."""
@@ -187,12 +225,14 @@ class MetricsCollector:
         n_images: int,
         stored_metrics: List[str],
         source_gps: Optional[List[Tuple[float, float]]] = None,
+        source_image_ids: Optional[List[str]] = None,
     ):
         self.attack_types = attack_types
         self.attack_budgets = attack_budgets
         self.n_images = n_images
         self.stored_metrics = stored_metrics
         self.source_gps = source_gps
+        self.source_image_ids = source_image_ids
         
         # Initialize result tensors for each attack type and metric
         self.results = {
@@ -224,12 +264,28 @@ class MetricsCollector:
         restart_result: Dict[str, Any],
         true_gps: Optional[Tuple[float, float]] = None,
     ) -> Dict[str, Any]:
+        def _final_step_tensor(val: Any) -> Any:
+            v = self._to_cpu_tensor(val)
+            # If we have a multi-step trajectory shaped (steps, 2), keep only final step
+            if isinstance(v, torch.Tensor):
+                # ensure final-step has shape (1, 2) for compatibility
+                if v.ndim == 2 and v.shape[-1] == 2:
+                    if v.shape[0] > 1:
+                        v = v[-1].unsqueeze(0)
+                    else:
+                        v = v.view(1, 2)
+                # If already a single coordinate (2,), convert to (1,2)
+                elif v.ndim == 1 and v.shape[0] == 2:
+                    v = v.view(1, 2)
+            return v
+
         normalized: Dict[str, Any] = {
             "metrics": dict(restart_result.get("metrics", {})),
-            "gps_source": self._to_cpu_tensor(restart_result.get("gps_source")),
-            "gps_perturbed": self._to_cpu_tensor(restart_result.get("gps_perturbed")),
-            "traj_source": self._to_cpu_tensor(restart_result.get("traj_source")),
-            "traj_perturbed": self._to_cpu_tensor(restart_result.get("traj_perturbed")),
+            # store only last-step coordinates (small) instead of full trajectories
+            "gps_source": _final_step_tensor(restart_result.get("gps_source")),
+            "gps_perturbed": _final_step_tensor(restart_result.get("gps_perturbed")),
+            "traj_source": _final_step_tensor(restart_result.get("traj_source")),
+            "traj_perturbed": _final_step_tensor(restart_result.get("traj_perturbed")),
         }
 
         clean_metric = normalized["metrics"].get("final_step_displacement")
@@ -335,10 +391,16 @@ class MetricsCollector:
             attack_results: Dict[str, Any] = {
                 metric: tensor for metric, tensor in self.results[attack_type].items()
             }
+            attack_results["image_indices"] = list(range(self.n_images))
+            attack_results["image_ids"] = self.source_image_ids
             attack_results["restart_results"] = self.restart_results[attack_type]
             attack_results["location_results"] = self.location_results[attack_type]
             combined_results[attack_type] = attack_results
         return combined_results
+
+    def is_task_complete(self, attack_type: str, budget_index: int, image_index: int) -> bool:
+        """Check whether a specific attack/budget/image tuple has already been recorded."""
+        return self.location_results[attack_type][budget_index][image_index] is not None
     
     def get_attack_type_results(self, attack_type: str) -> Dict[str, torch.Tensor]:
         """Get results for a specific attack type."""
@@ -352,13 +414,16 @@ class EvaluationRunner:
         self.config = config
         self.pipeline = pipeline
         self.results_manager = ResultsManager(config.results_dir, config.plots_dir)
+        self.state_signature = self._build_state_signature()
         
         # Load images
         print(f"Loading {config.n_images} images from {config.dataset} dataset...")
-        self.source_images, self.source_gps = ImageLoader.load_images(
+        self.source_images, self.source_gps, self.source_image_ids = ImageLoader.load_images(
             dataset=config.dataset,
             n_images=config.n_images,
+            seed=config.seed,
             use_real_gps=config.use_real_gps,
+            dataset_roots=config.dataset_roots,
         )
 
         self.metrics_collector = MetricsCollector(
@@ -367,7 +432,94 @@ class EvaluationRunner:
             n_images=config.n_images,
             stored_metrics=config.stored_metrics,
             source_gps=self.source_gps,
+            source_image_ids=self.source_image_ids,
         )
+        self._load_state_if_available()
+
+    def _build_state_signature(self) -> Dict[str, Any]:
+        """Create a compact signature that guards resume compatibility."""
+        return {
+            "dataset": self.config.dataset,
+            "seed": self.config.seed,
+            "attack_types": list(self.config.attack_types),
+            "attack_budgets": list(self.config.attack_budgets),
+            "attack_kwargs": self.config.attack_kwargs,
+            "n_images": self.config.n_images,
+            "stored_metrics": list(self.config.stored_metrics),
+            "use_real_gps": self.config.use_real_gps,
+            "dataset_roots": self.config.dataset_roots or {},
+            "state_suffix": self.config.state_suffix,
+        }
+
+    def _build_state(self) -> Dict[str, Any]:
+        """Collect the current incremental state for persistence."""
+        results = {
+            attack_type: {
+                metric: tensor.detach().cpu()
+                for metric, tensor in attack_results.items()
+            }
+            for attack_type, attack_results in self.metrics_collector.results.items()
+        }
+        return {
+            "version": 1,
+            "signature": self.state_signature,
+            "source_image_ids": list(self.source_image_ids) if self.source_image_ids is not None else None,
+            "image_indices": list(range(self.config.n_images)),
+            "results": results,
+            "restart_results": self.metrics_collector.restart_results,
+            "location_results": self.metrics_collector.location_results,
+        }
+
+    def _load_state_if_available(self) -> None:
+        """Restore progress from a previous interrupted run when compatible."""
+        state = self.results_manager.load_state(
+            self.config.dataset,
+            self.config.seed,
+            suffix=self.config.state_suffix,
+        )
+        if state is None:
+            return
+
+        if state.get("signature") != self.state_signature:
+            print("Existing evaluation state does not match the current configuration; starting fresh.")
+            return
+
+        saved_image_ids = state.get("source_image_ids")
+        if saved_image_ids is not None and saved_image_ids != self.source_image_ids:
+            print("Existing evaluation state was built from a different image ordering; starting fresh.")
+            return
+
+        results = state.get("results")
+        restart_results = state.get("restart_results")
+        location_results = state.get("location_results")
+        if results is None or restart_results is None or location_results is None:
+            print("Existing evaluation state is incomplete; starting fresh.")
+            return
+
+        self.metrics_collector.results = results
+        self.metrics_collector.restart_results = restart_results
+        self.metrics_collector.location_results = location_results
+        print(f"Resumed evaluation state from {self.results_manager.get_state_path(self.config.dataset, self.config.seed, self.config.state_suffix)}")
+
+    def save_state(self) -> None:
+        """Persist the current incremental evaluation state."""
+        self.results_manager.save_state(
+            self._build_state(),
+            self.config.dataset,
+            self.config.seed,
+            suffix=self.config.state_suffix,
+        )
+
+    def get_attack_configs(self, pending_only: bool = True) -> List[Tuple[str, int, int, Image.Image]]:
+        """Build the evaluation task list, optionally skipping completed tasks."""
+        attack_configs: List[Tuple[str, int, int, Image.Image]] = []
+        for attack_type in self.config.attack_types:
+            for budget_idx, _ in enumerate(self.config.attack_budgets):
+                for image_idx, image in enumerate(self.source_images):
+                    if pending_only and self.metrics_collector.is_task_complete(attack_type, budget_idx, image_idx):
+                        continue
+                    attack_configs.append((attack_type, budget_idx, image_idx, image))
+        return attack_configs
     
     def save_results(self) -> None:
         """Save collected results and attack arguments."""
@@ -449,6 +601,7 @@ def parallel_evaluate_attacks(
                 image_idx,
                 result,
             )
+            runner.save_state()
             eps = config.attack_budgets[budget_idx]
             pbar.set_postfix(
                 attack=attack_type,
@@ -462,54 +615,55 @@ def parallel_evaluate_attacks(
 
 def sequential_evaluate_attacks(
     runner: EvaluationRunner,
+    attack_configs: Optional[List[Tuple[str, int, int, Image.Image]]] = None,
 ) -> None:
     """Run attacks sequentially."""
     from attacks.attacks import run_attack
     config = runner.config
-    total = len(config.attack_types) * len(config.attack_budgets) * len(runner.source_images)
+    if attack_configs is None:
+        attack_configs = runner.get_attack_configs(pending_only=True)
+    total = len(attack_configs)
     
     pbar = tqdm_module.tqdm(total=total, desc="Evaluating attacks")
     
-    for attack_type in config.attack_types:
-        for budget_idx, eps in enumerate(config.attack_budgets):
-            for image_idx, image in enumerate(runner.source_images):
-                kwargs = dict(config.attack_kwargs[budget_idx])
-                
-                result = run_attack(
-                    attack_type=attack_type,
-                    source_image=image,
-                    pipeline=runner.pipeline,
-                    eps_max=eps,
-                    silent=True,
-                    **kwargs,
-                )
-                runner.metrics_collector.record_attack_result(
-                    attack_type,
-                    budget_idx,
-                    image_idx,
-                    result,
-                )
-                
-                pbar.set_postfix(
-                    attack=attack_type,
-                    eps=f"{eps:.4f}",
-                    image=f"{image_idx+1}/{config.n_images}"
-                )
-                pbar.update(1)
+    for attack_type, budget_idx, image_idx, image in attack_configs:
+        eps = config.attack_budgets[budget_idx]
+        kwargs = dict(config.attack_kwargs[budget_idx])
+
+        result = run_attack(
+            attack_type=attack_type,
+            source_image=image,
+            pipeline=runner.pipeline,
+            eps_max=eps,
+            silent=True,
+            **kwargs,
+        )
+        runner.metrics_collector.record_attack_result(
+            attack_type,
+            budget_idx,
+            image_idx,
+            result,
+        )
+        runner.save_state()
+
+        pbar.set_postfix(
+            attack=attack_type,
+            eps=f"{eps:.4f}",
+            image=f"{image_idx+1}/{config.n_images}"
+        )
+        pbar.update(1)
     
     pbar.close()
 
 
 def run_evaluation(runner: EvaluationRunner) -> None:
     """Execute evaluation with appropriate execution strategy."""
+    attack_configs = runner.get_attack_configs(pending_only=True)
+    if len(attack_configs) == 0:
+        print("No pending evaluation tasks. Using existing saved state/results.")
+        return
+
     if runner.config.parallel_workers > 1:
-        # Build task list for parallel execution
-        attack_configs = [
-            (at, bi, ii, img)
-            for at in runner.config.attack_types
-            for bi in range(len(runner.config.attack_budgets))
-            for ii, img in enumerate(runner.source_images)
-        ]
         parallel_evaluate_attacks(runner, attack_configs)
     else:
-        sequential_evaluate_attacks(runner)
+        sequential_evaluate_attacks(runner, attack_configs)

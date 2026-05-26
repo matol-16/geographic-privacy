@@ -12,8 +12,10 @@ Organized into sections:
 from __future__ import annotations
 
 import inspect
+import random
 from typing import Any, Callable, Dict, Optional
 
+import numpy as np
 from torchvision import transforms
 import torch
 from PIL import Image
@@ -31,6 +33,16 @@ def resolve_torch_device(device: Any = "cuda") -> str:
     if resolved.startswith("cuda") and not torch.cuda.is_available():
         return "cpu"
     return resolved
+
+
+def seed_everything(seed: int) -> None:
+    """Seed Python, NumPy, and Torch for deterministic experiment setup."""
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def make_shared_initial_noise(

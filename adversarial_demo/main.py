@@ -29,6 +29,7 @@ from utils.adversarial_eval import (
     evaluate_attack_on_dataset,
     evaluate_localizability,
 )
+from utils.adversarial_utils import seed_everything
 from utils.plots_adversarial_attacks import (
     plot_results,
     plot_attack_success_rate,
@@ -96,12 +97,15 @@ def parse_override_arg(arg: str) -> tuple[str, Any]:
     key = key.strip()
     value_str = value_str.strip()
     
-    # Try to parse as YAML to handle numbers, booleans, lists, etc.
-    try:
-        value = yaml.safe_load(value_str)
-    except yaml.YAMLError:
-        # Fallback to string
-        value = value_str
+    if value_str == "":
+        value = ""
+    else:
+        # Try to parse as YAML to handle numbers, booleans, lists, etc.
+        try:
+            value = yaml.safe_load(value_str)
+        except yaml.YAMLError:
+            # Fallback to string
+            value = value_str
     
     return key, value
 
@@ -183,6 +187,9 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
     
     results_dir = pick_value(args.results_dir, config.get("results_dir"), str(DEFAULT_RESULTS_DIR))
     plots_dir = pick_value(args.plots_dir, config.get("plots_dir"), str(DEFAULT_PLOTS_DIR))
+    seed = int(config.get("seed", 0))
+
+    seed_everything(seed)
     
     # Get pipeline
     pipeline = get_pipeline(config, dataset)
@@ -215,6 +222,7 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
         pipeline=pipeline,
         dataset_name=dataset,
         source_image=None,
+        seed=seed,
         use_real_gps=pick_value(args.use_real_gps, config.get("use_real_gps"), False),
         n_images_to_eval=n_images,
         plot_dir=plots_dir,
@@ -253,6 +261,9 @@ def cmd_evaluate_localizability(args, config: Dict[str, Any]) -> None:
     
     results_dir = pick_value(args.results_dir, config.get("results_dir"), str(DEFAULT_RESULTS_DIR))
     plots_dir = pick_value(args.plots_dir, config.get("plots_dir"), str(DEFAULT_PLOTS_DIR))
+    seed = int(config.get("seed", 0))
+
+    seed_everything(seed)
     
     # Get pipeline
     pipeline = get_pipeline(config, dataset)
@@ -275,6 +286,7 @@ def cmd_evaluate_localizability(args, config: Dict[str, Any]) -> None:
         attack_types=attack_types,
         pipeline=pipeline,
         dataset_name=dataset,
+        seed=seed,
         n_images_to_eval=n_images,
         plot_dir=plots_dir,
         results_dir=results_dir,
@@ -442,12 +454,13 @@ Examples:
     )
     
     # Global arguments
-    parser.add_argument(
+    global_parser = argparse.ArgumentParser(add_help=False)
+    global_parser.add_argument(
         "--config",
         default=str(DEFAULT_CONFIG_PATH),
         help=f"Path to config file (default: {DEFAULT_CONFIG_PATH})",
     )
-    parser.add_argument(
+    global_parser.add_argument(
         "--override",
         action="append",
         default=[],
@@ -461,6 +474,7 @@ Examples:
     eval_dataset = subparsers.add_parser(
         "evaluate-dataset",
         help="Evaluate attacks on a dataset",
+        parents=[global_parser],
     )
     eval_dataset.add_argument(
         "--dataset",
@@ -501,6 +515,7 @@ Examples:
     eval_local = subparsers.add_parser(
         "evaluate-localizability",
         help="Evaluate attack effectiveness by image localizability",
+        parents=[global_parser],
     )
     eval_local.add_argument(
         "--dataset",
@@ -530,6 +545,7 @@ Examples:
     plot_cmd = subparsers.add_parser(
         "plot",
         help="Plot saved results",
+        parents=[global_parser],
     )
     plot_cmd.add_argument(
         "plot_type",
@@ -560,6 +576,7 @@ Examples:
     subparsers.add_parser(
         "list-configs",
         help="List available configuration parameters",
+        parents=[global_parser],
     )
     
     return parser

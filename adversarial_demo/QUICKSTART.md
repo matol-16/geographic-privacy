@@ -92,7 +92,9 @@ After running an evaluation, check:
 
 - `results_dir` in [config.yaml](config.yaml) - All result files are saved there
   - `{dataset}_{attack_type}_results.pt` - Metric tensors
+  - `{dataset}_{attack_type}_results.pt` also includes `image_ids` and `image_indices` so results can be mapped back to the source dataset order without storing extra per-image metadata
   - `{dataset}_attack_args.pt` - Hyperparameters used
+- Resumable evaluations also save a state file named `{dataset}_seed{seed}_eval_state.pt` in `results_dir`, and rerunning the same evaluation resumes from the next unfinished image/budget pair when the state matches the current config
 - `plots_dir` in [config.yaml](config.yaml) - All generated plots are saved there
 
 The evaluation path is intentionally thin now: `core.py` orchestrates the loop, `attacks.py` dispatches to the attack implementation, and the attack classes handle the optimization details. That keeps the hot path focused on the per-image work, which matters most for large batches.

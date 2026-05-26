@@ -58,3 +58,5 @@ It is organized as follows ($\dagger$ specifies if the given code was coded with
 **Others**
 - Evaluation results are stored in the *results* folder. One can run directly our plotting methods that retrieve stored results.
 - *archive_code* consists of code used during the exploratory phase.
+
+The adversarial demo evaluation pipeline in `adversarial_demo` now supports resuming interrupted runs from a saved state file, and the saved results include compact `image_ids` and `image_indices` so each output can be mapped back to the source dataset order.

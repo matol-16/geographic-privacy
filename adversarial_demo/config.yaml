@@ -2,10 +2,11 @@
 
 # Device configuration
 device: "cuda"
+seed: 42
 
 # Dataset configuration
 dataset: "yfcc" # Options: "yfcc" or "osv"
-n_images_to_eval: 50
+n_images_to_eval: 100
 data_root: "/Data/mathias.ollu/hf_cache/datasets"
 data_dirs:
   yfcc: "/Data/mathias.ollu/hf_cache/datasets/YFCC100M/yfcc4k"
@@ -20,8 +21,8 @@ build_yfcc4k:
   imagedata_txt_name: "0aaaa.r.imagedata.txt"
 
 # Evaluation directories
-results_dir: "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/results_2405"
-plots_dir: "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/results_2405/plots_2405"
+results_dir: "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/results_2605_riemann_cosine_sim"
+plots_dir: "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/results_2605_riemann_cosine_sim/plots_2605"
 
 # Parallel processing
 parallel_workers: 4
