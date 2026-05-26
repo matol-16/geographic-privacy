@@ -281,11 +281,9 @@ class MetricsCollector:
 
         normalized: Dict[str, Any] = {
             "metrics": dict(restart_result.get("metrics", {})),
-            # store only last-step coordinates (small) instead of full trajectories
+            # store only final-step coordinates (small) instead of full trajectories
             "gps_source": _final_step_tensor(restart_result.get("gps_source")),
             "gps_perturbed": _final_step_tensor(restart_result.get("gps_perturbed")),
-            "traj_source": _final_step_tensor(restart_result.get("traj_source")),
-            "traj_perturbed": _final_step_tensor(restart_result.get("traj_perturbed")),
         }
 
         clean_metric = normalized["metrics"].get("final_step_displacement")
