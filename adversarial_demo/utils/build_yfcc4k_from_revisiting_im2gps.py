@@ -14,7 +14,7 @@ from tqdm import tqdm
 IMAGES_PAGE_URL = "http://www.mediafire.com/file/3og8y3o6c9de3ye/yfcc4k.zip"
 METADATA_PAGE_URL = "http://www.mediafire.com/file/8v2j565997i5jed/0aaaa.r.imagedata.txt"
 
-DEFAULT_CONFIG_PATH = Path(__file__).with_name("config.yaml")
+DEFAULT_CONFIG_PATH = "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/config.yaml"
 
 
 def load_config(config_path: str) -> dict:

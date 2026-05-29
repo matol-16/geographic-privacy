@@ -317,20 +317,22 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
     print(f"Plots directory: {plots_dir}")
     print(f"{'='*60}\n")
     
-    if plot_type == "results":
-        attack_budgets = config.get("attack_budgets", {}).get(dataset)
-        if not attack_budgets:
-            raise ValueError(f"No attack budgets configured for dataset: {dataset}")
+    attack_budgets = config.get("attack_budgets", {}).get(dataset)
+    if not attack_budgets:
+        raise ValueError(f"No attack budgets configured for dataset: {dataset}")
+    
+    attack_types = pick_value(args.attack_types, config.get("attack_types"), DEFAULT_ATTACK_TYPES)
+    gps_true = bool(get_nested_config(config, "plot", "gps_true", default=False))
+    plot_success_rate = bool(get_nested_config(config, "plot", "plot_success_rate", default=False))
+    success_rate_thresholds = get_nested_config(
+        config,
+        "plot",
+        "attack_success_rate_thresholds",
+        default=DEFAULT_SUCCESS_RATE_THRESHOLDS,
+    )
         
-        attack_types = pick_value(args.attack_types, config.get("attack_types"), DEFAULT_ATTACK_TYPES)
-        gps_true = bool(get_nested_config(config, "plot", "gps_true", default=False))
-        plot_success_rate = bool(get_nested_config(config, "plot", "plot_success_rate", default=False))
-        success_rate_thresholds = get_nested_config(
-            config,
-            "plot",
-            "attack_success_rate_thresholds",
-            default=DEFAULT_SUCCESS_RATE_THRESHOLDS,
-        )
+    
+    if plot_type == "results":
         
         print(f"Plotting results for attacks: {attack_types}")
         
@@ -380,7 +382,9 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
             attack_budgets=attack_budgets,
             plot_dir=plots_dir,
             dataset_name=dataset,
+            attack_types=attack_types,
             gps_true=gps_true,
+            threshold_km=success_rate_thresholds,
         )
     
     else:

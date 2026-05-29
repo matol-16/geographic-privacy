@@ -1,3 +1,4 @@
+import os
 import matplotlib.pyplot as plt
 from typing import Any
 from matplotlib import colormaps
@@ -8,8 +9,63 @@ from torchvision import transforms
 import torch
 from PIL import Image
 import numpy as np
+from pathlib import Path
+from matplotlib.ticker import FixedFormatter, FixedLocator, NullLocator
 
 from utils.adversarial_metrics import trajectory_displacement
+
+
+def _load_attack_results(results_dir, dataset_name, attack_types):
+    """Load per-attack results, falling back to a saved evaluation state if needed."""
+    if results_dir is None:
+        raise ValueError("results_dir must be provided when all_results/results are not supplied")
+
+    loaded_results = {}
+    missing_attack_types = []
+    for attack_type in attack_types:
+        results_path = os.path.join(results_dir, f"{dataset_name}_{attack_type}_results.pt")
+        if os.path.exists(results_path):
+            loaded_results[attack_type] = torch.load(results_path)
+        else:
+            missing_attack_types.append(attack_type)
+
+    if not missing_attack_types:
+        return loaded_results
+
+    state_candidates = sorted(
+        Path(results_dir).glob(f"{dataset_name}_seed*_eval_state*.pt"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not state_candidates:
+        missing_paths = [os.path.join(results_dir, f"{dataset_name}_{attack_type}_results.pt") for attack_type in missing_attack_types]
+        raise FileNotFoundError(
+            "Missing saved results files and no evaluation state was found. "
+            f"Missing: {missing_paths}"
+        )
+
+    state = torch.load(state_candidates[0], map_location="cpu")
+    state_results = state.get("results") if isinstance(state, dict) else None
+    if not isinstance(state_results, dict):
+        missing_paths = [os.path.join(results_dir, f"{dataset_name}_{attack_type}_results.pt") for attack_type in missing_attack_types]
+        raise FileNotFoundError(
+            "Missing saved results files and the latest evaluation state does not contain results. "
+            f"Missing: {missing_paths}"
+        )
+
+    for attack_type in missing_attack_types:
+        if attack_type in state_results:
+            loaded_results[attack_type] = state_results[attack_type]
+
+    still_missing = [attack_type for attack_type in attack_types if attack_type not in loaded_results]
+    if still_missing:
+        missing_paths = [os.path.join(results_dir, f"{dataset_name}_{attack_type}_results.pt") for attack_type in still_missing]
+        raise FileNotFoundError(
+            "Missing saved results files and the available evaluation state does not cover all requested attack types. "
+            f"Missing: {missing_paths}"
+        )
+
+    return loaded_results
 
 
 def _sanitize_lon_lat(coords):
@@ -96,10 +152,16 @@ def _get_metric_samples_by_budget(attack_results, metric_name):
     return samples_by_budget
 
 
-def _summarize_samples(samples: np.ndarray) -> tuple[float, float, float, float]:
+def _summarize_samples(samples: np.ndarray, attack_name, budget) -> tuple[float, float, float, float]:
     finite = samples[np.isfinite(samples)]
     if finite.size == 0:
         return np.nan, np.nan, np.nan, np.nan
+    
+    #drop nan results and log the amount that was dropped
+    valid_finite= finite[~np.isnan(finite)]
+    nb_dropped= finite.size - valid_finite.size
+    if nb_dropped>0:
+        print(f"Budget {budget:.3f}, attack {attack_name}: Dropped {nb_dropped} samples out of {valid_finite.size} total samples for metric summarization.")
 
     with np.errstate(all="ignore"):
         mean_value = float(np.mean(finite))
@@ -452,9 +514,7 @@ def plot_results(
         if results is not None:
             all_results = {attack_types[0]: results}
         elif results_dir is not None:
-            all_results = {}
-            for at in attack_types:
-                all_results[at] = torch.load(os.path.join(results_dir, f"{dataset_name}_{at}_results.pt"))
+            all_results = _load_attack_results(results_dir, dataset_name, attack_types)
 
     for metric in stored_metrics:
         plt.figure(figsize=(10,8))
@@ -465,8 +525,8 @@ def plot_results(
                 continue
 
             summary = np.asarray([
-                _summarize_samples(samples)
-                for samples in budget_samples
+                _summarize_samples(samples, attack_name=at, budget=attack_budgets[i]) 
+                for i,samples in enumerate(budget_samples)
             ], dtype=np.float64)
             mean_metric = summary[:, 0]
             median_metric = summary[:, 1]
@@ -492,7 +552,11 @@ def plot_results(
         plt.yscale("log")
         
         
-        plt.xticks(attack_budgets, [f"{eps*255:.0f}" for eps in attack_budgets])
+        ax = plt.gca()
+        tick_labels = [f"{eps*255:.0f}" for eps in attack_budgets]
+        ax.xaxis.set_major_locator(FixedLocator(attack_budgets))
+        ax.xaxis.set_major_formatter(FixedFormatter(tick_labels))
+        ax.xaxis.set_minor_locator(NullLocator())
         #replace y ticks with nice values (1km, 10km, 100km, 1000km, 10000km)
         plt.yticks([1000, 2500,5000,10000], ["1,000 km", "2500 km","5,000 km", "10,000 km"], rotation = 90, va='center')  # Rotate y-tick labels for better readability
                 
@@ -532,9 +596,7 @@ def plot_attack_success_rate(
         if results is not None:
             all_results = {attack_types[0]: results}
         elif results_dir is not None:
-            all_results = {}
-            for at in attack_types:
-                all_results[at] = torch.load(os.path.join(results_dir, f"{dataset_name}_{at}_results.pt"))
+            all_results = _load_attack_results(results_dir, dataset_name, attack_types)
     if all_results is None:
         raise ValueError("No results available to plot. Provide results/all_results or a valid results_dir.")
 
@@ -574,6 +636,15 @@ def plot_attack_success_rate(
         budget_samples = _get_metric_samples_by_budget(res, metric_name)
         if budget_samples is None:
             continue
+        
+        #filter out nan vaues:
+        for i,samples in enumerate(budget_samples):
+            l_before= len(samples)
+            samples=samples[~np.isnan(samples)]
+            nb_dropped= l_before - samples.size
+            if nb_dropped>0:
+                print(f"Budget {attack_budgets[i]:.3f}, attack {at}: Dropped {nb_dropped} samples out of {l_before} total samples for success rate computation")
+            budget_samples[i]=samples
 
         success_curves = []
         for t in thresholds:
@@ -582,7 +653,7 @@ def plot_attack_success_rate(
                 for samples in budget_samples
             ])
             success_curves.append(success_rate)
-
+            
         success_curves = np.asarray(success_curves)
         if success_curves.shape[0] > 1:
             low_curve = np.min(success_curves, axis=0)
@@ -629,7 +700,11 @@ def plot_attack_success_rate(
     plt.grid(alpha=0.25, linestyle='--', linewidth=0.6)
     plt.legend(ncol=2, fontsize='x-large')
     plt.xscale("log")
-    plt.xticks(attack_budgets, [f"{eps*255:.0f}" for eps in attack_budgets])
+    ax = plt.gca()
+    tick_labels = [f"{eps*255:.0f}" for eps in attack_budgets]
+    ax.xaxis.set_major_locator(FixedLocator(attack_budgets))
+    ax.xaxis.set_major_formatter(FixedFormatter(tick_labels))
+    ax.xaxis.set_minor_locator(NullLocator())
 
 
     if plot_dir is not None:
