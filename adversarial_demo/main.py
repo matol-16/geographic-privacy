@@ -44,6 +44,42 @@ DEFAULT_STORED_METRICS = ["final_step_displacement_predicted", "final_step_displ
 DEFAULT_SUCCESS_RATE_THRESHOLDS = [200, 750, 2500]
 
 
+def _parse_override_value(value_str: str) -> Any:
+    """Parse override values using YAML rules, matching OmegaConf-style typing."""
+    if value_str == "":
+        return ""
+
+    try:
+        return yaml.safe_load(value_str)
+    except yaml.YAMLError:
+        return value_str
+
+
+def _set_nested_value(config: Dict[str, Any], key_path: str, value: Any) -> None:
+    """Set a dotted key path inside a nested config mapping.
+
+    This intentionally mirrors OmegaConf dotlist behavior for dictionary-like
+    config trees while keeping the runtime object a plain Python dict.
+    """
+    parts = key_path.split(".")
+    current: Any = config
+
+    for part in parts[:-1]:
+        if not isinstance(current, dict):
+            raise TypeError(f"Cannot override nested key '{key_path}' because '{part}' is not a mapping")
+        if part not in current or current[part] is None:
+            current[part] = {}
+        elif not isinstance(current[part], dict):
+            raise TypeError(
+                f"Cannot override nested key '{key_path}' because '{part}' is not a mapping"
+            )
+        current = current[part]
+
+    if not isinstance(current, dict):
+        raise TypeError(f"Cannot override key '{key_path}' because parent is not a mapping")
+    current[parts[-1]] = value
+
+
 def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
     """Load YAML configuration file."""
     config_file = Path(config_path) if config_path is not None else DEFAULT_CONFIG_PATH
@@ -65,21 +101,15 @@ def load_config(config_path: Optional[str] = None) -> Dict[str, Any]:
 def merge_overrides(config: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
     """
     Merge command-line overrides into config dictionary.
-    
-    Handles nested keys with dot notation, e.g., 'attack_budgets.yfcc' or 'plot.stored_metrics'.
+
+    Nested keys use dot notation, matching OmegaConf-style dotlist overrides.
     """
     for key, value in overrides.items():
         if "." in key:
-            # Handle nested keys
-            parts = key.split(".")
-            current = config
-            for part in parts[:-1]:
-                if part not in current:
-                    current[part] = {}
-                current = current[part]
-            current[parts[-1]] = value
-        else:
-            config[key] = value
+            _set_nested_value(config, key, value)
+            continue
+
+        config[key] = value
     
     return config
 
@@ -96,18 +126,8 @@ def parse_override_arg(arg: str) -> tuple[str, Any]:
     key, value_str = arg.split("=", 1)
     key = key.strip()
     value_str = value_str.strip()
-    
-    if value_str == "":
-        value = ""
-    else:
-        # Try to parse as YAML to handle numbers, booleans, lists, etc.
-        try:
-            value = yaml.safe_load(value_str)
-        except yaml.YAMLError:
-            # Fallback to string
-            value = value_str
-    
-    return key, value
+
+    return key, _parse_override_value(value_str)
 
 
 def get_nested_config(config: Dict[str, Any], *keys: str, default: Any = None) -> Any:
@@ -451,6 +471,11 @@ Examples:
   python main.py evaluate-dataset --dataset yfcc \\
     --override 'attack_budgets.yfcc=[0.01, 0.05]' \\
     --override parallel_workers=4
+
+    # Dot notation and YAML typing work together
+    python main.py evaluate-dataset --dataset yfcc \
+        --override plot.gps_true=true \
+        --override 'plot.stored_metrics=["final_step_displacement_predicted"]'
   
   # Use custom config file
   python main.py --config custom_config.yaml evaluate-dataset --dataset yfcc

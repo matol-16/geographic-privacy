@@ -21,8 +21,8 @@ build_yfcc4k:
   imagedata_txt_name: "0aaaa.r.imagedata.txt"
 
 # Evaluation directories
-results_dir: "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/results_2605_riemann_cosine_sim"
-plots_dir: "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/results_2605_riemann_cosine_sim/plots_2605"
+results_dir: "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/results_2405_cosine_sim"
+plots_dir: "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/results_2405_cosine_sim/plots_2405"
 
 # Parallel processing
 parallel_workers: 4

@@ -19,6 +19,19 @@ python main.py evaluate-dataset --dataset osv
 
 The default dataset locations are read from [config.yaml](config.yaml). If your data lives elsewhere, update `data_root`, `data_dirs`, and `build_yfcc4k` there rather than passing ad hoc paths on the command line.
 
+### Shell Launchers
+
+For repeatable runs, use the scripts in [scripts/](scripts) and edit the variables at the top of each file:
+
+```bash
+bash scripts/evaluate_dataset.sh
+bash scripts/evaluate_localizability.sh
+bash scripts/plot_results.sh
+bash scripts/plot_success_rate.sh
+```
+
+These scripts keep [config.yaml](config.yaml) as the baseline and only add command-line overrides when you edit the in-file variables.
+
 ### With Custom Parameters
 
 ```bash
@@ -67,6 +80,8 @@ python main.py evaluate-dataset --dataset yfcc \
   --override parallel_workers=2 \
   --override use_cuda_streams=false
 ```
+
+Overrides use dot notation for nested config values and YAML parsing for values, so booleans, numbers, lists, and dictionaries are handled naturally.
 
 ### Building YFCC4k
 
