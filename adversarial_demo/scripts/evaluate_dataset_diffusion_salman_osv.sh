@@ -6,29 +6,38 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/common.sh"
 PROJECT_DIR="$(repo_root)"
 
-# Edit these values to match the results you want to visualize.
+# Edit these values to match the experiment you want to run.
 CONFIG_PATH="${PROJECT_DIR}/config.yaml"
-DATASET="yfcc"
-ATTACK_TYPES=(geoshield diffusion)
-RESULTS_DIR="${PROJECT_DIR}/results/results_2405_cosine_sim"
-PLOTS_DIR="${RESULTS_DIR}/plots_0306"
-PLOT_TYPE="results"
+DATASET="osv"
+ATTACK_TYPES=(diffusion_salman)
+N_IMAGES=100
+RESULTS_DIR="${PROJECT_DIR}/results/results_diffusion_salman"
+PLOTS_DIR="${RESULTS_DIR}/plots"
+PARALLEL_WORKERS=4
+USE_REAL_GPS=false
 OVERRIDES=(
-  # "plot.gps_true=true"
+  "attack_budgets.osv=[0.0157, 0.0314]"
 )
+
 
 cd "${PROJECT_DIR}"
 
 cmd=(
-  python main.py plot "${PLOT_TYPE}"
+  python main.py evaluate-dataset
   --config "${CONFIG_PATH}"
   --dataset "${DATASET}"
+  --n-images "${N_IMAGES}"
   --results-dir "${RESULTS_DIR}"
   --plots-dir "${PLOTS_DIR}"
+  --parallel-workers "${PARALLEL_WORKERS}"
 )
 
 if ((${#ATTACK_TYPES[@]})); then
   cmd+=(--attack-types "${ATTACK_TYPES[@]}")
+fi
+
+if [[ "${USE_REAL_GPS}" == true ]]; then
+  cmd+=(--use-real-gps)
 fi
 
 for override in "${OVERRIDES[@]}"; do

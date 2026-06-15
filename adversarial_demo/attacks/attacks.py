@@ -11,6 +11,7 @@ from PIL import Image
 from utils.adversarial_utils import filter_kwargs_for, add_perturbation_to_image, resolve_torch_device
 from attacks.encoder_attacks import EncoderAttack
 from attacks.trajectory_deviation import DiffusionAttack
+from attacks.diffusion_attack_salman import DiffusionAttack as SalmanDiffusionAttack
 
 
 def _run_restartable_attack(
@@ -90,7 +91,7 @@ def run_attack(
 	chosen attack class will be forwarded (unrecognised keys are ignored).
 
 	Args:
-		attack_type: "encoder" or "diffusion".
+		attack_type: "encoder", "diffusion", or "diffusion_salman".
 		source_image: PIL source image to attack.
 		pipeline: PLONK pipeline instance.
 		target_image: Target image for targeted encoder attacks.
@@ -117,6 +118,8 @@ def run_attack(
 		"enc": "encoder",
 		"diffusion": "diffusion",
 		"diff": "diffusion",
+		"diffusion_salman": "diffusion_salman",
+		"salman": "diffusion_salman",
 	}
 	normalized_type = aliases.get(str(attack_type).lower())
 	if normalized_type is None:
@@ -132,12 +135,17 @@ def run_attack(
 			pipeline=pipeline,
 			**kwargs
 		)
-	else:
+	if normalized_type == "diffusion":
 		return _run_diffusion_attack(
 			source_image=source_image,
 			pipeline=pipeline,
 			**kwargs
 		)
+	return _run_diffusion_salman_attack(
+		source_image=source_image,
+		pipeline=pipeline,
+		**kwargs
+	)
 
 
 def _run_encoder_attack(
@@ -211,6 +219,7 @@ def _run_diffusion_attack(
 	target_pure_noise: bool = False,
 	dot_product_loss: str = "absolute",
 	reconstruction_loss_weight: float = 0.0,
+	delta_init: float = 1e-4,
 	num_restarts: int = 1,
 	restart_selection_metric: str = "mean_step_displacement",
 	restart_eval_batch_size: int = 256,
@@ -252,6 +261,7 @@ def _run_diffusion_attack(
 		target_pure_noise=target_pure_noise,
 		dot_product_loss=dot_product_loss,
 		reconstruction_loss_weight=reconstruction_loss_weight,
+		delta_init=delta_init,
 		num_restarts=num_restarts,
 		restart_selection_metric=restart_selection_metric,
 		device=device,
@@ -262,6 +272,68 @@ def _run_diffusion_attack(
 	return _run_restartable_attack(
 		attack=attack,
 		attack_type="diffusion",
+		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
+		show_progress=show_progress,
+		early_stopping_patience=early_stopping_patience,
+		restart_eval_batch_size=restart_eval_batch_size,
+		restart_eval_cfg=restart_eval_cfg,
+		restart_eval_num_steps=restart_eval_num_steps,
+		restart_eval_seed=restart_eval_seed,
+		num_restart_workers=num_restart_workers,
+	)
+
+
+def _run_diffusion_salman_attack(
+	source_image: Image.Image,
+	pipeline,
+	n_steps: int = 400,
+	train_batch_size: int = 64,
+	lr: float = 2e-2,
+	eps_max: float = 1.0,
+	anchor_samples: int = 256,
+	sampling_steps_salman: int = 16,
+	clean_num_steps: int = 100,
+	target_pure_noise: bool = False,
+	dot_product_loss: str = "absolute",
+	reconstruction_loss_weight: float = 0.0,
+	delta_init: float = 1e-4,
+	num_restarts: int = 1,
+	restart_selection_metric: str = "mean_step_displacement",
+	restart_eval_batch_size: int = 256,
+	restart_eval_cfg: float = 10.0,
+	restart_eval_num_steps: Optional[int] = None,
+	restart_eval_seed: int = 1234,
+	print_restart_results: bool = True,
+	show_progress: bool = True,
+	device: str = "cuda",
+	early_stopping_patience: int = 0,
+	num_restart_workers: int = 1,
+	**kwargs,
+) -> Dict[str, Any]:
+	"""Run the Salman diffusion attack through the full sampling trajectory."""
+	attack = SalmanDiffusionAttack(
+		pipeline=pipeline,
+		source_image=source_image,
+		n_steps=n_steps,
+		train_batch_size=train_batch_size,
+		lr=lr,
+		eps_max=eps_max,
+		anchor_samples=anchor_samples,
+		sampling_steps_salman=sampling_steps_salman,
+		clean_num_steps=clean_num_steps,
+		target_pure_noise=target_pure_noise,
+		dot_product_loss=dot_product_loss,
+		reconstruction_loss_weight=reconstruction_loss_weight,
+		delta_init=delta_init,
+		num_restarts=num_restarts,
+		restart_selection_metric=restart_selection_metric,
+		device=device,
+	)
+	attack.restart_manager.print_results = print_restart_results
+
+	return _run_restartable_attack(
+		attack=attack,
+		attack_type="diffusion_salman",
 		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
 		show_progress=show_progress,
 		early_stopping_patience=early_stopping_patience,
@@ -285,6 +357,8 @@ def run_attack_and_build_image(
 	Returns a dict with:
 	  - attack_result: output of run_attack(...)
 	  - perturbed_image: PIL image built from source_image + learned delta
+   
+   Not used !
 	"""
 	attack_result = run_attack(
 		attack_type=attack_type,

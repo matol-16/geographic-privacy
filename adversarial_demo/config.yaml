@@ -38,6 +38,7 @@ pipelines:
 # Attack budgets (epsilon values) per dataset
 attack_budgets:
   yfcc: [0.0157, 0.0314, 0.0628] #4,8,16/255
+  # yfcc: [0.0157, 0.0314] #4,8,16/255
   osv: [0.0157, 0.0314, 0.0628] #4,8,16/255
 
 # Baseline attack training arguments
@@ -47,30 +48,37 @@ attack_train_args:
     train_batch_size: 256
     lr: 0.001
     anchor_samples: 512
+    sampling_steps_salman: 16
     clean_num_steps: 100
     target_pure_noise: false
-    dot_product_loss: "cosine_similarity"
+    dot_product_loss: "cosine_similarity_negative"
     reconstruction_loss_weight: 0.0
     num_restarts: 5
     restart_selection_metric: "final_step_displacement"
     restart_eval_cfg: 10.0
     restart_eval_batch_size: 128
+    restart_eval_seed: seed
+    restart_eval_num_steps: 250
   osv:
     n_steps: 60
     train_batch_size: 256
     lr: 0.001
     anchor_samples: 512
+    sampling_steps_salman: 16
     clean_num_steps: 100
     target_pure_noise: false
-    dot_product_loss: "cosine_similarity"
+    dot_product_loss: "cosine_similarity_negative"
     reconstruction_loss_weight: 0.0
     num_restarts: 5
     restart_selection_metric: "final_step_displacement"
     restart_eval_cfg: 10.0
     restart_eval_batch_size: 128
+    restart_eval_seed: seed
+    restart_eval_num_steps: 250
+
 
 # Default attack types to evaluate
-attack_types: ["encoder", "diffusion"]
+attack_types: ["encoder", "diffusion", "diffusion_salman"]
 
 # Localizability evaluation options
 localizability:

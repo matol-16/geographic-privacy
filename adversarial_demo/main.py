@@ -5,6 +5,7 @@ Command-line interface for adversarial attack experiments.
 Supports:
   - evaluate-dataset: Evaluate attacks on a dataset
   - evaluate-localizability: Evaluate attack effectiveness by image localizability
+    - evaluate-geoshield-vs-diffusion: Evaluate precomputed clean/attacked pairs
   - plot: Plot saved results or attack success rates
   - list-configs: List available config parameters
 
@@ -22,17 +23,21 @@ from typing import Any, Dict, List, Optional
 from pathlib import Path
 
 import torch
-from PIL import Image
 
 from utils.pipe_trajectory import PlonkPipelineTrajectory
 from utils.adversarial_eval import (
     evaluate_attack_on_dataset,
     evaluate_localizability,
 )
-from utils.adversarial_utils import seed_everything
+from utils.adversarial_utils import seed_everything, expand_to_budget_count
 from utils.plots_adversarial_attacks import (
     plot_results,
     plot_attack_success_rate,
+)
+from core import (
+    PrecomputedPairEvaluationConfig,
+    PrecomputedPairEvaluationRunner,
+    run_precomputed_pair_evaluation,
 )
 
 
@@ -42,6 +47,7 @@ DEFAULT_PLOTS_DIR = Path(__file__).with_name("plots")
 DEFAULT_ATTACK_TYPES = ["encoder", "diffusion"]
 DEFAULT_STORED_METRICS = ["final_step_displacement_predicted", "final_step_displacement_true"]
 DEFAULT_SUCCESS_RATE_THRESHOLDS = [200, 750, 2500]
+DEFAULT_GEOSHIELD_ATTACK_NAME = "geoshield"
 
 
 def _parse_override_value(value_str: str) -> Any:
@@ -185,10 +191,16 @@ def get_attack_kwargs(
 ) -> List[Dict[str, Any]]:
     """Return the base attack kwargs for the selected dataset."""
     device = get_device(config)
+    global_seed = int(config.get("seed", 0))
     
     base_kwargs = config.get("attack_train_args", {}).get(dataset, {})
     base_kwargs = dict(base_kwargs)  # Make a copy
     base_kwargs["device"] = device
+    restart_eval_seed = base_kwargs.get("restart_eval_seed")
+    if restart_eval_seed is None or restart_eval_seed == "seed":
+        base_kwargs["restart_eval_seed"] = global_seed
+    else:
+        base_kwargs["restart_eval_seed"] = int(restart_eval_seed)
     
     return [base_kwargs]
 
@@ -316,6 +328,141 @@ def cmd_evaluate_localizability(args, config: Dict[str, Any]) -> None:
         config_dump=config,
     )
     
+    print(f"\nEvaluation complete! Results saved to: {results_dir}")
+    print(f"Plots saved to: {plots_dir}")
+    
+    
+    
+def cmd_evaluate_geoshield_vs_diffusion(args, config: Dict[str, Any]) -> None:
+    """Evaluate precomputed clean/attacked image pairs and plot the results."""
+    dataset = pick_value(args.dataset, config.get("dataset"), "yfcc")
+    attack_name = pick_value(args.attack_name, config.get("attack_name"), DEFAULT_GEOSHIELD_ATTACK_NAME)
+
+    attack_budgets = pick_value(args.attack_budgets, config.get("attack_budgets"), None)
+    if attack_budgets is None:
+        attack_budgets = config.get("attack_budgets", {}).get(dataset)
+    if not attack_budgets:
+        raise ValueError("No attack budgets configured for the precomputed folder evaluation")
+
+    clean_image_dirs = pick_value(args.clean_image_dirs, config.get("clean_image_dirs"), None)
+    attacked_image_dirs = pick_value(args.attacked_image_dirs, config.get("attacked_image_dirs"), None)
+    if clean_image_dirs is None or attacked_image_dirs is None:
+        raise ValueError(
+            "Both --clean-image-dirs and --attacked-image-dirs must be provided, either on the CLI or in the config"
+        )
+
+    clean_image_dirs = expand_to_budget_count(clean_image_dirs, len(attack_budgets), "clean_image_dirs")
+    attacked_image_dirs = expand_to_budget_count(attacked_image_dirs, len(attack_budgets), "attacked_image_dirs")
+
+    results_dir = pick_value(args.results_dir, config.get("results_dir"), str(DEFAULT_RESULTS_DIR))
+    plots_dir = pick_value(args.plots_dir, config.get("plots_dir"), str(DEFAULT_PLOTS_DIR))
+    n_images = pick_value(args.n_images, config.get("n_images_to_eval"), None)
+    seed = int(config.get("seed", 0))
+    device = get_device(config)
+
+    seed_everything(seed)
+    pipeline = get_pipeline(config, dataset)
+
+    plot_gps_true = bool(get_nested_config(config, "plot", "gps_true", default=False))
+    if plot_gps_true:
+        print("Warning: plot.gps_true is enabled, but precomputed folder evaluation does not have ground-truth GPS labels. Using predicted displacement plots instead.")
+        plot_gps_true = False
+    plot_success_rate = bool(get_nested_config(config, "plot", "plot_success_rate", default=False))
+    success_rate_thresholds = get_nested_config(
+        config,
+        "plot",
+        "attack_success_rate_thresholds",
+        default=DEFAULT_SUCCESS_RATE_THRESHOLDS,
+    )
+
+    stored_metrics = get_nested_config(
+        config,
+        "plot",
+        "stored_metrics",
+        default=DEFAULT_STORED_METRICS,
+    )
+    resolved_stored_metrics = [
+        metric for metric in stored_metrics
+        if metric != "final_step_displacement_true"
+    ] or ["final_step_displacement_predicted"]
+
+    resolved_config = dict(config)
+    resolved_config.update(
+        {
+            "dataset": dataset,
+            "attack_name": attack_name,
+            "attack_budgets": list(attack_budgets),
+            "clean_image_dirs": list(clean_image_dirs),
+            "attacked_image_dirs": list(attacked_image_dirs),
+            "results_dir": results_dir,
+            "plots_dir": plots_dir,
+            "n_images_to_eval": n_images,
+            "plot": {
+                **dict(config.get("plot", {})),
+                "gps_true": plot_gps_true,
+                "plot_success_rate": plot_success_rate,
+                "attack_success_rate_thresholds": list(success_rate_thresholds),
+                "stored_metrics": resolved_stored_metrics,
+            },
+        }
+    )
+
+    print(f"\n{'='*60}")
+    print(f"Evaluating precomputed {attack_name} images on {dataset.upper()}")
+    print(f"{'='*60}")
+    print(f"Attack budgets: {attack_budgets}")
+    print(f"Clean image folders: {clean_image_dirs}")
+    print(f"Attacked image folders: {attacked_image_dirs}")
+    print(f"Results directory: {results_dir}")
+    print(f"Plots directory: {plots_dir}")
+    if n_images is not None:
+        print(f"Images to evaluate: {n_images}")
+    print(f"{'='*60}\n")
+
+    precomputed_config = PrecomputedPairEvaluationConfig(
+        dataset=dataset,
+        attack_name=attack_name,
+        seed=seed,
+        attack_budgets=list(attack_budgets),
+        clean_image_dirs=list(clean_image_dirs),
+        attacked_image_dirs=list(attacked_image_dirs),
+        results_dir=results_dir,
+        plots_dir=plots_dir,
+        stored_metrics=resolved_stored_metrics,
+        device=device,
+        n_images=n_images,
+    )
+    runner = PrecomputedPairEvaluationRunner(precomputed_config, pipeline)
+    runner.save_run_config(resolved_config, suffix=precomputed_config.state_suffix)
+
+    run_precomputed_pair_evaluation(runner)
+    runner.save_results()
+
+    all_results = runner.metrics_collector.get_results()
+
+    plot_results(
+        results_dir=results_dir,
+        attack_budgets=list(attack_budgets),
+        plot_dir=plots_dir,
+        dataset_name=dataset,
+        attack_types=[attack_name],
+        all_results=all_results,
+        stored_metrics=resolved_stored_metrics,
+        gps_true=False,
+    )
+
+    if plot_success_rate:
+        plot_attack_success_rate(
+            results_dir=results_dir,
+            attack_budgets=list(attack_budgets),
+            plot_dir=plots_dir,
+            dataset_name=dataset,
+            attack_types=[attack_name],
+            all_results=all_results,
+            threshold_km=list(success_rate_thresholds),
+            gps_true=False,
+        )
+
     print(f"\nEvaluation complete! Results saved to: {results_dir}")
     print(f"Plots saved to: {plots_dir}")
 
@@ -569,6 +716,51 @@ Examples:
         "--plots-dir",
         help="Directory to save plots",
     )
+
+    # evaluate-geoshield-vs-diffusion command
+    eval_geo = subparsers.add_parser(
+        "evaluate-geoshield-vs-diffusion",
+        help="Evaluate precomputed clean/attacked image pairs",
+        parents=[global_parser],
+    )
+    eval_geo.add_argument(
+        "--dataset",
+        choices=["yfcc", "osv"],
+        help="Dataset label used for saving results and plots",
+    )
+    eval_geo.add_argument(
+        "--attack-name",
+        help=f"Label for the evaluated attack (default: {DEFAULT_GEOSHIELD_ATTACK_NAME})",
+    )
+    eval_geo.add_argument(
+        "--attack-budgets",
+        nargs="+",
+        type=float,
+        help="Attack budgets aligned with the clean/attacked folder table",
+    )
+    eval_geo.add_argument(
+        "--clean-image-dirs",
+        nargs="+",
+        help="One clean image directory per budget",
+    )
+    eval_geo.add_argument(
+        "--attacked-image-dirs",
+        nargs="+",
+        help="One attacked image directory per budget",
+    )
+    eval_geo.add_argument(
+        "--n-images",
+        type=int,
+        help="Optional number of images to evaluate after matching pairs",
+    )
+    eval_geo.add_argument(
+        "--results-dir",
+        help="Directory to save results",
+    )
+    eval_geo.add_argument(
+        "--plots-dir",
+        help="Directory to save plots",
+    )
     
     # plot command
     plot_cmd = subparsers.add_parser(
@@ -640,6 +832,8 @@ def main():
         cmd_evaluate_dataset(args, config)
     elif args.command == "evaluate-localizability":
         cmd_evaluate_localizability(args, config)
+    elif args.command == "evaluate-geoshield-vs-diffusion":
+        cmd_evaluate_geoshield_vs_diffusion(args, config)
     elif args.command == "plot":
         cmd_plot(args, config)
     elif args.command == "list-configs":

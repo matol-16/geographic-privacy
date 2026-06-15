@@ -24,6 +24,7 @@ import tqdm as tqdm_module
 
 from utils.adversarial_metrics import trajectory_displacement
 from utils.adversarial_eval import retrieve_yfcc_images, retrieve_osv_images
+from utils.adversarial_utils import collect_common_image_pairs, run_paired_pipeline_with_shared_noise
 
 # Note: adversarial_eval imports and attacks imports are deferred to avoid circular imports
 
@@ -44,6 +45,26 @@ class EvaluationConfig:
     use_cuda_streams: bool = True
     use_real_gps: bool = False
     dataset_roots: Optional[Dict[str, str]] = None
+    state_suffix: str = ""
+
+
+@dataclass
+class PrecomputedPairEvaluationConfig:
+    """Configuration for evaluating precomputed clean/attacked image pairs."""
+    dataset: str
+    attack_name: str
+    seed: int
+    attack_budgets: List[float]
+    clean_image_dirs: List[str]
+    attacked_image_dirs: List[str]
+    results_dir: str
+    plots_dir: str
+    stored_metrics: List[str]
+    device: str = "cuda"
+    batch_size: int = 256
+    cfg: float = 10.0
+    num_steps: Optional[int] = None
+    n_images: Optional[int] = None
     state_suffix: str = ""
 
 
@@ -142,18 +163,21 @@ class ResultsManager:
         attack_budgets: List[float],
         attack_kwargs: List[Dict[str, Any]],
         dataset: str,
+        suffix: str = "",
     ) -> None:
         """Save attack arguments for reproducibility."""
-        path = self.get_attack_args_path(dataset)
+        filename = f"{dataset}_attack_args{suffix}.pt"
+        path = os.path.join(self.results_dir, filename)
         torch.save({
             "attack_budgets": attack_budgets,
             "attack_kwargs": attack_kwargs,
         }, path)
         print(f"Saved attack args to: {path}")
     
-    def load_attack_args(self, dataset: str) -> Dict[str, Any]:
+    def load_attack_args(self, dataset: str, suffix: str = "") -> Dict[str, Any]:
         """Load saved attack arguments."""
-        path = self.get_attack_args_path(dataset)
+        filename = f"{dataset}_attack_args{suffix}.pt"
+        path = os.path.join(self.results_dir, filename)
         if not os.path.exists(path):
             raise FileNotFoundError(f"Attack args file not found: {path}")
         return torch.load(path)
@@ -540,6 +564,158 @@ class EvaluationRunner:
         self.results_manager.save_run_config(run_config, self.config.dataset, suffix=suffix)
 
 
+class PrecomputedPairEvaluationRunner:
+    """Evaluation runner for precomputed clean/attacked image pairs."""
+
+    def __init__(self, config: PrecomputedPairEvaluationConfig, pipeline):
+        self.config = config
+        self.pipeline = pipeline
+        self.results_manager = ResultsManager(config.results_dir, config.plots_dir)
+        self.state_signature = self._build_state_signature()
+
+        self.pairs_by_budget = [
+            collect_common_image_pairs(clean_dir, attacked_dir)
+            for clean_dir, attacked_dir in zip(config.clean_image_dirs, config.attacked_image_dirs)
+        ]
+        if len(self.pairs_by_budget) != len(config.attack_budgets):
+            raise ValueError(
+                "attack_budgets must have the same length as clean_image_dirs and attacked_image_dirs"
+            )
+
+        common_ids = [key for _, _, key in self.pairs_by_budget[0]]
+        common_id_set = set(common_ids)
+        for pairs in self.pairs_by_budget[1:]:
+            common_id_set &= {key for _, _, key in pairs}
+        ordered_ids = [image_id for image_id in common_ids if image_id in common_id_set]
+        if config.n_images is not None:
+            ordered_ids = ordered_ids[: max(0, int(config.n_images))]
+        if not ordered_ids:
+            raise ValueError("No matched image pairs available for precomputed evaluation")
+
+        self.image_ids = ordered_ids
+        self.pair_lookup = [
+            {image_id: (clean_path, attacked_path) for clean_path, attacked_path, image_id in pairs}
+            for pairs in self.pairs_by_budget
+        ]
+        self.metrics_collector = MetricsCollector(
+            attack_types=[config.attack_name],
+            attack_budgets=config.attack_budgets,
+            n_images=len(self.image_ids),
+            stored_metrics=config.stored_metrics,
+            source_image_ids=self.image_ids,
+        )
+        self._load_state_if_available()
+
+    def _build_state_signature(self) -> Dict[str, Any]:
+        return {
+            "dataset": self.config.dataset,
+            "attack_name": self.config.attack_name,
+            "seed": self.config.seed,
+            "attack_budgets": list(self.config.attack_budgets),
+            "clean_image_dirs": list(self.config.clean_image_dirs),
+            "attacked_image_dirs": list(self.config.attacked_image_dirs),
+            "stored_metrics": list(self.config.stored_metrics),
+            "device": self.config.device,
+            "batch_size": self.config.batch_size,
+            "cfg": self.config.cfg,
+            "num_steps": self.config.num_steps,
+            "n_images": self.config.n_images,
+            "state_suffix": self.config.state_suffix,
+        }
+
+    def _build_state(self) -> Dict[str, Any]:
+        results = {
+            attack_type: {
+                metric: tensor.detach().cpu()
+                for metric, tensor in attack_results.items()
+            }
+            for attack_type, attack_results in self.metrics_collector.results.items()
+        }
+        return {
+            "version": 1,
+            "signature": self.state_signature,
+            "source_image_ids": list(self.image_ids),
+            "image_indices": list(range(len(self.image_ids))),
+            "results": results,
+            "restart_results": self.metrics_collector.restart_results,
+            "location_results": self.metrics_collector.location_results,
+        }
+
+    def _load_state_if_available(self) -> None:
+        state = self.results_manager.load_state(
+            self.config.dataset,
+            self.config.seed,
+            suffix=self.config.state_suffix,
+        )
+        if state is None:
+            return
+
+        if state.get("signature") != self.state_signature:
+            print("Existing precomputed evaluation state does not match the current configuration; starting fresh.")
+            return
+
+        saved_image_ids = state.get("source_image_ids")
+        if saved_image_ids is not None and saved_image_ids != self.image_ids:
+            print("Existing precomputed evaluation state was built from a different image ordering; starting fresh.")
+            return
+
+        results = state.get("results")
+        restart_results = state.get("restart_results")
+        location_results = state.get("location_results")
+        if results is None or restart_results is None or location_results is None:
+            print("Existing precomputed evaluation state is incomplete; starting fresh.")
+            return
+
+        self.metrics_collector.results = results
+        self.metrics_collector.restart_results = restart_results
+        self.metrics_collector.location_results = location_results
+        print(
+            f"Resumed precomputed evaluation state from {self.results_manager.get_state_path(self.config.dataset, self.config.seed, self.config.state_suffix)}"
+        )
+
+    def save_state(self) -> None:
+        self.results_manager.save_state(
+            self._build_state(),
+            self.config.dataset,
+            self.config.seed,
+            suffix=self.config.state_suffix,
+        )
+
+    def get_attack_configs(self, pending_only: bool = True) -> List[Tuple[str, int, int, Image.Image, Image.Image]]:
+        attack_configs: List[Tuple[str, int, int, Image.Image, Image.Image]] = []
+        for budget_idx, _ in enumerate(self.config.attack_budgets):
+            for image_idx, image_id in enumerate(self.image_ids):
+                if pending_only and self.metrics_collector.is_task_complete(self.config.attack_name, budget_idx, image_idx):
+                    continue
+                clean_path, attacked_path = self.pair_lookup[budget_idx][image_id]
+                attack_configs.append((self.config.attack_name, budget_idx, image_idx, clean_path, attacked_path))
+        return attack_configs
+
+    def save_results(self) -> None:
+        results = self.metrics_collector.get_results()
+        self.results_manager.save_results(
+            results[self.config.attack_name],
+            self.config.dataset,
+            self.config.attack_name,
+            suffix=self.config.state_suffix,
+        )
+        self.results_manager.save_attack_args(
+            self.config.attack_budgets,
+            [
+                {
+                    "clean_images_dir": clean_dir,
+                    "attacked_images_dir": attacked_dir,
+                }
+                for clean_dir, attacked_dir in zip(self.config.clean_image_dirs, self.config.attacked_image_dirs)
+            ],
+            self.config.dataset,
+            suffix=self.config.state_suffix,
+        )
+
+    def save_run_config(self, run_config: Dict[str, Any], suffix: str = "") -> None:
+        self.results_manager.save_run_config(run_config, self.config.dataset, suffix=suffix)
+
+
 def parallel_evaluate_attacks(
     runner: EvaluationRunner,
     attack_configs: List[Tuple[str, int, int, Image.Image]],  # (attack_type, budget_idx, image_idx, image)
@@ -665,3 +841,56 @@ def run_evaluation(runner: EvaluationRunner) -> None:
         parallel_evaluate_attacks(runner, attack_configs)
     else:
         sequential_evaluate_attacks(runner, attack_configs)
+
+
+def run_precomputed_pair_evaluation(runner: PrecomputedPairEvaluationRunner) -> None:
+    """Evaluate precomputed clean/attacked pairs using the shared metrics architecture."""
+    attack_configs = runner.get_attack_configs(pending_only=True)
+    if len(attack_configs) == 0:
+        print("No pending precomputed evaluation tasks. Using existing saved state/results.")
+        return
+
+    pbar = tqdm_module.tqdm(total=len(attack_configs), desc="Evaluating precomputed pairs")
+    for attack_type, budget_idx, image_idx, clean_path, attacked_path in attack_configs:
+        with Image.open(clean_path) as clean_image_file:
+            clean_image = clean_image_file.convert("RGB")
+        with Image.open(attacked_path) as attacked_image_file:
+            attacked_image = attacked_image_file.convert("RGB")
+
+        eval_result = run_paired_pipeline_with_shared_noise(
+            pipeline=runner.pipeline,
+            source_image=clean_image,
+            perturbed_image=attacked_image,
+            batch_size=runner.config.batch_size,
+            cfg=runner.config.cfg,
+            num_steps=runner.config.num_steps,
+            seed=int(runner.config.seed) + budget_idx * 100_000 + image_idx,
+            device=runner.config.device,
+        )
+
+        attack_result = {
+            "best_metrics": eval_result["metrics"],
+            "best_restart": 0,
+            "restart_evaluations": [
+                {
+                    "metrics": eval_result["metrics"],
+                    "gps_source": eval_result["gps_source"],
+                    "gps_perturbed": eval_result["gps_perturbed"],
+                }
+            ],
+        }
+        runner.metrics_collector.record_attack_result(
+            attack_type,
+            budget_idx,
+            image_idx,
+            attack_result,
+        )
+        runner.save_state()
+        pbar.set_postfix(
+            attack=attack_type,
+            eps=f"{runner.config.attack_budgets[budget_idx]:.4f}",
+            image=f"{image_idx + 1}/{len(runner.image_ids)}",
+        )
+        pbar.update(1)
+
+    pbar.close()

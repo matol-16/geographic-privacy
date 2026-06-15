@@ -23,6 +23,7 @@ from utils.adversarial_utils import (
 def _compute_dot_alignment_loss(eps_reference, eps_prediction, dot_product_loss="squared"):
     """Compute alignment loss from dot products between reference and predicted directions."""
     metric_aliases = {
+        "l2": "l2",
         "square": "squared",
         "squared": "squared",
         "squared_dot": "squared",
@@ -30,23 +31,32 @@ def _compute_dot_alignment_loss(eps_reference, eps_prediction, dot_product_loss=
         "absolute": "absolute",
         "absolute_dot": "absolute",
         "cosine_similarity": "cosine_similarity",
+        "cosine_similarity_negative": "cosine_similarity_negative",
     }
     normalized_metric = metric_aliases.get(str(dot_product_loss).lower())
     if normalized_metric is None:
         raise ValueError(
             f"Unknown dot_product_loss: {dot_product_loss}. Expected one of ['squared', 'absolute']"
         )
-
+    if normalized_metric == "l2":
+        return -1*torch.nn.functional.mse_loss(eps_prediction, eps_reference)
     dot = torch.sum(eps_reference * eps_prediction, dim=-1)
     if normalized_metric == "squared":
         return (dot ** 2).mean()
-    abs_dot= torch.abs(dot)
+    if normalized_metric == "absolute":
+        abs_dot= torch.abs(dot)
+        return abs_dot.mean()
     if normalized_metric == "cosine_similarity":
+        abs_dot=torch.abs(dot)
         eps_reference_norm = torch.norm(eps_reference, dim=-1)
         eps_prediction_norm = torch.norm(eps_prediction, dim=-1)
         cosine_sim = abs_dot / (eps_reference_norm * eps_prediction_norm + 1e-8)
         return cosine_sim.mean()
-    return abs_dot.mean()
+    if normalized_metric == "cosine_similarity_negative":
+        eps_reference_norm = torch.norm(eps_reference, dim=-1)
+        eps_prediction_norm = torch.norm(eps_prediction, dim=-1)
+        cosine_sim = dot / (eps_reference_norm * eps_prediction_norm + 1e-8)
+        return cosine_sim.mean()
 
 
 def build_x0_bank_from_clean_model(
@@ -94,6 +104,7 @@ class DiffusionAttack(AttackBase):
         target_pure_noise: bool = False,
         dot_product_loss: str = "absolute",
         reconstruction_loss_weight: float = 0.0,
+        delta_init: float = 1e-4,
         num_restarts: int = 1,
         restart_selection_metric: str = "mean_step_displacement",
         device: str = "cuda",
@@ -132,10 +143,15 @@ class DiffusionAttack(AttackBase):
         self.target_pure_noise = target_pure_noise
         self.dot_product_loss = dot_product_loss
         self.reconstruction_loss_weight = float(reconstruction_loss_weight)
+        self.delta_init = float(delta_init)
 
     def initialize_delta(self, restart_idx: int) -> torch.Tensor:
-        """Initialize delta as zeros (universal perturbation)."""
-        delta = torch.zeros_like(self.source_tensor, requires_grad=True)
+        """Initialize delta with tiny random noise to avoid zero-gradient dead start."""
+        if self.delta_init > 0:
+            delta = torch.empty_like(self.source_tensor).uniform_(-self.delta_init, self.delta_init)
+        else:
+            delta = torch.zeros_like(self.source_tensor)
+        delta.requires_grad_(True)
         return delta
 
     def run_step(
@@ -225,5 +241,6 @@ class DiffusionAttack(AttackBase):
             "target_pure_noise": self.target_pure_noise,
             "dot_product_loss": self.dot_product_loss,
             "reconstruction_loss_weight": self.reconstruction_loss_weight,
+            "delta_init": self.delta_init,
             "num_restarts": self.restart_manager.num_restarts,
         }

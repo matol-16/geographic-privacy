@@ -175,6 +175,17 @@ def _select_displacement_metric(gps_true: bool) -> str:
     return "final_step_displacement_true" if gps_true else "final_step_displacement_predicted"
 
 
+def _display_attack_name(attack_name: str) -> str:
+    normalized = str(attack_name).lower()
+    if normalized == "diffusion":
+        return "DTD"
+    if normalized == "encoder":
+        return "Encoder"
+    if normalized == "geoshield":
+        return "GeoShield"
+    return str(attack_name).replace("_", " ").title()
+
+
 def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_perturbed, perturb_budget = None, cfg=None, point_size=100):
     plt.figure(figsize=(8,6))
     ax = plt.axes(projection=ccrs.PlateCarree())
@@ -532,8 +543,10 @@ def plot_results(
             median_metric = summary[:, 1]
             q25_metric = summary[:, 2]
             q75_metric = summary[:, 3]
+            
+            print(q25_metric, mean_metric, q75_metric)
 
-            attack_name = "DTD" if at.lower() == "diffusion" else "encoder"
+            attack_name = _display_attack_name(at)
             plt.plot(attack_budgets, mean_metric, linestyle='--', alpha=1.0,linewidth=3.0, label=f"{attack_name} mean")
             # plt.plot(attack_budgets, median_metric, label=f"{at} median")
             plt.fill_between(attack_budgets, q25_metric, q75_metric, alpha=0.3, label= f"{at} IQR (25-75%)")
@@ -622,7 +635,7 @@ def plot_attack_success_rate(
     attack_names = list(all_results.keys())
     # Use fixed qualitative colors so the first two attacks are clearly distinct (blue, red).
     attack_palette = [
-        '#1f77b4',  # blue
+        '#9467bd',  # purple
         '#ff7f0e',  # orange
         '#d62728',  # red
         '#2ca02c',  # green
@@ -655,6 +668,9 @@ def plot_attack_success_rate(
             success_curves.append(success_rate)
             
         success_curves = np.asarray(success_curves)
+        
+        print(f"Attack {at}: Success rates at thresholds {thresholds} are:\n{success_curves}")
+        
         if success_curves.shape[0] > 1:
             low_curve = np.min(success_curves, axis=0)
             high_curve = np.max(success_curves, axis=0)
@@ -678,7 +694,7 @@ def plot_attack_success_rate(
             line_color = _darken_rgba(base_color, shade_factor)
             linestyle = threshold_linestyles[threshold_index % len(threshold_linestyles)]
             
-            attack_name = "DTD" if at.lower() == "diffusion" else "encoder"
+            attack_name = _display_attack_name(at)
 
             plt.plot(
                 attack_budgets,
@@ -696,7 +712,7 @@ def plot_attack_success_rate(
     # else:
     #     plt.ylabel("Attack Success Rate")
     plt.title(f"Attack Success Rate on {dataset_name} dataset")
-    # plt.ylim(0.0, 1.0)
+    plt.ylim(0.4, 1.0)
     plt.grid(alpha=0.25, linestyle='--', linewidth=0.6)
     plt.legend(ncol=2, fontsize='x-large')
     plt.xscale("log")
@@ -792,7 +808,7 @@ def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, 
             patch.set_facecolor(colors[i])
             patch.set_edgecolor(colors[i])
             patch.set_alpha(0.5)
-        attack_name = "DTD" if attack.lower() == "diffusion" else "Encoder"
+        attack_name = _display_attack_name(attack)
         ax.set_title(f"{attack_name} attack")
         # ax.set_xlabel(f"Budget = {selected_budget * 255:.0f}/255")
         ax.set_xticks(np.arange(3))

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import inspect
 import random
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 import numpy as np
@@ -20,6 +21,8 @@ from torchvision import transforms
 import torch
 from PIL import Image
 from utils.adversarial_metrics import evaluate_displacement_metrics
+
+SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 
 ############################################################################################
@@ -169,6 +172,7 @@ def run_paired_pipeline_with_shared_noise(
 ) -> Dict[str, Any]:
     """Run source and perturbed images with identical initial noise and return trajectories + metrics."""
     x_n = make_shared_initial_noise(batch_size=batch_size, device=device, seed=seed)
+    eval_seed = int(seed)
 
     eval_kwargs = {
         "batch_size": int(batch_size),
@@ -179,8 +183,21 @@ def run_paired_pipeline_with_shared_noise(
     if num_steps is not None:
         eval_kwargs["num_steps"] = int(num_steps)
 
+    #on top of shared initial noise, we use same seed... SHoudl not change much since we sample with DDIM (deterministic)
     with torch.inference_mode():
+        # Re-seed before each call so random preprocessing uses the same draws.
+        random.seed(eval_seed)
+        np.random.seed(eval_seed)
+        torch.manual_seed(eval_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(eval_seed)
         gps_source, traj_source = pipeline(source_image, **eval_kwargs)
+
+        random.seed(eval_seed)
+        np.random.seed(eval_seed)
+        torch.manual_seed(eval_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(eval_seed)
         gps_perturbed, traj_perturbed = pipeline(perturbed_image, **eval_kwargs)
     metrics = evaluate_displacement_metrics(traj_source, traj_perturbed)
 
@@ -191,6 +208,74 @@ def run_paired_pipeline_with_shared_noise(
         "traj_perturbed": traj_perturbed,
         "metrics": metrics,
     }
+
+
+def expand_to_budget_count(value: Any, n_budgets: int, label: str) -> list[Any]:
+    """Normalize a scalar-or-list config field to one entry per budget."""
+    if value is None:
+        raise ValueError(f"{label} must not be None")
+    if isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        values = [value]
+
+    if len(values) == 1 and n_budgets > 1:
+        return values * n_budgets
+    if len(values) != n_budgets:
+        raise ValueError(f"{label} must have length 1 or {n_budgets}, got {len(values)}")
+    return values
+
+
+def collect_common_image_pairs(clean_dir: str | Path, attacked_dir: str | Path) -> list[tuple[Path, Path, str]]:
+    """Match clean and attacked images by relative path, then by unique filename."""
+    clean_root = Path(clean_dir)
+    attacked_root = Path(attacked_dir)
+
+    def _index_images(root: Path) -> dict[str, Path]:
+        if not root.exists():
+            raise FileNotFoundError(f"Image folder not found: {root}")
+
+        indexed: dict[str, Path] = {}
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES:
+                indexed[path.relative_to(root).as_posix()] = path
+
+        if not indexed:
+            raise FileNotFoundError(f"No supported images found in folder: {root}")
+        return indexed
+
+    clean_index = _index_images(clean_root)
+    attacked_index = _index_images(attacked_root)
+
+    common_keys = sorted(set(clean_index).intersection(attacked_index))
+    if common_keys:
+        return [(clean_index[key], attacked_index[key], key) for key in common_keys]
+
+    clean_by_name: dict[str, list[Path]] = {}
+    attacked_by_name: dict[str, list[Path]] = {}
+    for rel_path, path in clean_index.items():
+        clean_by_name.setdefault(Path(rel_path).name, []).append(path)
+    for rel_path, path in attacked_index.items():
+        attacked_by_name.setdefault(Path(rel_path).name, []).append(path)
+
+    common_names = sorted(set(clean_by_name).intersection(attacked_by_name))
+    if not common_names:
+        raise ValueError(
+            f"No matching image files found between {clean_root} and {attacked_root}. "
+            "Expected identical relative paths or unique shared file names."
+        )
+
+    pairs: list[tuple[Path, Path, str]] = []
+    for name in common_names:
+        clean_paths = clean_by_name[name]
+        attacked_paths = attacked_by_name[name]
+        if len(clean_paths) != 1 or len(attacked_paths) != 1:
+            raise ValueError(
+                f"Ambiguous file name '{name}' when matching {clean_root} and {attacked_root}. "
+                "Use matching relative paths or unique file names."
+            )
+        pairs.append((clean_paths[0], attacked_paths[0], name))
+    return pairs
 
 
 ############################################################################################

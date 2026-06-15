@@ -6,7 +6,6 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 
-
 from utils.adversarial_metrics import evaluate_displacement_metrics, select_displacement_score
 from utils.plots_adversarial_attacks import plot_results, plot_transferability_results, plot_localizability_results, plot_attack_success_rate
 
@@ -58,6 +57,7 @@ def retrieve_yfcc_images(
     seed: int = 0,
     use_real_gps: bool = False,
     local_dir: Optional[str] = None,
+    im_idx=None, # If specified, retrieves only the image with this index in the dataset (after sorting by ID). Useful for debugging with a single image.
 ):
     if local_dir is None:
         local_dir = "/Data/mathias.ollu/hf_cache/datasets/YFCC100M/yfcc4k"
@@ -65,6 +65,26 @@ def retrieve_yfcc_images(
     img_dir = os.path.join(local_dir, "images")
     if not os.path.exists(info_path):
         raise FileNotFoundError(f"YFCC4k info.txt not found at {info_path}. Run build_yfcc4k_from_revisiting_im2gps.py first.")
+
+    if im_idx is not None:
+        #load image corresponding to this index (im_idx.jpg)
+        img_path = os.path.join(img_dir, f"{str(im_idx)}.jpg")
+        if not os.path.exists(img_path):
+            raise FileNotFoundError(f"Image with index {im_idx} not found at {img_path}. Check if im_idx is correct and if images are properly stored.")
+        img = Image.open(img_path).convert("RGB")
+        #retrieve metadata for this image from info.txt
+        with open(info_path, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) < 3:
+                    continue
+                photo_id = parts[0]
+                if photo_id == str(im_idx):
+                    lon = float(parts[1])
+                    lat = float(parts[2])
+                    gps = (lat, lon)
+                    return [img], [gps], [photo_id]
+        raise ValueError(f"Metadata for image with index {im_idx} not found in info.txt. Check if im_idx is correct and if info.txt is properly formatted.")
 
     rows = []
     with open(info_path, "r") as f:
