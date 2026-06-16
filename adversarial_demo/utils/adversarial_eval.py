@@ -99,8 +99,12 @@ def retrieve_yfcc_images(
             if os.path.exists(img_path):
                 rows.append({"id": photo_id, "path": img_path, "latitude": lat, "longitude": lon})
 
+    # Keep selection prefix-stable across different n_images_to_eval values:
+    # with a fixed seed, first N images of a larger run match a smaller run.
+    rows = sorted(rows, key=lambda r: str(r["id"]))
     rng = random.Random(seed)
-    samples = rng.sample(rows, min(n_images_to_eval, len(rows)))
+    rng.shuffle(rows)
+    samples = rows[: min(n_images_to_eval, len(rows))]
 
     source_images = [Image.open(s["path"]).convert("RGB") for s in samples]
     source_gps = [(s["latitude"], s["longitude"]) for s in samples]
@@ -138,9 +142,11 @@ def retrieve_osv_images(
     # Keep only rows whose image exists on disk
     rows = [r for r in rows if r["id"] in id_to_path]
 
-    # Sample n_images_to_eval random images
+    # Keep selection prefix-stable across different n_images_to_eval values.
+    rows = sorted(rows, key=lambda r: str(r["id"]))
     rng = random.Random(seed)
-    samples = rng.sample(rows, min(n_images_to_eval, len(rows)))
+    rng.shuffle(rows)
+    samples = rows[: min(n_images_to_eval, len(rows))]
 
     source_images = [Image.open(id_to_path[s["id"]]).convert("RGB") for s in samples]
     source_gps = [(float(s["latitude"]), float(s["longitude"])) for s in samples]
@@ -333,7 +339,140 @@ def evaluate_localizability(
     
     
 
-      
+def evaluate_sampling_steps(
+    attack_types,
+    pipeline,
+    dataset_name: str,
+    seed: int = 0,
+    n_images_to_eval: int = 20,
+    eval_num_steps: list = (10, 25, 50, 100, 250),
+    results_dir: str = "./results",
+    attack_budgets: list = (2/255, 15/255, 50/255),
+    attack_kwargs: list = (),
+    success_rate_thresholds: list = (200, 750, 2500),
+    dataset_roots: dict = None,
+    config_dump: dict = None,
+):
+    """
+    Train attacks on a set of images, then re-evaluate the trained perturbations
+    at multiple sampling step counts to measure how attack success evolves with
+    inference budget.
+
+    Returns the JSON-serialisable results dict (also saved to results_dir).
+    """
+    import json
+    import numpy as np
+    from core import ImageLoader
+    from attacks.attacks import run_attack
+    from utils.adversarial_utils import (
+        add_perturbation_to_image,
+        expand_per_budget_kwargs,
+        run_paired_pipeline_with_shared_noise,
+    )
+
+    seed_everything(seed)
+    dataset_roots = dataset_roots or {}
+    eval_num_steps = list(eval_num_steps)
+
+    if isinstance(attack_types, str):
+        attack_types = [attack_types]
+
+    source_images, source_gps, source_image_ids = ImageLoader.load_images(
+        dataset=dataset_name,
+        n_images=n_images_to_eval,
+        seed=seed,
+        dataset_roots=dataset_roots,
+    )
+
+    attack_kwargs = expand_per_budget_kwargs(list(attack_kwargs), len(attack_budgets))
+    device = str(attack_kwargs[0].get("device", "cuda"))
+    eval_cfg = float(attack_kwargs[0].get("restart_eval_cfg", 10.0))
+    eval_batch_size = int(attack_kwargs[0].get("restart_eval_batch_size", 128))
+
+    # Phase 1: train attacks, collect best deltas
+    # deltas[attack_type][budget_idx][image_idx] = CPU tensor
+    deltas = {
+        at: {bi: {} for bi in range(len(attack_budgets))}
+        for at in attack_types
+    }
+    for attack_type in attack_types:
+        for budget_idx, budget in enumerate(attack_budgets):
+            print(f"Training {attack_type} attacks (eps={budget:.4f})...")
+            for image_idx, image in enumerate(tqdm_module.tqdm(source_images, desc="  images")):
+                result = run_attack(
+                    attack_type=attack_type,
+                    source_image=image,
+                    pipeline=pipeline,
+                    eps_max=budget,
+                    silent=True,
+                    **dict(attack_kwargs[budget_idx]),
+                )
+                deltas[attack_type][budget_idx][image_idx] = result["delta"].detach().cpu()
+
+    # Phase 2: re-evaluate each delta at every num_steps
+    # raw[attack_type][budget_idx][num_steps] = [displacement_km, ...]
+    raw = {
+        at: {bi: {ns: [] for ns in eval_num_steps} for bi in range(len(attack_budgets))}
+        for at in attack_types
+    }
+    for attack_type in attack_types:
+        for budget_idx, budget in enumerate(attack_budgets):
+            for num_steps in tqdm_module.tqdm(
+                eval_num_steps,
+                desc=f"  {attack_type} eps={budget:.4f} eval steps",
+            ):
+                for image_idx, image in enumerate(source_images):
+                    delta = deltas[attack_type][budget_idx][image_idx].to(device)
+                    perturbed = add_perturbation_to_image(image, delta, pipeline)
+                    eval_result = run_paired_pipeline_with_shared_noise(
+                        pipeline=pipeline,
+                        source_image=image,
+                        perturbed_image=perturbed,
+                        batch_size=eval_batch_size,
+                        cfg=eval_cfg,
+                        num_steps=int(num_steps),
+                        seed=seed,
+                        device=device,
+                    )
+                    raw[attack_type][budget_idx][num_steps].append(
+                        float(eval_result["metrics"]["final_step_displacement"])
+                    )
+
+    # Build JSON-serialisable results dict
+    json_results = {
+        "dataset": dataset_name,
+        "attack_types": attack_types,
+        "attack_budgets": list(attack_budgets),
+        "eval_num_steps": eval_num_steps,
+        "success_rate_thresholds_km": list(success_rate_thresholds),
+        "n_images": n_images_to_eval,
+        "results": {},
+    }
+    for attack_type in attack_types:
+        json_results["results"][attack_type] = {}
+        for budget_idx, budget in enumerate(attack_budgets):
+            bkey = f"budget_{budget:.6f}"
+            json_results["results"][attack_type][bkey] = {}
+            for num_steps in eval_num_steps:
+                disps = raw[attack_type][budget_idx][num_steps]
+                success_rates = {
+                    str(thr): float(np.mean([d > thr for d in disps]))
+                    for thr in success_rate_thresholds
+                }
+                json_results["results"][attack_type][bkey][str(num_steps)] = {
+                    "mean_displacement_km": float(np.mean(disps)),
+                    "success_rates": success_rates,
+                }
+
+    os.makedirs(results_dir, exist_ok=True)
+    json_path = os.path.join(results_dir, f"{dataset_name}_sampling_steps_results.json")
+    with open(json_path, "w") as f:
+        json.dump(json_results, f, indent=2)
+    print(f"Saved sampling-steps results to: {json_path}")
+
+    return json_results
+
+
 if __name__ == "__main__":
     # download_osv5m_test()
  

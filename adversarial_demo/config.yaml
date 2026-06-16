@@ -28,7 +28,7 @@ plots_dir: "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/resul
 parallel_workers: 4
 use_cuda_streams: true
 
-model_type: "diffusion" # Options: "diffusion", "flow" or "" - i.e. riemannian flow matching
+model_type: "" # Options: "diffusion", "flow" or "" - i.e. riemannian flow matching
 
 # Pipeline models per dataset
 pipelines:

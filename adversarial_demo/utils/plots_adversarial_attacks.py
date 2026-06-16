@@ -861,4 +861,57 @@ def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, 
     plt.close(fig)
 
 
+def plot_sampling_steps_success_rate(
+    json_results: dict,
+    plot_dir: str,
+) -> None:
+    """
+    Plot attack success rate vs. number of sampling steps.
+
+    One subplot per distance threshold; one line per (attack_type, budget) pair.
+    json_results is the dict returned by evaluate_sampling_steps().
+    """
+    thresholds = json_results["success_rate_thresholds_km"]
+    eval_num_steps = json_results["eval_num_steps"]
+    attack_types = json_results["attack_types"]
+    attack_budgets = json_results["attack_budgets"]
+    dataset = json_results["dataset"]
+
+    n_thresholds = len(thresholds)
+    fig, axes = plt.subplots(1, n_thresholds, figsize=(6 * n_thresholds, 5), squeeze=False)
+    colors = plt.cm.tab10.colors
+
+    color_idx = 0
+    for attack_type in attack_types:
+        for budget_idx, budget in enumerate(attack_budgets):
+            bkey = f"budget_{budget:.6f}"
+            label = f"{attack_type} eps={budget:.3f}"
+            color = colors[color_idx % len(colors)]
+            for ax_idx, thr in enumerate(thresholds):
+                ax = axes[0][ax_idx]
+                rates = [
+                    json_results["results"][attack_type][bkey][str(ns)]["success_rates"][str(thr)]
+                    for ns in eval_num_steps
+                ]
+                ax.plot(eval_num_steps, rates, marker="o", label=label, color=color)
+            color_idx += 1
+
+    for ax_idx, thr in enumerate(thresholds):
+        ax = axes[0][ax_idx]
+        ax.set_xlabel("Sampling steps")
+        ax.set_ylabel("Attack success rate")
+        ax.set_title(f"Displacement > {thr} km")
+        ax.legend(fontsize=7)
+        ax.set_ylim(0, 1)
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle(f"Attack success vs. sampling steps — {dataset.upper()}")
+    fig.tight_layout()
+    os.makedirs(plot_dir, exist_ok=True)
+    plot_path = os.path.join(plot_dir, f"{dataset}_sampling_steps_success_rate.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Plot saved to: {plot_path}")
+
+
     

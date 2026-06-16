@@ -502,12 +502,19 @@ class EvaluationRunner:
         if state is None:
             return
 
-        if state.get("signature") != self.state_signature:
-            print("Existing evaluation state does not match the current configuration; starting fresh.")
+        saved_signature = state.get("signature")
+        if not self._is_state_compatible(saved_signature):
+            print("Existing evaluation state is incompatible with the current configuration; starting fresh.")
             return
 
         saved_image_ids = state.get("source_image_ids")
-        if saved_image_ids is not None and saved_image_ids != self.source_image_ids:
+        if not isinstance(saved_image_ids, list):
+            print("Existing evaluation state does not include image IDs; starting fresh.")
+            return
+
+        current_image_ids = list(self.source_image_ids)
+        shared_n_images = min(len(saved_image_ids), len(current_image_ids))
+        if saved_image_ids[:shared_n_images] != current_image_ids[:shared_n_images]:
             print("Existing evaluation state was built from a different image ordering; starting fresh.")
             return
 
@@ -518,10 +525,145 @@ class EvaluationRunner:
             print("Existing evaluation state is incomplete; starting fresh.")
             return
 
-        self.metrics_collector.results = results
-        self.metrics_collector.restart_results = restart_results
-        self.metrics_collector.location_results = location_results
+        reusable_budget_pairs = self._get_reusable_budget_pairs(saved_signature)
+        if not reusable_budget_pairs:
+            print("Existing evaluation state has no reusable budget overlap; starting fresh.")
+            return
+
+        self._merge_saved_state(
+            results=results,
+            restart_results=restart_results,
+            location_results=location_results,
+            shared_n_images=shared_n_images,
+            reusable_budget_pairs=reusable_budget_pairs,
+        )
+        print(
+            f"Reused {len(reusable_budget_pairs)}/{len(self.config.attack_budgets)} budget rows from saved state."
+        )
         print(f"Resumed evaluation state from {self.results_manager.get_state_path(self.config.dataset, self.config.seed, self.config.state_suffix)}")
+
+    def _is_state_compatible(self, saved_signature: Any) -> bool:
+        """Check whether a saved state can be partially merged into the current run."""
+        if not isinstance(saved_signature, dict):
+            return False
+
+        keys_that_must_match = [
+            "dataset",
+            "seed",
+            "stored_metrics",
+            "use_real_gps",
+            "dataset_roots",
+            "state_suffix",
+        ]
+        for key in keys_that_must_match:
+            if saved_signature.get(key) != self.state_signature.get(key):
+                return False
+
+        return True
+
+    def _get_reusable_budget_pairs(self, saved_signature: Dict[str, Any]) -> List[Tuple[int, int]]:
+        """Return (current_budget_idx, saved_budget_idx) pairs that are safe to reuse."""
+        saved_budgets = saved_signature.get("attack_budgets")
+        saved_kwargs = saved_signature.get("attack_kwargs")
+        if not isinstance(saved_budgets, list) or not isinstance(saved_kwargs, list):
+            return []
+
+        current_budgets = list(self.config.attack_budgets)
+        current_kwargs = list(self.config.attack_kwargs)
+
+        used_saved_indices: set[int] = set()
+        reusable_pairs: List[Tuple[int, int]] = []
+        for current_idx, budget in enumerate(current_budgets):
+            current_kwarg = current_kwargs[current_idx] if current_idx < len(current_kwargs) else None
+            match_idx: Optional[int] = None
+            for saved_idx, saved_budget in enumerate(saved_budgets):
+                if saved_idx in used_saved_indices:
+                    continue
+                if saved_budget != budget:
+                    continue
+                saved_kwarg = saved_kwargs[saved_idx] if saved_idx < len(saved_kwargs) else None
+                if saved_kwarg != current_kwarg:
+                    continue
+                match_idx = saved_idx
+                break
+
+            if match_idx is None:
+                continue
+            used_saved_indices.add(match_idx)
+            reusable_pairs.append((current_idx, match_idx))
+
+        return reusable_pairs
+
+    def _merge_saved_state(
+        self,
+        results: Any,
+        restart_results: Any,
+        location_results: Any,
+        shared_n_images: int,
+        reusable_budget_pairs: List[Tuple[int, int]],
+    ) -> None:
+        """Copy overlap from a compatible saved state into current in-memory buffers."""
+        if not isinstance(results, dict):
+            return
+        if not isinstance(restart_results, dict):
+            return
+        if not isinstance(location_results, dict):
+            return
+
+        for attack_type in self.config.attack_types:
+            if attack_type not in results:
+                continue
+            saved_attack_results = results.get(attack_type)
+            if not isinstance(saved_attack_results, dict):
+                continue
+
+            for metric in self.config.stored_metrics:
+                saved_metric = saved_attack_results.get(metric)
+                if not isinstance(saved_metric, torch.Tensor):
+                    continue
+                current_metric = self.metrics_collector.results[attack_type][metric]
+                image_limit = min(current_metric.shape[1], saved_metric.shape[1], shared_n_images)
+                if image_limit == 0:
+                    continue
+                for current_budget_idx, saved_budget_idx in reusable_budget_pairs:
+                    if current_budget_idx >= current_metric.shape[0] or saved_budget_idx >= saved_metric.shape[0]:
+                        continue
+                    current_metric[current_budget_idx, :image_limit] = (
+                        saved_metric[saved_budget_idx, :image_limit].detach().cpu()
+                    )
+
+            saved_restart_by_budget = restart_results.get(attack_type)
+            saved_location_by_budget = location_results.get(attack_type)
+            if not isinstance(saved_restart_by_budget, list) or not isinstance(saved_location_by_budget, list):
+                continue
+
+            current_restart_by_budget = self.metrics_collector.restart_results[attack_type]
+            current_location_by_budget = self.metrics_collector.location_results[attack_type]
+            for current_budget_idx, saved_budget_idx in reusable_budget_pairs:
+                if current_budget_idx >= len(current_restart_by_budget) or current_budget_idx >= len(current_location_by_budget):
+                    continue
+                if saved_budget_idx >= len(saved_restart_by_budget) or saved_budget_idx >= len(saved_location_by_budget):
+                    continue
+
+                current_restart_by_image = current_restart_by_budget[current_budget_idx]
+                current_location_by_image = current_location_by_budget[current_budget_idx]
+                saved_restart_by_image = saved_restart_by_budget[saved_budget_idx]
+                saved_location_by_image = saved_location_by_budget[saved_budget_idx]
+                if not isinstance(saved_restart_by_image, list) or not isinstance(saved_location_by_image, list):
+                    continue
+
+                image_limit = min(
+                    len(current_restart_by_image),
+                    len(current_location_by_image),
+                    len(saved_restart_by_image),
+                    len(saved_location_by_image),
+                    shared_n_images,
+                )
+                for image_idx in range(image_limit):
+                    if saved_restart_by_image[image_idx] is not None:
+                        current_restart_by_image[image_idx] = saved_restart_by_image[image_idx]
+                    if saved_location_by_image[image_idx] is not None:
+                        current_location_by_image[image_idx] = saved_location_by_image[image_idx]
 
     def save_state(self) -> None:
         """Persist the current incremental evaluation state."""
@@ -650,12 +792,19 @@ class PrecomputedPairEvaluationRunner:
         if state is None:
             return
 
-        if state.get("signature") != self.state_signature:
-            print("Existing precomputed evaluation state does not match the current configuration; starting fresh.")
+        saved_signature = state.get("signature")
+        if not self._is_state_compatible(saved_signature):
+            print("Existing precomputed evaluation state is incompatible with the current configuration; starting fresh.")
             return
 
         saved_image_ids = state.get("source_image_ids")
-        if saved_image_ids is not None and saved_image_ids != self.image_ids:
+        if not isinstance(saved_image_ids, list):
+            print("Existing precomputed evaluation state does not include image IDs; starting fresh.")
+            return
+
+        current_image_ids = list(self.image_ids)
+        shared_n_images = min(len(saved_image_ids), len(current_image_ids))
+        if saved_image_ids[:shared_n_images] != current_image_ids[:shared_n_images]:
             print("Existing precomputed evaluation state was built from a different image ordering; starting fresh.")
             return
 
@@ -666,12 +815,153 @@ class PrecomputedPairEvaluationRunner:
             print("Existing precomputed evaluation state is incomplete; starting fresh.")
             return
 
-        self.metrics_collector.results = results
-        self.metrics_collector.restart_results = restart_results
-        self.metrics_collector.location_results = location_results
+        reusable_budget_pairs = self._get_reusable_budget_pairs(saved_signature)
+        if not reusable_budget_pairs:
+            print("Existing precomputed evaluation state has no reusable budget overlap; starting fresh.")
+            return
+
+        self._merge_saved_state(
+            results=results,
+            restart_results=restart_results,
+            location_results=location_results,
+            shared_n_images=shared_n_images,
+            reusable_budget_pairs=reusable_budget_pairs,
+        )
+        print(
+            f"Reused {len(reusable_budget_pairs)}/{len(self.config.attack_budgets)} precomputed budget rows from saved state."
+        )
         print(
             f"Resumed precomputed evaluation state from {self.results_manager.get_state_path(self.config.dataset, self.config.seed, self.config.state_suffix)}"
         )
+
+    def _is_state_compatible(self, saved_signature: Any) -> bool:
+        """Check whether a saved precomputed state can be partially merged."""
+        if not isinstance(saved_signature, dict):
+            return False
+
+        keys_that_must_match = [
+            "dataset",
+            "attack_name",
+            "seed",
+            "stored_metrics",
+            "device",
+            "batch_size",
+            "cfg",
+            "num_steps",
+            "state_suffix",
+        ]
+        for key in keys_that_must_match:
+            if saved_signature.get(key) != self.state_signature.get(key):
+                return False
+
+        return True
+
+    def _get_reusable_budget_pairs(self, saved_signature: Dict[str, Any]) -> List[Tuple[int, int]]:
+        """Return (current_budget_idx, saved_budget_idx) pairs that are safe to reuse."""
+        saved_budgets = saved_signature.get("attack_budgets")
+        saved_clean_dirs = saved_signature.get("clean_image_dirs")
+        saved_attacked_dirs = saved_signature.get("attacked_image_dirs")
+        if not isinstance(saved_budgets, list) or not isinstance(saved_clean_dirs, list) or not isinstance(saved_attacked_dirs, list):
+            return []
+
+        current_budgets = list(self.config.attack_budgets)
+        current_clean_dirs = list(self.config.clean_image_dirs)
+        current_attacked_dirs = list(self.config.attacked_image_dirs)
+
+        used_saved_indices: set[int] = set()
+        reusable_pairs: List[Tuple[int, int]] = []
+        for current_idx, budget in enumerate(current_budgets):
+            current_clean = current_clean_dirs[current_idx] if current_idx < len(current_clean_dirs) else None
+            current_attacked = current_attacked_dirs[current_idx] if current_idx < len(current_attacked_dirs) else None
+            match_idx: Optional[int] = None
+
+            for saved_idx, saved_budget in enumerate(saved_budgets):
+                if saved_idx in used_saved_indices:
+                    continue
+                if saved_budget != budget:
+                    continue
+                saved_clean = saved_clean_dirs[saved_idx] if saved_idx < len(saved_clean_dirs) else None
+                saved_attacked = saved_attacked_dirs[saved_idx] if saved_idx < len(saved_attacked_dirs) else None
+                if saved_clean != current_clean or saved_attacked != current_attacked:
+                    continue
+                match_idx = saved_idx
+                break
+
+            if match_idx is None:
+                continue
+            used_saved_indices.add(match_idx)
+            reusable_pairs.append((current_idx, match_idx))
+
+        return reusable_pairs
+
+    def _merge_saved_state(
+        self,
+        results: Any,
+        restart_results: Any,
+        location_results: Any,
+        shared_n_images: int,
+        reusable_budget_pairs: List[Tuple[int, int]],
+    ) -> None:
+        """Copy overlap from a compatible precomputed state into current buffers."""
+        if not isinstance(results, dict):
+            return
+        if not isinstance(restart_results, dict):
+            return
+        if not isinstance(location_results, dict):
+            return
+
+        attack_type = self.config.attack_name
+        saved_attack_results = results.get(attack_type)
+        if not isinstance(saved_attack_results, dict):
+            return
+
+        for metric in self.config.stored_metrics:
+            saved_metric = saved_attack_results.get(metric)
+            if not isinstance(saved_metric, torch.Tensor):
+                continue
+            current_metric = self.metrics_collector.results[attack_type][metric]
+            image_limit = min(current_metric.shape[1], saved_metric.shape[1], shared_n_images)
+            if image_limit == 0:
+                continue
+            for current_budget_idx, saved_budget_idx in reusable_budget_pairs:
+                if current_budget_idx >= current_metric.shape[0] or saved_budget_idx >= saved_metric.shape[0]:
+                    continue
+                current_metric[current_budget_idx, :image_limit] = (
+                    saved_metric[saved_budget_idx, :image_limit].detach().cpu()
+                )
+
+        saved_restart_by_budget = restart_results.get(attack_type)
+        saved_location_by_budget = location_results.get(attack_type)
+        if not isinstance(saved_restart_by_budget, list) or not isinstance(saved_location_by_budget, list):
+            return
+
+        current_restart_by_budget = self.metrics_collector.restart_results[attack_type]
+        current_location_by_budget = self.metrics_collector.location_results[attack_type]
+        for current_budget_idx, saved_budget_idx in reusable_budget_pairs:
+            if current_budget_idx >= len(current_restart_by_budget) or current_budget_idx >= len(current_location_by_budget):
+                continue
+            if saved_budget_idx >= len(saved_restart_by_budget) or saved_budget_idx >= len(saved_location_by_budget):
+                continue
+
+            current_restart_by_image = current_restart_by_budget[current_budget_idx]
+            current_location_by_image = current_location_by_budget[current_budget_idx]
+            saved_restart_by_image = saved_restart_by_budget[saved_budget_idx]
+            saved_location_by_image = saved_location_by_budget[saved_budget_idx]
+            if not isinstance(saved_restart_by_image, list) or not isinstance(saved_location_by_image, list):
+                continue
+
+            image_limit = min(
+                len(current_restart_by_image),
+                len(current_location_by_image),
+                len(saved_restart_by_image),
+                len(saved_location_by_image),
+                shared_n_images,
+            )
+            for image_idx in range(image_limit):
+                if saved_restart_by_image[image_idx] is not None:
+                    current_restart_by_image[image_idx] = saved_restart_by_image[image_idx]
+                if saved_location_by_image[image_idx] is not None:
+                    current_location_by_image[image_idx] = saved_location_by_image[image_idx]
 
     def save_state(self) -> None:
         self.results_manager.save_state(
