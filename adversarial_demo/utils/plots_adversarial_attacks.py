@@ -955,6 +955,9 @@ def plot_sampling_steps_success_rate(
     attack_types = json_results["attack_types"]
     attack_budgets = json_results["attack_budgets"]
     dataset = json_results["dataset"]
+    # Per-type budget lists are set by merge_sampling_steps_results when combining
+    # results from different commands (e.g. encoder vs GeoShield).
+    budgets_per_type = json_results.get("attack_budgets_per_type", {})
 
     n_thresholds = len(thresholds)
     fig, axes = plt.subplots(1, n_thresholds, figsize=(6 * n_thresholds, 5), squeeze=False)
@@ -962,7 +965,8 @@ def plot_sampling_steps_success_rate(
 
     color_idx = 0
     for attack_type in attack_types:
-        for budget_idx, budget in enumerate(attack_budgets):
+        budgets = budgets_per_type.get(attack_type, attack_budgets)
+        for budget in budgets:
             bkey = f"budget_{budget:.6f}"
             label = f"{attack_type} eps={budget:.3f}"
             color = colors[color_idx % len(colors)]

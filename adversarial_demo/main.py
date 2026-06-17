@@ -31,6 +31,8 @@ from utils.adversarial_eval import (
     evaluate_localizability,
     evaluate_restarts,
     evaluate_sampling_steps,
+    evaluate_sampling_steps_precomputed,
+    merge_sampling_steps_results,
 )
 from utils.adversarial_utils import seed_everything, expand_to_budget_count
 from utils.plots_adversarial_attacks import (
@@ -524,6 +526,77 @@ def cmd_evaluate_restarts(args, config: Dict[str, Any]) -> None:
     print(f"Plots saved to: {plots_dir}")
 
 
+def cmd_evaluate_sampling_steps_precomputed(args, config: Dict[str, Any]) -> None:
+    """Execute evaluate-sampling-steps-precomputed command."""
+    dataset = pick_value(args.dataset, config.get("dataset"), "yfcc")
+    attack_name = pick_value(args.attack_name, config.get("attack_name"), DEFAULT_GEOSHIELD_ATTACK_NAME)
+    eval_num_steps = pick_value(args.eval_num_steps, config.get("eval_num_steps"), DEFAULT_EVAL_NUM_STEPS)
+
+    attack_budgets = pick_value(args.attack_budgets, config.get("attack_budgets"), None)
+    if attack_budgets is None:
+        attack_budgets = config.get("attack_budgets", {}).get(dataset)
+    if not attack_budgets:
+        raise ValueError("No attack budgets configured for the precomputed sampling-steps evaluation")
+
+    clean_image_dirs = pick_value(args.clean_image_dirs, config.get("clean_image_dirs"), None)
+    attacked_image_dirs = pick_value(args.attacked_image_dirs, config.get("attacked_image_dirs"), None)
+    if clean_image_dirs is None or attacked_image_dirs is None:
+        raise ValueError(
+            "Both --clean-image-dirs and --attacked-image-dirs must be provided, "
+            "either on the CLI or in the config"
+        )
+
+    clean_image_dirs = expand_to_budget_count(clean_image_dirs, len(attack_budgets), "clean_image_dirs")
+    attacked_image_dirs = expand_to_budget_count(attacked_image_dirs, len(attack_budgets), "attacked_image_dirs")
+
+    n_images = pick_value(args.n_images, config.get("n_images_to_eval"), None)
+    results_dir = pick_value(args.results_dir, config.get("results_dir"), str(DEFAULT_RESULTS_DIR))
+    plots_dir = pick_value(args.plots_dir, config.get("plots_dir"), str(DEFAULT_PLOTS_DIR))
+    seed = int(config.get("seed", 0))
+    device = get_device(config)
+    success_rate_thresholds = get_nested_config(
+        config, "plot", "attack_success_rate_thresholds", default=DEFAULT_SUCCESS_RATE_THRESHOLDS
+    )
+
+    seed_everything(seed)
+    pipeline = get_pipeline(config, dataset)
+
+    print(f"\n{'='*60}")
+    print(f"Evaluating {attack_name} sampling-step sensitivity on {dataset.upper()}")
+    print(f"{'='*60}")
+    print(f"Attack budgets: {attack_budgets}")
+    print(f"Clean image folders: {clean_image_dirs}")
+    print(f"Attacked image folders: {attacked_image_dirs}")
+    print(f"Evaluation step counts: {eval_num_steps}")
+    print(f"Results directory: {results_dir}")
+    print(f"Plots directory: {plots_dir}")
+    if n_images is not None:
+        print(f"Images per budget: {n_images}")
+    print(f"{'='*60}\n")
+
+    json_results = evaluate_sampling_steps_precomputed(
+        attack_name=attack_name,
+        pipeline=pipeline,
+        dataset_name=dataset,
+        clean_image_dirs=list(clean_image_dirs),
+        attacked_image_dirs=list(attacked_image_dirs),
+        attack_budgets=list(attack_budgets),
+        seed=seed,
+        eval_num_steps=eval_num_steps,
+        n_images=n_images,
+        results_dir=results_dir,
+        cfg=float(get_nested_config(config, "attack_train_args", dataset, "restart_eval_cfg") or 10.0),
+        success_rate_thresholds=success_rate_thresholds,
+        device=device,
+        config_dump=config,
+    )
+
+    plot_sampling_steps_success_rate(json_results=json_results, plot_dir=plots_dir)
+
+    print(f"\nEvaluation complete! Results saved to: {results_dir}")
+    print(f"Plots saved to: {plots_dir}")
+
+
 def cmd_evaluate_sampling_steps(args, config: Dict[str, Any]) -> None:
     """Execute evaluate-sampling-steps command."""
     dataset = pick_value(args.dataset, config.get("dataset"), "yfcc")
@@ -665,9 +738,19 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
             threshold_km=success_rate_thresholds,
         )
     
+    elif plot_type == "sampling-steps":
+        results_files = pick_value(args.results_files, config.get("results_files"), None)
+        if not results_files:
+            raise ValueError(
+                "plot sampling-steps requires --results-files (one or more JSON result file paths)"
+            )
+        print(f"Merging {len(results_files)} result file(s) for joint sampling-steps plot")
+        merged = merge_sampling_steps_results(results_files)
+        plot_sampling_steps_success_rate(json_results=merged, plot_dir=plots_dir)
+
     else:
         raise ValueError(f"Unknown plot type: {plot_type}")
-    
+
     print(f"\nPlots saved to: {plots_dir}")
 
 
@@ -873,6 +956,57 @@ Examples:
         help="Directory to save plots",
     )
     
+    # evaluate-sampling-steps-precomputed command
+    eval_steps_pre = subparsers.add_parser(
+        "evaluate-sampling-steps-precomputed",
+        help="Evaluate sampling-step sensitivity for a precomputed attack (e.g. GeoShield)",
+        parents=[global_parser],
+    )
+    eval_steps_pre.add_argument(
+        "--dataset",
+        choices=["yfcc", "osv"],
+        help="Dataset label used for saving results and plots",
+    )
+    eval_steps_pre.add_argument(
+        "--attack-name",
+        help=f"Label for the evaluated attack (default: {DEFAULT_GEOSHIELD_ATTACK_NAME})",
+    )
+    eval_steps_pre.add_argument(
+        "--attack-budgets",
+        nargs="+",
+        type=float,
+        help="Attack budgets aligned with the clean/attacked folder list",
+    )
+    eval_steps_pre.add_argument(
+        "--clean-image-dirs",
+        nargs="+",
+        help="One clean image directory per budget",
+    )
+    eval_steps_pre.add_argument(
+        "--attacked-image-dirs",
+        nargs="+",
+        help="One attacked image directory per budget",
+    )
+    eval_steps_pre.add_argument(
+        "--eval-num-steps",
+        nargs="+",
+        type=int,
+        help=f"Sampling step counts to evaluate at (default: {DEFAULT_EVAL_NUM_STEPS})",
+    )
+    eval_steps_pre.add_argument(
+        "--n-images",
+        type=int,
+        help="Optional number of images to evaluate per budget after matching pairs",
+    )
+    eval_steps_pre.add_argument(
+        "--results-dir",
+        help="Directory to save results",
+    )
+    eval_steps_pre.add_argument(
+        "--plots-dir",
+        help="Directory to save plots",
+    )
+
     # evaluate-restarts command
     eval_restarts = subparsers.add_parser(
         "evaluate-restarts",
@@ -953,7 +1087,7 @@ Examples:
     plot_cmd.add_argument(
         "plot_type",
         nargs="?",
-        choices=["results", "success-rate"],
+        choices=["results", "success-rate", "sampling-steps"],
         help="Type of plot to generate",
     )
     plot_cmd.add_argument(
@@ -973,6 +1107,11 @@ Examples:
     plot_cmd.add_argument(
         "--plots-dir",
         help="Directory to save plots",
+    )
+    plot_cmd.add_argument(
+        "--results-files",
+        nargs="+",
+        help="JSON result files to merge for 'sampling-steps' plot type",
     )
     
     # list-configs command
@@ -1016,6 +1155,8 @@ def main():
         cmd_evaluate_localizability(args, config)
     elif args.command == "evaluate-geoshield-vs-diffusion":
         cmd_evaluate_geoshield_vs_diffusion(args, config)
+    elif args.command == "evaluate-sampling-steps-precomputed":
+        cmd_evaluate_sampling_steps_precomputed(args, config)
     elif args.command == "evaluate-restarts":
         cmd_evaluate_restarts(args, config)
     elif args.command == "evaluate-sampling-steps":

@@ -339,6 +339,184 @@ def evaluate_localizability(
     
     
 
+def merge_sampling_steps_results(json_paths):
+    """
+    Load and merge multiple sampling-steps JSON result files for joint plotting.
+
+    All files must share the same eval_num_steps and success_rate_thresholds_km.
+    Attack types and their per-type budget lists are combined so that
+    plot_sampling_steps_success_rate can overlay lines from different commands
+    (e.g. encoder trained on-the-fly vs GeoShield precomputed pairs).
+
+    Args:
+        json_paths: iterable of file paths to JSON result files produced by
+                    evaluate_sampling_steps or evaluate_sampling_steps_precomputed.
+
+    Returns:
+        Merged json_results dict compatible with plot_sampling_steps_success_rate.
+    """
+    import json
+
+    results_list = []
+    for path in json_paths:
+        with open(path) as f:
+            results_list.append(json.load(f))
+
+    if not results_list:
+        raise ValueError("No result files provided to merge")
+
+    ref = results_list[0]
+    for other in results_list[1:]:
+        if other["eval_num_steps"] != ref["eval_num_steps"]:
+            raise ValueError(
+                f"Cannot merge: eval_num_steps differ ({ref['eval_num_steps']} vs {other['eval_num_steps']})"
+            )
+        if other["success_rate_thresholds_km"] != ref["success_rate_thresholds_km"]:
+            raise ValueError(
+                f"Cannot merge: success_rate_thresholds_km differ "
+                f"({ref['success_rate_thresholds_km']} vs {other['success_rate_thresholds_km']})"
+            )
+
+    merged_attack_types = []
+    merged_results = {}
+    budgets_per_type = {}
+
+    for r in results_list:
+        for attack_type in r["attack_types"]:
+            if attack_type in merged_results:
+                raise ValueError(
+                    f"Duplicate attack type '{attack_type}' across result files. "
+                    "Rename one of them with a different --attack-name or --attack-types value."
+                )
+            merged_attack_types.append(attack_type)
+            merged_results[attack_type] = r["results"][attack_type]
+            budgets_per_type[attack_type] = list(r["attack_budgets"])
+
+    return {
+        "dataset": ref["dataset"],
+        "attack_types": merged_attack_types,
+        "attack_budgets": ref["attack_budgets"],  # fallback for single-file usage
+        "attack_budgets_per_type": budgets_per_type,
+        "eval_num_steps": ref["eval_num_steps"],
+        "success_rate_thresholds_km": ref["success_rate_thresholds_km"],
+        "n_images": ref["n_images"],
+        "results": merged_results,
+    }
+
+
+def evaluate_sampling_steps_precomputed(
+    attack_name: str,
+    pipeline,
+    dataset_name: str,
+    clean_image_dirs: list,
+    attacked_image_dirs: list,
+    attack_budgets: list,
+    seed: int = 0,
+    eval_num_steps: list = (10, 25, 50, 100, 250),
+    n_images: Optional[int] = None,
+    results_dir: str = "./results",
+    batch_size: int = 256,
+    cfg: float = 10.0,
+    success_rate_thresholds: list = (200, 750, 2500),
+    device: str = "cuda",
+    config_dump: dict = None,
+):
+    """
+    Evaluate how attack success of a precomputed attack (e.g. GeoShield) varies
+    with the number of sampling steps used at evaluation time.
+
+    Loads clean/attacked image pairs from folders (one pair of dirs per budget),
+    runs run_paired_pipeline_with_shared_noise at each num_steps value, and
+    returns a JSON-serialisable results dict in the same format as
+    evaluate_sampling_steps (so plot_sampling_steps_success_rate can be reused).
+    """
+    import json
+    import numpy as np
+    from PIL import Image as PILImage
+    from utils.adversarial_utils import collect_common_image_pairs, run_paired_pipeline_with_shared_noise
+
+    seed_everything(seed)
+    eval_num_steps = list(eval_num_steps)
+
+    if len(clean_image_dirs) != len(attack_budgets) or len(attacked_image_dirs) != len(attack_budgets):
+        raise ValueError(
+            "clean_image_dirs, attacked_image_dirs, and attack_budgets must have the same length"
+        )
+
+    # Load and match pairs per budget; optionally truncate
+    pairs_by_budget = []
+    for budget_idx, (clean_dir, attacked_dir) in enumerate(zip(clean_image_dirs, attacked_image_dirs)):
+        pairs = collect_common_image_pairs(clean_dir, attacked_dir)
+        if n_images is not None:
+            pairs = pairs[: max(0, int(n_images))]
+        if not pairs:
+            raise ValueError(f"No matched image pairs found for budget index {budget_idx}")
+        pairs_by_budget.append(pairs)
+
+    n_images_actual = min(len(p) for p in pairs_by_budget)
+
+    # Evaluate each pair at every num_steps value
+    # raw[budget_idx][num_steps] = [displacement_km, ...]
+    raw = {bi: {ns: [] for ns in eval_num_steps} for bi in range(len(attack_budgets))}
+
+    for budget_idx, budget in enumerate(attack_budgets):
+        pairs = pairs_by_budget[budget_idx]
+        for num_steps in tqdm_module.tqdm(
+            eval_num_steps,
+            desc=f"  {attack_name} eps={budget:.4f} eval steps",
+        ):
+            for image_idx, (clean_path, attacked_path, _) in enumerate(pairs):
+                with PILImage.open(clean_path) as f:
+                    clean_image = f.convert("RGB")
+                with PILImage.open(attacked_path) as f:
+                    attacked_image = f.convert("RGB")
+                eval_result = run_paired_pipeline_with_shared_noise(
+                    pipeline=pipeline,
+                    source_image=clean_image,
+                    perturbed_image=attacked_image,
+                    batch_size=batch_size,
+                    cfg=cfg,
+                    num_steps=int(num_steps),
+                    seed=int(seed) + budget_idx * 100_000 + image_idx,
+                    device=device,
+                )
+                raw[budget_idx][num_steps].append(
+                    float(eval_result["metrics"]["final_step_displacement"])
+                )
+
+    # Build JSON in the same format as evaluate_sampling_steps
+    json_results = {
+        "dataset": dataset_name,
+        "attack_types": [attack_name],
+        "attack_budgets": list(attack_budgets),
+        "eval_num_steps": eval_num_steps,
+        "success_rate_thresholds_km": list(success_rate_thresholds),
+        "n_images": n_images_actual,
+        "results": {attack_name: {}},
+    }
+    for budget_idx, budget in enumerate(attack_budgets):
+        bkey = f"budget_{budget:.6f}"
+        json_results["results"][attack_name][bkey] = {}
+        for num_steps in eval_num_steps:
+            disps = raw[budget_idx][num_steps]
+            success_rates = {
+                str(thr): float(np.mean([d > thr for d in disps]))
+                for thr in success_rate_thresholds
+            }
+            json_results["results"][attack_name][bkey][str(num_steps)] = {
+                "mean_displacement_km": float(np.mean(disps)),
+                "success_rates": success_rates,
+            }
+
+    os.makedirs(results_dir, exist_ok=True)
+    json_path = os.path.join(results_dir, f"{dataset_name}_{attack_name}_sampling_steps_results.json")
+    with open(json_path, "w") as f:
+        json.dump(json_results, f, indent=2)
+    print(f"Saved sampling-steps results to: {json_path}")
+
+    return json_results
+
+
 def evaluate_restarts(
     attack_types,
     pipeline,
