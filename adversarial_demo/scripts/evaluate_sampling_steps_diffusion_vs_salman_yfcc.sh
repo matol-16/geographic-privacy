@@ -9,8 +9,8 @@ PROJECT_DIR="$(repo_root)"
 # Edit these values to match the experiment you want to run.
 CONFIG_PATH="${PROJECT_DIR}/config.yaml"
 DATASET="yfcc"
-ATTACK_TYPES=(diffusion diffusion_salman)
-N_IMAGES=10
+ATTACK_TYPES=(diffusion diffusion_salman encoder)
+N_IMAGES=50
 EVAL_NUM_STEPS=(8 16 32 64 128 250 512)
 RESULTS_DIR="${PROJECT_DIR}/results/ablations/results_sampling_steps_diffusion_vs_salman"
 PLOTS_DIR="${RESULTS_DIR}/plots"

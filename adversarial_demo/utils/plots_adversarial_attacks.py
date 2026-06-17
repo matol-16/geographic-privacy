@@ -861,6 +861,85 @@ def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, 
     plt.close(fig)
 
 
+def plot_restarts_success(
+    json_results: dict,
+    plot_dir: str,
+) -> None:
+    """
+    Plot best displacement vs. number of restarts.
+
+    For each image: scatter of individual restart displacements + best-so-far line,
+    one line per (attack_type, budget) combination.
+    When n_images > 1, also produces a summary plot with mean ± std across images.
+    """
+    attack_types = json_results["attack_types"]
+    attack_budgets = json_results["attack_budgets"]
+    dataset = json_results["dataset"]
+    max_restarts = json_results["max_restarts"]
+    n_images = json_results["n_images"]
+    image_ids = json_results.get("image_ids", [str(i) for i in range(n_images)])
+    colors = plt.cm.tab10.colors
+
+    os.makedirs(plot_dir, exist_ok=True)
+
+    for img_idx in range(n_images):
+        fig, ax = plt.subplots(figsize=(7, 5))
+        color_idx = 0
+        for attack_type in attack_types:
+            for budget_idx, budget in enumerate(attack_budgets):
+                bkey = f"budget_{budget:.6f}"
+                ikey = f"image_{img_idx}"
+                color = colors[color_idx % len(colors)]
+                label = f"{attack_type} eps={budget:.3f}"
+                disps = json_results["results"][attack_type][bkey][ikey]["restart_displacements"]
+                best_k = json_results["results"][attack_type][bkey][ikey]["best_after_k"]
+                xs = list(range(1, len(disps) + 1))
+                ax.scatter(xs, disps, color=color, alpha=0.4, s=30, zorder=2)
+                ax.plot(range(1, len(best_k) + 1), best_k, color=color, label=label, linewidth=2, zorder=3)
+                color_idx += 1
+        ax.set_xlabel("Number of restarts")
+        ax.set_ylabel("Displacement (km)")
+        img_label = image_ids[img_idx] if img_idx < len(image_ids) else str(img_idx)
+        ax.set_title(f"Best displacement vs. restarts — {dataset.upper()} — image {img_label}")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        suffix = f"_image_{img_idx}" if n_images > 1 else ""
+        path = os.path.join(plot_dir, f"{dataset}_restarts_success{suffix}.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Plot saved to: {path}")
+
+    if n_images > 1:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        color_idx = 0
+        for attack_type in attack_types:
+            for budget_idx, budget in enumerate(attack_budgets):
+                bkey = f"budget_{budget:.6f}"
+                color = colors[color_idx % len(colors)]
+                label = f"{attack_type} eps={budget:.3f}"
+                curves = np.array([
+                    json_results["results"][attack_type][bkey][f"image_{i}"]["best_after_k"]
+                    for i in range(n_images)
+                ])
+                mean = curves.mean(axis=0)
+                std = curves.std(axis=0)
+                xs = list(range(1, max_restarts + 1))
+                ax.plot(xs, mean, color=color, label=label, linewidth=2)
+                ax.fill_between(xs, mean - std, mean + std, color=color, alpha=0.2)
+                color_idx += 1
+        ax.set_xlabel("Number of restarts")
+        ax.set_ylabel("Displacement (km)")
+        ax.set_title(f"Best displacement vs. restarts — {dataset.upper()} — {n_images} images (mean ± std)")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        path = os.path.join(plot_dir, f"{dataset}_restarts_success_summary.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Summary plot saved to: {path}")
+
+
 def plot_sampling_steps_success_rate(
     json_results: dict,
     plot_dir: str,

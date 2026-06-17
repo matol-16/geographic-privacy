@@ -29,12 +29,14 @@ from utils.pipe_trajectory import PlonkPipelineTrajectory
 from utils.adversarial_eval import (
     evaluate_attack_on_dataset,
     evaluate_localizability,
+    evaluate_restarts,
     evaluate_sampling_steps,
 )
 from utils.adversarial_utils import seed_everything, expand_to_budget_count
 from utils.plots_adversarial_attacks import (
     plot_results,
     plot_attack_success_rate,
+    plot_restarts_success,
     plot_sampling_steps_success_rate,
 )
 from core import (
@@ -52,6 +54,7 @@ DEFAULT_STORED_METRICS = ["final_step_displacement_predicted", "final_step_displ
 DEFAULT_SUCCESS_RATE_THRESHOLDS = [200, 750, 2500]
 DEFAULT_GEOSHIELD_ATTACK_NAME = "geoshield"
 DEFAULT_EVAL_NUM_STEPS = [10, 25, 50, 100, 250]
+DEFAULT_MAX_RESTARTS = 10
 
 
 def _parse_override_value(value_str: str) -> Any:
@@ -471,6 +474,56 @@ def cmd_evaluate_geoshield_vs_diffusion(args, config: Dict[str, Any]) -> None:
     print(f"Plots saved to: {plots_dir}")
 
 
+def cmd_evaluate_restarts(args, config: Dict[str, Any]) -> None:
+    """Execute evaluate-restarts command."""
+    dataset = pick_value(args.dataset, config.get("dataset"), "yfcc")
+    attack_types = pick_value(args.attack_types, config.get("attack_types"), DEFAULT_ATTACK_TYPES)
+    n_images = pick_value(args.n_images, config.get("n_images_to_eval"), 1)
+    max_restarts = pick_value(args.max_restarts, config.get("max_restarts"), DEFAULT_MAX_RESTARTS)
+
+    attack_budgets = config.get("attack_budgets", {}).get(dataset)
+    if not attack_budgets:
+        raise ValueError(f"No attack budgets configured for dataset: {dataset}")
+
+    results_dir = pick_value(args.results_dir, config.get("results_dir"), str(DEFAULT_RESULTS_DIR))
+    plots_dir = pick_value(args.plots_dir, config.get("plots_dir"), str(DEFAULT_PLOTS_DIR))
+    seed = int(config.get("seed", 0))
+
+    seed_everything(seed)
+    pipeline = get_pipeline(config, dataset)
+    attack_kwargs = get_attack_kwargs(config, dataset)
+
+    print(f"\n{'='*60}")
+    print(f"Evaluating restart sensitivity on {dataset.upper()} dataset")
+    print(f"{'='*60}")
+    print(f"Attack types: {attack_types}")
+    print(f"Attack budgets: {attack_budgets}")
+    print(f"Images to evaluate: {n_images}")
+    print(f"Max restarts: {max_restarts}")
+    print(f"Results directory: {results_dir}")
+    print(f"Plots directory: {plots_dir}")
+    print(f"{'='*60}\n")
+
+    json_results = evaluate_restarts(
+        attack_types=attack_types,
+        pipeline=pipeline,
+        dataset_name=dataset,
+        seed=seed,
+        n_images_to_eval=n_images,
+        max_restarts=max_restarts,
+        results_dir=results_dir,
+        attack_budgets=attack_budgets,
+        attack_kwargs=attack_kwargs,
+        dataset_roots=config.get("data_dirs", {}),
+        config_dump=config,
+    )
+
+    plot_restarts_success(json_results=json_results, plot_dir=plots_dir)
+
+    print(f"\nEvaluation complete! Results saved to: {results_dir}")
+    print(f"Plots saved to: {plots_dir}")
+
+
 def cmd_evaluate_sampling_steps(args, config: Dict[str, Any]) -> None:
     """Execute evaluate-sampling-steps command."""
     dataset = pick_value(args.dataset, config.get("dataset"), "yfcc")
@@ -820,6 +873,41 @@ Examples:
         help="Directory to save plots",
     )
     
+    # evaluate-restarts command
+    eval_restarts = subparsers.add_parser(
+        "evaluate-restarts",
+        help="Evaluate how attack success varies with the number of restarts",
+        parents=[global_parser],
+    )
+    eval_restarts.add_argument(
+        "--dataset",
+        choices=["yfcc", "osv"],
+        help="Dataset to evaluate on",
+    )
+    eval_restarts.add_argument(
+        "--attack-types",
+        nargs="+",
+        help="Attack types to evaluate (default: encoder diffusion)",
+    )
+    eval_restarts.add_argument(
+        "--n-images",
+        type=int,
+        help="Number of images to evaluate (default: 1)",
+    )
+    eval_restarts.add_argument(
+        "--max-restarts",
+        type=int,
+        help=f"Maximum number of restarts to run (default: {DEFAULT_MAX_RESTARTS})",
+    )
+    eval_restarts.add_argument(
+        "--results-dir",
+        help="Directory to save results",
+    )
+    eval_restarts.add_argument(
+        "--plots-dir",
+        help="Directory to save plots",
+    )
+
     # evaluate-sampling-steps command
     eval_steps = subparsers.add_parser(
         "evaluate-sampling-steps",
@@ -928,6 +1016,8 @@ def main():
         cmd_evaluate_localizability(args, config)
     elif args.command == "evaluate-geoshield-vs-diffusion":
         cmd_evaluate_geoshield_vs_diffusion(args, config)
+    elif args.command == "evaluate-restarts":
+        cmd_evaluate_restarts(args, config)
     elif args.command == "evaluate-sampling-steps":
         cmd_evaluate_sampling_steps(args, config)
     elif args.command == "plot":

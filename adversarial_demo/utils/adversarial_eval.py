@@ -339,6 +339,111 @@ def evaluate_localizability(
     
     
 
+def evaluate_restarts(
+    attack_types,
+    pipeline,
+    dataset_name: str,
+    seed: int = 0,
+    n_images_to_eval: int = 1,
+    max_restarts: int = 10,
+    results_dir: str = "./results",
+    attack_budgets: list = (2/255, 15/255, 50/255),
+    attack_kwargs: list = (),
+    dataset_roots: dict = None,
+    config_dump: dict = None,
+):
+    """
+    Train attacks with max_restarts restarts and measure how the best displacement
+    found evolves as the restart count increases.
+
+    For each (attack_type, budget, image), runs the attack once with max_restarts
+    restarts and extracts per-restart displacements from restart_summaries.
+    Returns a JSON-serialisable results dict (also saved to results_dir).
+    """
+    import json
+    import numpy as np
+    from core import ImageLoader
+    from attacks.attacks import run_attack
+    from utils.adversarial_utils import expand_per_budget_kwargs
+
+    seed_everything(seed)
+    dataset_roots = dataset_roots or {}
+
+    if isinstance(attack_types, str):
+        attack_types = [attack_types]
+
+    source_images, source_gps, source_image_ids = ImageLoader.load_images(
+        dataset=dataset_name,
+        n_images=n_images_to_eval,
+        seed=seed,
+        dataset_roots=dataset_roots,
+    )
+
+    attack_kwargs = expand_per_budget_kwargs(list(attack_kwargs), len(attack_budgets))
+
+    # Train each attack with max_restarts; record per-restart displacement from summaries.
+    # raw[attack_type][budget_idx][image_idx] = [disp_restart_0, disp_restart_1, ...]
+    raw = {
+        at: {bi: {} for bi in range(len(attack_budgets))}
+        for at in attack_types
+    }
+    for attack_type in attack_types:
+        for budget_idx, budget in enumerate(attack_budgets):
+            print(f"Training {attack_type} attacks with {max_restarts} restarts (eps={budget:.4f})...")
+            for image_idx, image in enumerate(tqdm_module.tqdm(source_images, desc="  images")):
+                kw = dict(attack_kwargs[budget_idx])
+                kw["num_restarts"] = max_restarts
+                result = run_attack(
+                    attack_type=attack_type,
+                    source_image=image,
+                    pipeline=pipeline,
+                    eps_max=budget,
+                    silent=True,
+                    **kw,
+                )
+                raw[attack_type][budget_idx][image_idx] = [
+                    float(s["final_step_displacement"])
+                    for s in result.get("restart_summaries", [])
+                ]
+
+    def _best_after_k(displacements):
+        best, current = [], float("-inf")
+        for d in displacements:
+            current = max(current, d)
+            best.append(current)
+        return best
+
+    json_results = {
+        "dataset": dataset_name,
+        "attack_types": attack_types,
+        "attack_budgets": list(attack_budgets),
+        "max_restarts": max_restarts,
+        "n_images": n_images_to_eval,
+        "image_ids": list(source_image_ids),
+        "results": {},
+    }
+    for attack_type in attack_types:
+        json_results["results"][attack_type] = {}
+        for budget_idx, budget in enumerate(attack_budgets):
+            bkey = f"budget_{budget:.6f}"
+            json_results["results"][attack_type][bkey] = {}
+            for image_idx in range(n_images_to_eval):
+                disps = raw[attack_type][budget_idx][image_idx]
+                json_results["results"][attack_type][bkey][f"image_{image_idx}"] = {
+                    "image_id": source_image_ids[image_idx],
+                    "restart_displacements": disps,
+                    "best_after_k": _best_after_k(disps),
+                }
+
+    os.makedirs(results_dir, exist_ok=True)
+    json_path = os.path.join(results_dir, f"{dataset_name}_restarts_results.json")
+    with open(json_path, "w") as f:
+        json.dump(json_results, f, indent=2)
+    print(f"Saved restart ablation results to: {json_path}")
+
+    return json_results
+
+
 def evaluate_sampling_steps(
     attack_types,
     pipeline,

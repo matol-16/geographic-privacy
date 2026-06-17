@@ -18,8 +18,8 @@ USE_REAL_GPS=false
 #model type: "" for RFM, "diffusion" for diffusion, "flow" for flow
 MODEL_TYPE="" 
 OVERRIDES=(
-#   "attack_budgets.yfcc=[0.0157, 0.0314]"
-  "attack_budgets.yfcc=[0.0314]"
+  "attack_budgets.yfcc=[0.0157, 0.0314]"
+#   "attack_budgets.yfcc=[0.0314]"
   "model_type=${MODEL_TYPE}"
 )
 

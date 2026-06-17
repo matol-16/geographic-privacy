@@ -8,40 +8,31 @@ PROJECT_DIR="$(repo_root)"
 
 # Edit these values to match the experiment you want to run.
 CONFIG_PATH="${PROJECT_DIR}/config.yaml"
-DATASET="osv"
-ATTACK_TYPES=(encoder)
-N_IMAGES=200
-RESULTS_DIR="${PROJECT_DIR}/results/results_encoder_200_8"
+DATASET="yfcc"
+ATTACK_TYPES=(diffusion diffusion_salman)
+N_IMAGES=50
+MAX_RESTARTS=10
+RESULTS_DIR="${PROJECT_DIR}/results/ablations/results_restarts_diffusion_vs_salman"
 PLOTS_DIR="${RESULTS_DIR}/plots"
-PARALLEL_WORKERS=4
-USE_REAL_GPS=false
-#model type: "" for RFM, "diffusion" for diffusion, "flow" for flow
-MODEL_TYPE="" 
 OVERRIDES=(
-  "attack_budgets.osv=[0.0157, 0.0314]"
-#   "attack_budgets.yfcc=[0.0314]"
-  "model_type=${MODEL_TYPE}"
+  "attack_budgets.yfcc=[0.03137]"
 )
 
 
 cd "${PROJECT_DIR}"
 
 cmd=(
-  python main.py evaluate-dataset
+  python main.py evaluate-restarts
   --config "${CONFIG_PATH}"
   --dataset "${DATASET}"
   --n-images "${N_IMAGES}"
+  --max-restarts "${MAX_RESTARTS}"
   --results-dir "${RESULTS_DIR}"
   --plots-dir "${PLOTS_DIR}"
-  --parallel-workers "${PARALLEL_WORKERS}"
 )
 
 if ((${#ATTACK_TYPES[@]})); then
   cmd+=(--attack-types "${ATTACK_TYPES[@]}")
-fi
-
-if [[ "${USE_REAL_GPS}" == true ]]; then
-  cmd+=(--use-real-gps)
 fi
 
 for override in "${OVERRIDES[@]}"; do
