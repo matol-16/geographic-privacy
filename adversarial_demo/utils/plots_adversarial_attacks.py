@@ -179,6 +179,8 @@ def _display_attack_name(attack_name: str) -> str:
     normalized = str(attack_name).lower()
     if normalized == "diffusion":
         return "DTD"
+    if normalized == "ace":
+        return "ACE"
     if normalized == "encoder":
         return "Encoder"
     if normalized == "geoshield":

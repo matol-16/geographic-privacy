@@ -10,7 +10,7 @@ from PIL import Image
 
 from utils.adversarial_utils import filter_kwargs_for, add_perturbation_to_image, resolve_torch_device
 from attacks.encoder_attacks import EncoderAttack
-from attacks.trajectory_deviation import DiffusionAttack
+from attacks.trajectory_deviation import DiffusionAttack, ACE
 from attacks.diffusion_attack_salman import DiffusionAttack as SalmanDiffusionAttack
 
 
@@ -91,10 +91,10 @@ def run_attack(
 	chosen attack class will be forwarded (unrecognised keys are ignored).
 
 	Args:
-		attack_type: "encoder", "diffusion", or "diffusion_salman".
+		attack_type: "encoder", "diffusion", "ace", or "diffusion_salman".
 		source_image: PIL source image to attack.
 		pipeline: PLONK pipeline instance.
-		target_image: Target image for targeted encoder attacks.
+		target_image: Target image for targeted attacks ("encoder" and "ace").
 		silent: If True, suppress all prints and progress bars from the attack.
 		**kwargs: forwarded to the attack implementation.
 	
@@ -122,6 +122,10 @@ def run_attack(
 		"salman": "diffusion_salman",
 		"diffusion_l2": "diffusion_l2",
 		"diffusion_cosine_neg": "diffusion_cosine_neg",
+		"ace": "ace",
+		"diffusion_target": "ace",
+		"dtd_target": "ace",
+		"diff_target": "ace",
 	}
 	normalized_type = aliases.get(str(attack_type).lower())
 	if normalized_type is None:
@@ -157,6 +161,13 @@ def run_attack(
 			source_image=source_image,
 			pipeline=pipeline,
 			attack_type_label="diffusion_cosine_neg",
+			**kwargs
+		)
+	if normalized_type == "ace":
+		return _run_ace_attack(
+			source_image=source_image,
+			target_image=target_image,
+			pipeline=pipeline,
 			**kwargs
 		)
 	return _run_diffusion_salman_attack(
@@ -299,6 +310,98 @@ def _run_diffusion_attack(
 		restart_eval_num_steps=restart_eval_num_steps,
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
+	)
+
+
+def _run_ace_attack(
+	source_image: Image.Image,
+	pipeline,
+	target_image: Optional[Image.Image] = None,
+	n_steps: int = 400,
+	train_batch_size: int = 64,
+	lr: float = 2e-2,
+	eps_max: float = 1.0,
+	anchor_samples: int = 256,
+	clean_num_steps: int = 200,
+	dot_product_loss: str = "l2_target",
+	reconstruction_loss_weight: float = 0.0,
+	alpha: float = 100.0,
+	delta_init: float = 1e-4,
+	num_restarts: int = 1,
+	restart_selection_metric: str = "mean_step_displacement",
+	restart_eval_batch_size: int = 256,
+	restart_eval_cfg: float = 10.0,
+	restart_eval_num_steps: Optional[int] = None,
+	restart_eval_seed: int = 1234,
+	print_restart_results: bool = True,
+	show_progress: bool = True,
+	device: str = "cuda",
+	early_stopping_patience: int = 0,  # 0=disabled, >0=stop if no improvement for N steps
+	num_restart_workers: int = 1,  # Number of parallel workers for restarts; 1=sequential
+	diagnose_grad_balance: bool = True,  # Print per-term grad norms once to check alpha
+	**kwargs,  # Absorb unused kwargs
+) -> Dict[str, Any]:
+	"""Run the ACE attack: pull the score and encoding towards a target image.
+
+	Combines a target score-alignment term with an encoder l2 term weighted by ``alpha``.
+	"""
+	from attacks.trajectory_deviation import build_x0_bank_from_clean_model
+
+	if target_image is None:
+		raise ValueError("attack_type='ace' requires a target_image.")
+
+	# Allow the target image to be supplied as a filesystem path (e.g. from config
+	# overrides), loading it into a PIL image for preprocessing.
+	if isinstance(target_image, str):
+		target_image = Image.open(target_image).convert("RGB")
+
+	# Build x0_bank once and reuse across all restarts (KEY OPTIMIZATION)
+	if show_progress:
+		print("Building x0 bank (shared across restarts)...")
+	x0_bank = build_x0_bank_from_clean_model(
+		pipeline,
+		source_image,
+		n_samples=anchor_samples,
+		num_steps=clean_num_steps,
+		cfg=0.0,
+		device=device,
+	)
+
+	# Create attack with shared x0_bank
+	attack = ACE(
+		pipeline=pipeline,
+		source_image=source_image,
+		target_image=target_image,
+		n_steps=n_steps,
+		train_batch_size=train_batch_size,
+		lr=lr,
+		eps_max=eps_max,
+		anchor_samples=anchor_samples,
+		clean_num_steps=clean_num_steps,
+		dot_product_loss=dot_product_loss,
+		reconstruction_loss_weight=reconstruction_loss_weight,
+		alpha=alpha,
+		delta_init=delta_init,
+		num_restarts=num_restarts,
+		restart_selection_metric=restart_selection_metric,
+		device=device,
+		x0_bank=x0_bank,  # Pass shared x0_bank
+		diagnose_grad_balance=diagnose_grad_balance,
+	)
+	attack.restart_manager.print_results = print_restart_results
+
+	return _run_restartable_attack(
+		attack=attack,
+		attack_type="ace",
+		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
+		show_progress=show_progress,
+		early_stopping_patience=early_stopping_patience,
+		restart_eval_batch_size=restart_eval_batch_size,
+		restart_eval_cfg=restart_eval_cfg,
+		restart_eval_num_steps=restart_eval_num_steps,
+		restart_eval_seed=restart_eval_seed,
+		num_restart_workers=num_restart_workers,
+		finalize_kwargs={"attack_mode": "targeted"},
 	)
 
 
