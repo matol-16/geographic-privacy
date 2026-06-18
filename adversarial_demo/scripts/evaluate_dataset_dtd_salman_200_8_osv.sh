@@ -9,14 +9,18 @@ PROJECT_DIR="$(repo_root)"
 # Edit these values to match the experiment you want to run.
 CONFIG_PATH="${PROJECT_DIR}/config.yaml"
 DATASET="osv"
-ATTACK_TYPES=(diffusion_salman)
-N_IMAGES=100
-RESULTS_DIR="${PROJECT_DIR}/results/results_diffusion_salman"
+ATTACK_TYPES=(diffusion_salman diffusion)
+N_IMAGES=200
+RESULTS_DIR="${PROJECT_DIR}/results/results_dtd_salman_200"
 PLOTS_DIR="${RESULTS_DIR}/plots"
 PARALLEL_WORKERS=4
 USE_REAL_GPS=false
+#model type: "" for RFM, "diffusion" for diffusion, "flow" for flow
+MODEL_TYPE="" 
 OVERRIDES=(
-  "attack_budgets.osv=[0.0157, 0.0314]"
+#   "attack_budgets.osv=[0.0157, 0.0314]"
+  "attack_budgets.osv=[0.0314]"
+  "model_type=${MODEL_TYPE}"
 )
 
 

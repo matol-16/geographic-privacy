@@ -120,6 +120,8 @@ def run_attack(
 		"diff": "diffusion",
 		"diffusion_salman": "diffusion_salman",
 		"salman": "diffusion_salman",
+		"diffusion_l2": "diffusion_l2",
+		"diffusion_cosine_neg": "diffusion_cosine_neg",
 	}
 	normalized_type = aliases.get(str(attack_type).lower())
 	if normalized_type is None:
@@ -139,6 +141,22 @@ def run_attack(
 		return _run_diffusion_attack(
 			source_image=source_image,
 			pipeline=pipeline,
+			**kwargs
+		)
+	if normalized_type == "diffusion_l2":
+		kwargs["dot_product_loss"] = "l2"
+		return _run_diffusion_attack(
+			source_image=source_image,
+			pipeline=pipeline,
+			attack_type_label="diffusion_l2",
+			**kwargs
+		)
+	if normalized_type == "diffusion_cosine_neg":
+		kwargs["dot_product_loss"] = "cosine_similarity_negative"
+		return _run_diffusion_attack(
+			source_image=source_image,
+			pipeline=pipeline,
+			attack_type_label="diffusion_cosine_neg",
 			**kwargs
 		)
 	return _run_diffusion_salman_attack(
@@ -231,11 +249,12 @@ def _run_diffusion_attack(
 	device: str = "cuda",
 	early_stopping_patience: int = 0,  # 0=disabled, >0=stop if no improvement for N steps
 	num_restart_workers: int = 1,  # Number of parallel workers for restarts; 1=sequential
+	attack_type_label: str = "diffusion",  # Label stored in result dict
 	**kwargs,  # Absorb unused kwargs
 ) -> Dict[str, Any]:
 	"""Run diffusion attack with optimizations: shared x0_bank, early stopping, and parallel restarts."""
 	from attacks.trajectory_deviation import build_x0_bank_from_clean_model
-	
+
 	# Build x0_bank once and reuse across all restarts (KEY OPTIMIZATION)
 	if show_progress:
 		print("Building x0 bank (shared across restarts)...")
@@ -247,7 +266,7 @@ def _run_diffusion_attack(
 		cfg=0.0,
 		device=device,
 	)
-	
+
 	# Create attack with shared x0_bank
 	attack = DiffusionAttack(
 		pipeline=pipeline,
@@ -268,10 +287,10 @@ def _run_diffusion_attack(
 		x0_bank=x0_bank,  # Pass shared x0_bank
 	)
 	attack.restart_manager.print_results = print_restart_results
-	
+
 	return _run_restartable_attack(
 		attack=attack,
-		attack_type="diffusion",
+		attack_type=attack_type_label,
 		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
 		show_progress=show_progress,
 		early_stopping_patience=early_stopping_patience,
