@@ -27,6 +27,12 @@ conda activate plonk
 pip install -e .
 '''
 
+## Datasets
+
+You can download the YFCC4k dataset by running the dedicated *build_yfcc4k_from_revisiting_im2gps.py* python file. You can specify you dataset folders through the argument parser. 
+
+The OSV datasets downloads automatically when calling an evaluation using it.
+
 ## Code structure
 
 As mentioned above, all the new code in is *adversarial_demo*. 
@@ -52,3 +58,5 @@ It is organized as follows ($\dagger$ specifies if the given code was coded with
 **Others**
 - Evaluation results are stored in the *results* folder. One can run directly our plotting methods that retrieve stored results.
 - *archive_code* consists of code used during the exploratory phase.
+
+The adversarial demo evaluation pipeline in `adversarial_demo` now supports resuming interrupted runs from a saved state file, and the saved results include compact `image_ids` and `image_indices` so each output can be mapped back to the source dataset order.

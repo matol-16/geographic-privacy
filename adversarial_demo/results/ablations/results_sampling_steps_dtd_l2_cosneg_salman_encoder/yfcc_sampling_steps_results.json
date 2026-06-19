@@ -1,0 +1,269 @@
+{
+  "dataset": "yfcc",
+  "attack_types": [
+    "diffusion_l2",
+    "diffusion_cosine_neg",
+    "diffusion_salman",
+    "encoder"
+  ],
+  "attack_budgets": [
+    0.03137
+  ],
+  "eval_num_steps": [
+    8,
+    16,
+    32,
+    64,
+    128,
+    250,
+    512
+  ],
+  "success_rate_thresholds_km": [
+    200,
+    750,
+    2500
+  ],
+  "n_images": 50,
+  "results": {
+    "diffusion_l2": {
+      "budget_0.031370": {
+        "8": {
+          "mean_displacement_km": 8529.321110839845,
+          "success_rates": {
+            "200": 1.0,
+            "750": 1.0,
+            "2500": 0.96
+          }
+        },
+        "16": {
+          "mean_displacement_km": 8464.805427246094,
+          "success_rates": {
+            "200": 1.0,
+            "750": 1.0,
+            "2500": 0.86
+          }
+        },
+        "32": {
+          "mean_displacement_km": 8145.2817085266115,
+          "success_rates": {
+            "200": 0.94,
+            "750": 0.9,
+            "2500": 0.78
+          }
+        },
+        "64": {
+          "mean_displacement_km": 8089.278901057243,
+          "success_rates": {
+            "200": 0.88,
+            "750": 0.86,
+            "2500": 0.76
+          }
+        },
+        "128": {
+          "mean_displacement_km": 8088.284834938049,
+          "success_rates": {
+            "200": 0.88,
+            "750": 0.86,
+            "2500": 0.76
+          }
+        },
+        "250": {
+          "mean_displacement_km": 8081.376669526696,
+          "success_rates": {
+            "200": 0.88,
+            "750": 0.86,
+            "2500": 0.76
+          }
+        },
+        "512": {
+          "mean_displacement_km": 8076.5299374789,
+          "success_rates": {
+            "200": 0.88,
+            "750": 0.84,
+            "2500": 0.76
+          }
+        }
+      }
+    },
+    "diffusion_cosine_neg": {
+      "budget_0.031370": {
+        "8": {
+          "mean_displacement_km": 9410.054040527344,
+          "success_rates": {
+            "200": 1.0,
+            "750": 1.0,
+            "2500": 0.94
+          }
+        },
+        "16": {
+          "mean_displacement_km": 9775.820847778321,
+          "success_rates": {
+            "200": 1.0,
+            "750": 0.98,
+            "2500": 0.88
+          }
+        },
+        "32": {
+          "mean_displacement_km": 9652.190069556236,
+          "success_rates": {
+            "200": 0.94,
+            "750": 0.9,
+            "2500": 0.82
+          }
+        },
+        "64": {
+          "mean_displacement_km": 9648.407190065383,
+          "success_rates": {
+            "200": 0.86,
+            "750": 0.86,
+            "2500": 0.8
+          }
+        },
+        "128": {
+          "mean_displacement_km": 9639.05074795246,
+          "success_rates": {
+            "200": 0.86,
+            "750": 0.86,
+            "2500": 0.8
+          }
+        },
+        "250": {
+          "mean_displacement_km": 9646.49914485097,
+          "success_rates": {
+            "200": 0.86,
+            "750": 0.86,
+            "2500": 0.8
+          }
+        },
+        "512": {
+          "mean_displacement_km": 9650.548252518178,
+          "success_rates": {
+            "200": 0.86,
+            "750": 0.86,
+            "2500": 0.8
+          }
+        }
+      }
+    },
+    "diffusion_salman": {
+      "budget_0.031370": {
+        "8": {
+          "mean_displacement_km": 6972.943907470703,
+          "success_rates": {
+            "200": 1.0,
+            "750": 0.98,
+            "2500": 0.78
+          }
+        },
+        "16": {
+          "mean_displacement_km": 6691.808544311523,
+          "success_rates": {
+            "200": 1.0,
+            "750": 0.94,
+            "2500": 0.62
+          }
+        },
+        "32": {
+          "mean_displacement_km": 6178.509717533589,
+          "success_rates": {
+            "200": 0.82,
+            "750": 0.6,
+            "2500": 0.54
+          }
+        },
+        "64": {
+          "mean_displacement_km": 6038.111303207427,
+          "success_rates": {
+            "200": 0.7,
+            "750": 0.58,
+            "2500": 0.52
+          }
+        },
+        "128": {
+          "mean_displacement_km": 6054.265661676228,
+          "success_rates": {
+            "200": 0.7,
+            "750": 0.6,
+            "2500": 0.52
+          }
+        },
+        "250": {
+          "mean_displacement_km": 6044.086105610877,
+          "success_rates": {
+            "200": 0.7,
+            "750": 0.58,
+            "2500": 0.52
+          }
+        },
+        "512": {
+          "mean_displacement_km": 6050.855844300054,
+          "success_rates": {
+            "200": 0.7,
+            "750": 0.6,
+            "2500": 0.52
+          }
+        }
+      }
+    },
+    "encoder": {
+      "budget_0.031370": {
+        "8": {
+          "mean_displacement_km": 7420.811037597657,
+          "success_rates": {
+            "200": 1.0,
+            "750": 1.0,
+            "2500": 0.86
+          }
+        },
+        "16": {
+          "mean_displacement_km": 7272.6637240600585,
+          "success_rates": {
+            "200": 0.98,
+            "750": 0.92,
+            "2500": 0.72
+          }
+        },
+        "32": {
+          "mean_displacement_km": 6835.387152519226,
+          "success_rates": {
+            "200": 0.9,
+            "750": 0.8,
+            "2500": 0.64
+          }
+        },
+        "64": {
+          "mean_displacement_km": 6779.379395909309,
+          "success_rates": {
+            "200": 0.84,
+            "750": 0.76,
+            "2500": 0.64
+          }
+        },
+        "128": {
+          "mean_displacement_km": 6760.468681698441,
+          "success_rates": {
+            "200": 0.84,
+            "750": 0.76,
+            "2500": 0.64
+          }
+        },
+        "250": {
+          "mean_displacement_km": 6759.075554525554,
+          "success_rates": {
+            "200": 0.84,
+            "750": 0.76,
+            "2500": 0.64
+          }
+        },
+        "512": {
+          "mean_displacement_km": 6759.660103787482,
+          "success_rates": {
+            "200": 0.84,
+            "750": 0.76,
+            "2500": 0.64
+          }
+        }
+      }
+    }
+  }
+}

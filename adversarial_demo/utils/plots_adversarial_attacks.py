@@ -1,0 +1,1004 @@
+import os
+import matplotlib.pyplot as plt
+from typing import Any
+from matplotlib import colormaps
+from matplotlib.patches import Patch
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+from torchvision import transforms
+import torch
+from PIL import Image
+import numpy as np
+from pathlib import Path
+from matplotlib.ticker import FixedFormatter, FixedLocator, NullLocator
+
+from utils.adversarial_metrics import trajectory_displacement
+
+
+def _load_attack_results(results_dir, dataset_name, attack_types):
+    """Load per-attack results, falling back to a saved evaluation state if needed."""
+    if results_dir is None:
+        raise ValueError("results_dir must be provided when all_results/results are not supplied")
+
+    loaded_results = {}
+    missing_attack_types = []
+    for attack_type in attack_types:
+        results_path = os.path.join(results_dir, f"{dataset_name}_{attack_type}_results.pt")
+        if os.path.exists(results_path):
+            loaded_results[attack_type] = torch.load(results_path)
+        else:
+            missing_attack_types.append(attack_type)
+
+    if not missing_attack_types:
+        return loaded_results
+
+    state_candidates = sorted(
+        Path(results_dir).glob(f"{dataset_name}_seed*_eval_state*.pt"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not state_candidates:
+        missing_paths = [os.path.join(results_dir, f"{dataset_name}_{attack_type}_results.pt") for attack_type in missing_attack_types]
+        raise FileNotFoundError(
+            "Missing saved results files and no evaluation state was found. "
+            f"Missing: {missing_paths}"
+        )
+
+    state = torch.load(state_candidates[0], map_location="cpu")
+    state_results = state.get("results") if isinstance(state, dict) else None
+    if not isinstance(state_results, dict):
+        missing_paths = [os.path.join(results_dir, f"{dataset_name}_{attack_type}_results.pt") for attack_type in missing_attack_types]
+        raise FileNotFoundError(
+            "Missing saved results files and the latest evaluation state does not contain results. "
+            f"Missing: {missing_paths}"
+        )
+
+    for attack_type in missing_attack_types:
+        if attack_type in state_results:
+            loaded_results[attack_type] = state_results[attack_type]
+
+    still_missing = [attack_type for attack_type in attack_types if attack_type not in loaded_results]
+    if still_missing:
+        missing_paths = [os.path.join(results_dir, f"{dataset_name}_{attack_type}_results.pt") for attack_type in still_missing]
+        raise FileNotFoundError(
+            "Missing saved results files and the available evaluation state does not cover all requested attack types. "
+            f"Missing: {missing_paths}"
+        )
+
+    return loaded_results
+
+
+def _sanitize_lon_lat(coords):
+    """Return valid [lat, lon] rows only, wrapping lon to [-180, 180]."""
+    arr = np.asarray(coords, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[1] != 2:
+        raise ValueError("Expected coords shape [N, 2] with [lat, lon]")
+
+    arr = arr.copy()
+    arr[:, 1] = ((arr[:, 1] + 180.0) % 360.0) - 180.0
+    arr[:, 0] = np.clip(arr[:, 0], -90.0, 90.0)
+
+    valid = np.isfinite(arr).all(axis=1)
+    return arr[valid], valid
+
+
+def _plot_valid_path(ax, lat_lon_traj, **plot_kwargs):
+    """Plot only contiguous valid trajectory segments to avoid Shapely warnings."""
+    traj = np.asarray(lat_lon_traj, dtype=np.float64)
+    if traj.ndim != 2 or traj.shape[1] != 2:
+        return
+
+    traj = traj.copy()
+    traj[:, 1] = ((traj[:, 1] + 180.0) % 360.0) - 180.0
+    traj[:, 0] = np.clip(traj[:, 0], -90.0, 90.0)
+    valid = np.isfinite(traj).all(axis=1)
+
+    start = None
+    for i, is_valid in enumerate(valid):
+        if is_valid and start is None:
+            start = i
+        if (not is_valid or i == len(valid) - 1) and start is not None:
+            end = i if not is_valid else i + 1
+            if end - start >= 2:
+                seg = traj[start:end]
+                ax.plot(seg[:, 1], seg[:, 0], **plot_kwargs)
+            start = None
+
+
+def _metric_aliases(metric_name):
+    if metric_name == "final_step_displacement_predicted":
+        return ["final_step_displacement_predicted", "final_step_displacement", "final_step_displacement_clean"]
+    if metric_name == "final_step_displacement_true":
+        return ["final_step_displacement_true"]
+    if metric_name == "final_step_displacement":
+        return ["final_step_displacement", "final_step_displacement_predicted", "final_step_displacement_clean"]
+    return [metric_name]
+
+
+def _get_metric_tensor(attack_results, metric_name):
+    for alias in _metric_aliases(metric_name):
+        tensor = attack_results.get(alias)
+        if isinstance(tensor, torch.Tensor):
+            return tensor
+    return None
+
+
+def _get_metric_samples_by_budget(attack_results, metric_name):
+    tensor = _get_metric_tensor(attack_results, metric_name)
+    if tensor is not None:
+        tensor = tensor.detach().cpu()
+        return [tensor[i].reshape(-1).numpy() for i in range(tensor.shape[0])]
+
+    restart_results = attack_results.get("restart_results")
+    if restart_results is None:
+        return None
+
+    samples_by_budget = []
+    for budget_results in restart_results:
+        budget_samples = []
+        for image_results in budget_results:
+            if not image_results:
+                continue
+            for restart_result in image_results:
+                value = restart_result.get(metric_name)
+                if value is None:
+                    for alias in _metric_aliases(metric_name):
+                        value = restart_result.get(alias)
+                        if value is not None:
+                            break
+                if value is not None:
+                    budget_samples.append(float(value))
+        samples_by_budget.append(np.asarray(budget_samples, dtype=np.float64))
+    return samples_by_budget
+
+
+def _summarize_samples(samples: np.ndarray, attack_name, budget) -> tuple[float, float, float, float]:
+    finite = samples[np.isfinite(samples)]
+    if finite.size == 0:
+        return np.nan, np.nan, np.nan, np.nan
+    
+    #drop nan results and log the amount that was dropped
+    valid_finite= finite[~np.isnan(finite)]
+    nb_dropped= finite.size - valid_finite.size
+    if nb_dropped>0:
+        print(f"Budget {budget:.3f}, attack {attack_name}: Dropped {nb_dropped} samples out of {valid_finite.size} total samples for metric summarization.")
+
+    with np.errstate(all="ignore"):
+        mean_value = float(np.mean(finite))
+        median_value = float(np.median(finite))
+        q25_value = float(np.quantile(finite, 0.25))
+        q75_value = float(np.quantile(finite, 0.75))
+    return mean_value, median_value, q25_value, q75_value
+
+
+def _select_displacement_metric(gps_true: bool) -> str:
+    return "final_step_displacement_true" if gps_true else "final_step_displacement_predicted"
+
+
+def _display_attack_name(attack_name: str) -> str:
+    normalized = str(attack_name).lower()
+    if normalized == "diffusion":
+        return "DTD"
+    if normalized == "ace":
+        return "ACE"
+    if normalized == "unidef":
+        return "UniDef"
+    if normalized == "encoder":
+        return "Encoder"
+    if normalized == "geoshield":
+        return "GeoShield"
+    return str(attack_name).replace("_", " ").title()
+
+
+def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_perturbed, perturb_budget = None, cfg=None, point_size=100):
+    plt.figure(figsize=(8,6))
+    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax.set_global()
+    ax.set_extent([-180, 180, -90, 90], crs=ccrs.PlateCarree())
+
+    # Higher-contrast map colors for better point visibility
+    ax.set_facecolor('#1f2a38')
+    ax.add_feature(cfeature.OCEAN, facecolor='#1f2a38')
+    ax.add_feature(cfeature.LAND, facecolor='#d9d2b6', edgecolor='none')
+    ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=0.7)
+    ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='white', linewidth=0.6)
+
+    gps_coords_source, _ = _sanitize_lon_lat(gps_coords_source)
+    gps_coords_perturbed, _ = _sanitize_lon_lat(gps_coords_perturbed)
+    if gps_coords_target is not None and len(gps_coords_target) > 0:
+        gps_coords_target, _ = _sanitize_lon_lat(gps_coords_target)
+
+    # Pipeline outputs arrays shaped [N, 2] as [latitude, longitude]
+    if len(gps_coords_source) > 0:
+        ax.scatter(
+            gps_coords_source[:, 1],
+            gps_coords_source[:, 0],
+            color='deepskyblue',
+            marker='o',
+            s=200,
+            alpha=0.95,
+            linewidths=0.5,
+            transform=ccrs.PlateCarree(),
+            label='Source Locations',
+            zorder=5,
+        )
+    if gps_coords_target is not None and len(gps_coords_target) > 0:
+        ax.scatter(
+            gps_coords_target[:, 1],
+            gps_coords_target[:, 0],
+            color='lime',
+            marker='o',
+            s=point_size,
+            alpha=0.95,
+            linewidths=0.5,
+            transform=ccrs.PlateCarree(),
+            label='Target Locations',
+            zorder=6,
+        )
+    if len(gps_coords_perturbed) > 0:
+        ax.scatter(
+            gps_coords_perturbed[:, 1],
+            gps_coords_perturbed[:, 0],
+            color='red',
+            marker='X',
+            s=point_size,
+            alpha=0.95,
+            edgecolors='white',
+            linewidths=0.8,
+            transform=ccrs.PlateCarree(),
+            label='Perturbed Predicted Locations',
+            zorder=7,
+        )
+
+    # Add gridlines
+    gl = ax.gridlines(draw_labels=True, linewidth=0.45, color='white', alpha=0.25, linestyle='--')
+    gl.top_labels = False
+    gl.right_labels = False
+
+    # Add title and legend
+    title = 'Geolocation Samples (Global View)' if perturb_budget is None else f'Geolocation Samples (Budget: {perturb_budget:.3f})'
+    
+    if cfg is not None:
+        title += f", CFG: {cfg}"
+    
+    plt.title(title, fontsize=16, color='black', pad=20)
+    plt.legend(loc='upper left', fontsize='large', frameon=True, facecolor='white', edgecolor='black')
+
+    plt.tight_layout()
+    plt.show()
+    
+    
+
+def plot_gps_trajectories_on_map(
+    gps_traj_source,
+    gps_traj_perturbed,
+    perturb_budget=None,
+    cfg=None,
+    max_trajectories=16,
+    show_map=True,
+    show_paths=True,
+    show_connectors=True,
+    show_displacement=True,
+    point_size=8,
+    metric="haversine",
+):
+    if not show_map and not show_displacement:
+        raise ValueError("At least one of show_map or show_displacement must be True")
+
+    map_ax = None
+    disp_ax = None
+
+    if show_map and show_displacement:
+        fig = plt.figure(figsize=(12, 5))
+        map_ax = fig.add_subplot(1, 2, 1, projection=ccrs.PlateCarree())
+        disp_ax = fig.add_subplot(1, 2, 2)
+    elif show_map:
+        fig = plt.figure(figsize=(8, 6))
+        map_ax = fig.add_subplot(1, 1, 1, projection=ccrs.PlateCarree())
+    else:
+        fig = plt.figure(figsize=(7, 5))
+        disp_ax = fig.add_subplot(1, 1, 1)
+
+    if show_map:
+        assert map_ax is not None
+        map_ax.set_global()
+        map_ax.set_extent([-180, 180, -90, 90], crs=ccrs.PlateCarree())
+
+        # Higher-contrast map colors for better point visibility
+        map_ax.set_facecolor('#1f2a38')
+        map_ax.add_feature(cfeature.OCEAN, facecolor='#1f2a38')
+        map_ax.add_feature(cfeature.LAND, facecolor='#d9d2b6', edgecolor='none')
+        map_ax.add_feature(cfeature.COASTLINE, edgecolor='white', linewidth=0.7)
+        map_ax.add_feature(cfeature.BORDERS, linestyle=':', edgecolor='white', linewidth=0.6)
+
+    if isinstance(gps_traj_source, torch.Tensor):
+        gps_traj_source = gps_traj_source.detach().cpu().numpy()
+    if isinstance(gps_traj_perturbed, torch.Tensor):
+        gps_traj_perturbed = gps_traj_perturbed.detach().cpu().numpy()
+
+    gps_traj_source = np.asarray(gps_traj_source)
+    gps_traj_perturbed = np.asarray(gps_traj_perturbed)
+
+    if gps_traj_source.ndim != 3 or gps_traj_source.shape[-1] != 2:
+        raise ValueError("gps_traj_source must have shape [num_steps, batch_size, 2]")
+    if gps_traj_perturbed.ndim != 3 or gps_traj_perturbed.shape[-1] != 2:
+        raise ValueError("gps_traj_perturbed must have shape [num_steps, batch_size, 2]")
+    if gps_traj_perturbed.shape[1] != gps_traj_source.shape[1]:
+        raise ValueError("gps_traj_source and gps_traj_perturbed must have the same batch_size")
+
+    num_steps, batch_size, _ = gps_traj_source.shape
+    n_plot = min(batch_size, max_trajectories)
+    colors = colormaps['tab20'](np.linspace(0, 1, max(n_plot, 2)))
+
+    for trajectory_index in range(n_plot):
+        c = colors[trajectory_index % len(colors)]
+
+        source_traj = gps_traj_source[:, trajectory_index, :]  # [num_steps, 2]
+        perturbed_traj = gps_traj_perturbed[:, trajectory_index, :]  # [num_steps, 2]
+
+        if show_map:
+            if show_paths:
+                _plot_valid_path(
+                    map_ax,
+                    source_traj,
+                    color=c,
+                    linewidth=0.7,
+                    alpha=0.35,
+                    transform=ccrs.PlateCarree(),
+                    zorder=4,
+                )
+            source_traj_sanitized, source_valid = _sanitize_lon_lat(source_traj)
+            map_ax.scatter(
+                source_traj_sanitized[:, 1],
+                source_traj_sanitized[:, 0],
+                color=c,
+                marker='o',
+                s=point_size,
+                alpha=0.85,
+                linewidths=0,
+                transform=ccrs.PlateCarree(),
+                zorder=5,
+                label='Source trajectories' if trajectory_index == 0 else None,
+            )
+
+            if show_paths:
+                _plot_valid_path(
+                    map_ax,
+                    perturbed_traj,
+                    color=c,
+                    linewidth=0.7,
+                    alpha=0.35,
+                    linestyle='--',
+                    transform=ccrs.PlateCarree(),
+                    zorder=4,
+                )
+            perturbed_traj_sanitized, perturbed_valid = _sanitize_lon_lat(perturbed_traj)
+            map_ax.scatter(
+                perturbed_traj_sanitized[:, 1],
+                perturbed_traj_sanitized[:, 0],
+                color=c,
+                marker='x',
+                s=point_size,
+                alpha=0.85,
+                linewidths=0.8,
+                transform=ccrs.PlateCarree(),
+                zorder=6,
+                label='Perturbed trajectories' if trajectory_index == 0 else None,
+            )
+
+            if show_connectors:
+                valid_steps = source_valid & perturbed_valid
+                for step_index in range(num_steps):
+                    if not valid_steps[step_index]:
+                        continue
+                    map_ax.plot(
+                        [source_traj[step_index, 1], perturbed_traj[step_index, 1]],
+                        [source_traj[step_index, 0], perturbed_traj[step_index, 0]],
+                        color=c,
+                        linewidth=0.4,
+                        alpha=0.2,
+                        transform=ccrs.PlateCarree(),
+                        zorder=3,
+                    )
+
+    if show_map:
+        # Add gridlines
+        gl = map_ax.gridlines(draw_labels=True, linewidth=0.45, color='white', alpha=0.25, linestyle='--')
+        gl.top_labels = False
+        gl.right_labels = False
+
+        # Add title and legend
+        title = 'Geolocation Trajectories (Global View)' if perturb_budget is None else f'Geolocation Trajectories (Budget: {perturb_budget:.3f})'
+
+        if cfg is not None:
+            title += f", CFG: {cfg}"
+        if n_plot < batch_size:
+            title += f" (showing {n_plot}/{batch_size})"
+
+        map_ax.set_title(title, fontsize=13, color='black', pad=12)
+        map_ax.legend(loc='upper left', fontsize='small', frameon=True, facecolor='white', edgecolor='black')
+
+    if show_displacement:
+        assert disp_ax is not None
+        src = gps_traj_source[:, :n_plot, :].astype(np.float64)
+        per = gps_traj_perturbed[:, :n_plot, :].astype(np.float64)
+        #convert to tensors for metrics, which expect tensors
+        src_tensor = torch.from_numpy(src)
+        per_tensor = torch.from_numpy(per)
+        displacement = trajectory_displacement(src_tensor, per_tensor, metric=metric)
+        displacement_np = displacement.detach().cpu().numpy()
+        mean_disp = np.nanmean(displacement_np, axis=1)
+        median_disp = np.nanmedian(displacement_np, axis=1)
+        q25_disp = np.nanquantile(displacement_np, 0.25, axis=1)
+        q75_disp = np.nanquantile(displacement_np, 0.75, axis=1)
+        steps = np.arange(num_steps)
+        disp_ax.plot(steps, mean_disp, color='black', linewidth=1.2, linestyle='--', alpha=0.8, label='Mean displacement')
+        disp_ax.plot(steps, median_disp, color='crimson', linewidth=1.8, label='Median displacement')
+        disp_ax.fill_between(steps, q25_disp, q75_disp, color='crimson', alpha=0.2, label='IQR (25-75%)')
+        disp_ax.set_title('Perturbation effect over steps', fontsize=12)
+        disp_ax.set_xlabel('Step')
+        disp_ax.set_ylabel(f'Displacement {metric}')
+        disp_ax.grid(alpha=0.3)
+        disp_ax.legend(fontsize='small')
+
+    fig.tight_layout()
+    plt.show()
+
+
+def plot_gps_trajectories_clean(gps_traj_source, gps_traj_perturbed, perturb_budget=None, cfg=None):
+    return plot_gps_trajectories_on_map(
+        gps_traj_source=gps_traj_source,
+        gps_traj_perturbed=gps_traj_perturbed,
+        perturb_budget=perturb_budget,
+        cfg=cfg,
+        max_trajectories=12,
+        show_paths=True,
+        show_connectors=False,
+        show_displacement=True,
+        point_size=6,
+    )
+    
+    
+    
+#comprehensive evaluation plots:
+
+import os
+
+def plot_transferability_results(results_dir, attack_budgets, plot_dir, dataset_name, metric, results=None):
+    # if results is None and results_dir is not None:
+    # 	results = torch.load(os.path.join(results_dir, f"{dataset_name}_results_transferability.pt"))
+
+    # plt.figure(figsize=(10,6))
+    # for attack, res in results.items():
+    # 	mean_metric = res.mean(dim=1)
+    # 	std_metric = res.std(dim=1)
+    # 	plt.plot(attack_budgets, mean_metric, label=attack)
+    # 	plt.fill_between(attack_budgets, mean_metric-std_metric, mean_metric+std_metric, alpha=0.2)
+
+    # plt.xlabel("Attack budget (eps)")
+    # plt.ylabel(metric)
+    # plt.title(f"Attack transferability evaluation on {dataset_name} dataset")
+    # plt.legend()
+    # if plot_dir is not None:
+    # 	os.makedirs(plot_dir, exist_ok=True)
+    # 	plt.savefig(os.path.join(plot_dir, f"{dataset_name}_transferability.png"))
+    # else:
+    # 	plt.show()
+ 
+    #instead, for each attack budget, plot a boxplot of the metric for each attack type, to better show the distribution of the metric across samples and attacks, which is more informative for transferability evaluation
+    if results is None and results_dir is not None:
+        results = torch.load(os.path.join(results_dir, f"{dataset_name}_results_transferability.pt"))
+    data_to_plot = []
+    attack_labels = []
+    for attack, res in results.items():
+        for i, budget in enumerate(attack_budgets):
+            data_to_plot.append(res[i].cpu().numpy())
+            attack_labels.append(f"{attack} (eps={budget:.3f})")
+    plt.figure(figsize=(12,6))
+    plt.boxplot(data_to_plot, showfliers=False)
+    plt.xticks(range(1, len(attack_labels) + 1), attack_labels, rotation=45, ha='right')
+    plt.ylabel(metric)
+    plt.title(f"Attack transferability evaluation on {dataset_name} dataset")
+    plt.tight_layout()
+
+    if plot_dir is not None:
+        os.makedirs(plot_dir, exist_ok=True)
+        plt.savefig(os.path.join(plot_dir, f"{dataset_name}_transferability_boxplot.png"))
+    else:
+        plt.show()
+ 
+  
+def plot_results(
+    results_dir,
+    attack_budgets,
+    plot_dir,
+    dataset_name,
+    attack_types=None,
+    attack_type=None,
+    all_results=None,
+    results=None,
+    stored_metrics=None,
+    gps_true: bool = False,
+):
+    # Support both old single-attack and new multi-attack signatures
+    if attack_types is None:
+        attack_types = [attack_type] if attack_type is not None else []
+    if stored_metrics is None:
+        stored_metrics = [_select_displacement_metric(gps_true)]
+    if all_results is None:
+        if results is not None:
+            all_results = {attack_types[0]: results}
+        elif results_dir is not None:
+            all_results = _load_attack_results(results_dir, dataset_name, attack_types)
+
+    for metric in stored_metrics:
+        plt.figure(figsize=(10,8))
+        plotted_any = False
+        for at, res in all_results.items():
+            budget_samples = _get_metric_samples_by_budget(res, metric)
+            if budget_samples is None:
+                continue
+
+            summary = np.asarray([
+                _summarize_samples(samples, attack_name=at, budget=attack_budgets[i]) 
+                for i,samples in enumerate(budget_samples)
+            ], dtype=np.float64)
+            mean_metric = summary[:, 0]
+            median_metric = summary[:, 1]
+            q25_metric = summary[:, 2]
+            q75_metric = summary[:, 3]
+            
+            print(q25_metric, mean_metric, q75_metric)
+
+            attack_name = _display_attack_name(at)
+            plt.plot(attack_budgets, mean_metric, linestyle='--', alpha=1.0,linewidth=3.0, label=f"{attack_name} mean")
+            # plt.plot(attack_budgets, median_metric, label=f"{at} median")
+            plt.fill_between(attack_budgets, q25_metric, q75_metric, alpha=0.3, label= f"{at} IQR (25-75%)")
+            plotted_any = True
+        if not plotted_any:
+            plt.close()
+            continue
+
+        plt.xlabel("Attack budget (out of 255)")
+        # plt.ylabel("Final step displacement (km)")
+        
+        #add note about log scale on y axis + quantiles
+        
+        #x and y axis should be log scale
+        plt.xscale("log")
+        plt.yscale("log")
+        
+        
+        ax = plt.gca()
+        tick_labels = [f"{eps*255:.0f}" for eps in attack_budgets]
+        ax.xaxis.set_major_locator(FixedLocator(attack_budgets))
+        ax.xaxis.set_major_formatter(FixedFormatter(tick_labels))
+        ax.xaxis.set_minor_locator(NullLocator())
+        #replace y ticks with nice values (1km, 10km, 100km, 1000km, 10000km)
+        plt.yticks([1000, 2500,5000,10000], ["1,000 km", "2500 km","5,000 km", "10,000 km"], rotation = 90, va='center')  # Rotate y-tick labels for better readability
+                
+        #add grid
+        plt.grid(which="both", linestyle="--", linewidth=0.5, alpha=0.7)
+        
+        plt.title(f"{dataset_name} dataset")
+        plt.legend(fontsize="x-large", markerscale=2)
+        if plot_dir is not None:
+            os.makedirs(plot_dir, exist_ok=True)
+            suffix = '_'.join(attack_types)
+            plt.savefig(os.path.join(plot_dir, f"{dataset_name}_{suffix}_{metric}.png"))
+        else:
+            plt.show()
+        plt.close()
+        
+        
+def plot_attack_success_rate(
+    results_dir,
+    attack_budgets,
+    plot_dir,
+    dataset_name,
+    threshold_km: Any = 2500,
+    attack_types=None,
+    attack_type=None,
+    all_results=None,
+    results=None,
+    gps_true: bool = False,
+):
+    """
+    Takes same input as plot_results, but plots attack success rate instead of metrics. Attack success is defined as the fraction of samples for which the final step displacement is above a certain threshold (e.g. 100km), which indicates a successful attack that significantly changes the predicted location.
+    
+    """
+    if attack_types is None:
+        attack_types = [attack_type] if attack_type is not None else []
+    if all_results is None:
+        if results is not None:
+            all_results = {attack_types[0]: results}
+        elif results_dir is not None:
+            all_results = _load_attack_results(results_dir, dataset_name, attack_types)
+    if all_results is None:
+        raise ValueError("No results available to plot. Provide results/all_results or a valid results_dir.")
+
+    if isinstance(threshold_km, (int, float, np.integer, np.floating)):
+        thresholds = [float(threshold_km)]
+    else:
+        thresholds = np.asarray(threshold_km, dtype=np.float64).reshape(-1).tolist()
+    if len(thresholds) == 0:
+        raise ValueError("threshold_km list cannot be empty")
+
+    # Ensure higher thresholds are rendered darker, regardless of input order.
+    thresholds = sorted(set(thresholds))
+    
+    linewidths= np.linspace(0.5,3, len(thresholds))
+
+    def _darken_rgba(color_rgba, factor):
+        import matplotlib.colors as mcolors
+        rgb = np.asarray(mcolors.to_rgb(color_rgba))
+        rgb = np.clip(rgb * factor, 0.0, 1.0)
+        return (rgb[0], rgb[1], rgb[2], 1.0)
+
+    plt.figure(figsize=(10, 8))
+    attack_names = list(all_results.keys())
+    # Use fixed qualitative colors so the first two attacks are clearly distinct (blue, red).
+    attack_palette = [
+        '#9467bd',  # purple
+        '#ff7f0e',  # orange
+        '#d62728',  # red
+        '#2ca02c',  # green
+        '#9467bd',  # purple
+        '#8c564b',  # brown
+    ]
+
+    for attack_index, (at, res) in enumerate(all_results.items()):
+        base_color = attack_palette[attack_index % len(attack_palette)]
+        metric_name = _select_displacement_metric(gps_true)
+        budget_samples = _get_metric_samples_by_budget(res, metric_name)
+        if budget_samples is None:
+            continue
+        
+        #filter out nan vaues:
+        for i,samples in enumerate(budget_samples):
+            l_before= len(samples)
+            samples=samples[~np.isnan(samples)]
+            nb_dropped= l_before - samples.size
+            if nb_dropped>0:
+                print(f"Budget {attack_budgets[i]:.3f}, attack {at}: Dropped {nb_dropped} samples out of {l_before} total samples for success rate computation")
+            budget_samples[i]=samples
+
+        success_curves = []
+        for t in thresholds:
+            success_rate = np.asarray([
+                float((samples > t).mean()) if samples.size > 0 else np.nan
+                for samples in budget_samples
+            ])
+            success_curves.append(success_rate)
+            
+        success_curves = np.asarray(success_curves)
+        
+        print(f"Attack {at}: Success rates at thresholds {thresholds} are:\n{success_curves}")
+        
+        if success_curves.shape[0] > 1:
+            low_curve = np.min(success_curves, axis=0)
+            high_curve = np.max(success_curves, axis=0)
+            plt.fill_between(
+                attack_budgets,
+                low_curve,
+                high_curve,
+                color=base_color,
+                alpha=0.30,
+                linewidth=0,
+            )
+
+        n_thresholds = len(thresholds)
+        threshold_linestyles = ['solid', 'dashed', 'dashdot', 'dotted', (0, (3, 1, 1, 1, 1, 1))]
+        for threshold_index, t in enumerate(thresholds):
+            if n_thresholds == 1:
+                shade_factor = 0.85
+            else:
+                # Highest threshold gets the darkest shade.
+                shade_factor = 1.0 - 0.55 * (threshold_index / (n_thresholds - 1))
+            line_color = _darken_rgba(base_color, shade_factor)
+            linestyle = threshold_linestyles[threshold_index % len(threshold_linestyles)]
+            
+            attack_name = _display_attack_name(at)
+
+            plt.plot(
+                attack_budgets,
+                success_curves[threshold_index],
+                color=line_color,
+                linewidth=linewidths[threshold_index],
+                linestyle=linestyle,
+                alpha=0.95,
+                label=f"{attack_name} > {t:.0f} km",
+            )
+
+    plt.xlabel("Attack budget out of 255 (log scale))")
+    # if len(thresholds) == 1:
+    #     plt.ylabel(f"Attack Success Rate (disp > {thresholds[0]:.0f} km)")
+    # else:
+    #     plt.ylabel("Attack Success Rate")
+    plt.title(f"Attack Success Rate on {dataset_name} dataset")
+    plt.ylim(0.4, 1.0)
+    plt.grid(alpha=0.25, linestyle='--', linewidth=0.6)
+    plt.legend(ncol=2, fontsize='x-large')
+    plt.xscale("log")
+    ax = plt.gca()
+    tick_labels = [f"{eps*255:.0f}" for eps in attack_budgets]
+    ax.xaxis.set_major_locator(FixedLocator(attack_budgets))
+    ax.xaxis.set_major_formatter(FixedFormatter(tick_labels))
+    ax.xaxis.set_minor_locator(NullLocator())
+
+
+    if plot_dir is not None:
+        os.makedirs(plot_dir, exist_ok=True)
+        suffix = '_'.join(attack_types)
+        plt.savefig(os.path.join(plot_dir, f"{dataset_name}_{suffix}_attack_success_rate.png"))
+    else:
+        plt.show()
+    plt.close()
+
+def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, results_attack_budgets):
+    """Produces a 2×2 grid: rows = datasets, columns = attacks.
+
+    Args:
+        attack_budgets: single float (or length-1 iterable) — the budget to plot.
+        plot_dir: directory to save the figure, or None to show interactively.
+        all_datasets_results: dict[dataset_name -> results] with two entries.
+        results_attack_budgets: list of budgets used when running evaluate_localizability,
+            used to map ``attack_budgets`` to the correct row index in the results tensors.
+    """
+
+    if isinstance(attack_budgets, (int, float, np.integer, np.floating)):
+        selected_budget = float(attack_budgets)
+    else:
+        budgets_arr = np.asarray(attack_budgets, dtype=np.float64).reshape(-1)
+        if budgets_arr.size != 1:
+            raise ValueError("plot_localizability_results expects a single budget (float)")
+        selected_budget = float(budgets_arr[0])
+
+    budget_arr = np.asarray(results_attack_budgets, dtype=np.float64).reshape(-1)
+    budget_idx = int(np.argmin(np.abs(budget_arr - selected_budget)))
+    if not np.isclose(budget_arr[budget_idx], selected_budget, rtol=1e-4):
+        raise ValueError(
+            f"Budget {selected_budget:.6f} not found in results_attack_budgets "
+            f"{[f'{b:.6f}' for b in budget_arr]}. Closest is {budget_arr[budget_idx]:.6f}."
+        )
+
+    bucket_names = ["Low", "Medium", "High"]
+    colors = colormaps['Set1'](np.linspace(0, 1, 3))
+    y_tick_values = [1000, 2500, 5000, 10000]
+    y_tick_labels = ["1,000 km", "2,500 km", "5,000 km", "10,000 km"]
+
+    def _get_buckets(res):
+        loc = res["localizability"].detach().cpu()
+        low_t = torch.quantile(loc, 0.33)
+        high_t = torch.quantile(loc, 0.66)
+        b = torch.zeros_like(loc, dtype=torch.long)
+        b[(loc > low_t) & (loc <= high_t)] = 1
+        b[loc > high_t] = 2
+        return b
+
+    def _get_attack_strength(res, attack):
+        attack_result = res["attack_results"][attack]
+        if isinstance(attack_result, dict):
+            t = _get_metric_tensor(attack_result, "final_step_displacement_predicted")
+            if t is None:
+                t = _get_metric_tensor(attack_result, "final_step_displacement")
+            if t is None:
+                tensor_values = [value for value in attack_result.values() if isinstance(value, torch.Tensor)]
+                if not tensor_values:
+                    raise ValueError(f"No tensor-valued attack results found for attack '{attack}'")
+                t = tensor_values[0]
+        else:
+            t = attack_result
+        t = t.detach().cpu()
+        if t.ndim == 1:
+            return t
+        if t.ndim == 2:
+            return t[budget_idx]
+        raise ValueError(f"Unexpected tensor shape {tuple(t.shape)} for attack '{attack}'")
+
+    def _fill_ax(ax, res, attack, row_label=None):
+        buckets = _get_buckets(res)
+        strength = _get_attack_strength(res, attack)
+        data = [strength[buckets == k].numpy() for k in range(3)]
+        box = ax.boxplot(
+            data,
+            positions=np.arange(3),
+            widths=0.9,
+            showfliers=False,
+            patch_artist=True,
+            medianprops=dict(color='black', linewidth=1.5),
+        )
+        for i, patch in enumerate(box['boxes']):
+            patch.set_facecolor(colors[i])
+            patch.set_edgecolor(colors[i])
+            patch.set_alpha(0.5)
+        attack_name = _display_attack_name(attack)
+        ax.set_title(f"{attack_name} attack")
+        # ax.set_xlabel(f"Budget = {selected_budget * 255:.0f}/255")
+        ax.set_xticks(np.arange(3))
+        ax.set_xticklabels(bucket_names)
+        ax.grid(axis='y', linestyle='--', linewidth=0.5, alpha=0.7)
+        if row_label is not None:
+            ax.set_ylabel(f"{row_label}")
+        return np.concatenate([v for v in data if len(v) > 0]) if any(len(v) > 0 for v in data) else np.array([])
+
+    dataset_names = list(all_datasets_results.keys())
+    attacks = list(next(iter(all_datasets_results.values()))["attack_results"].keys())
+    n_rows = len(dataset_names)
+    n_cols = len(attacks)
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(3 * n_cols, 3 * n_rows), sharey='row')
+    axes = np.atleast_2d(axes)
+
+    all_values = []
+    for r, ds in enumerate(dataset_names):
+        res = all_datasets_results[ds]
+        ds_name = "YFCC4K" if ds == "yfcc" else "OSV-5M"
+
+        for c, attack in enumerate(attacks):
+            ax = axes[r, c]
+            vals = _fill_ax(ax, res, attack, row_label=ds_name if c == 0 else None)
+            all_values.append(vals)
+
+    flat = np.concatenate([v for v in all_values if v.size > 0]) if any(v.size > 0 for v in all_values) else np.array([])
+    if flat.size > 0 and np.nanmax(flat) >= y_tick_values[0]:
+        for r in range(n_rows):
+            axes[r, 0].set_yticks(y_tick_values)
+            axes[r, 0].set_yticklabels(y_tick_labels, rotation=90, va='center')
+            axes[r,0].set_yscale('log')
+    legend_handles = [
+        Patch(facecolor=colors[i], edgecolor=colors[i], alpha=0.5, label=f"{bucket_names[i]} localizability")
+        for i in range(3)
+    ]
+    fig.legend(handles=legend_handles, loc='upper center', ncol=3, frameon=False, bbox_to_anchor=(0.52, 1.04))
+    # fig.suptitle(f"Attack strength vs localizability — budget = {selected_budget * 255:.0f}/255", y=1.05)
+    fig.tight_layout()
+
+    if plot_dir is not None:
+        os.makedirs(plot_dir, exist_ok=True)
+        plt.savefig(
+            os.path.join(plot_dir, f"localizability_budget_{selected_budget * 255:.0f}.png"),
+            bbox_inches='tight',
+        )
+    else:
+        plt.show()
+    plt.close(fig)
+
+
+def plot_restarts_success(
+    json_results: dict,
+    plot_dir: str,
+) -> None:
+    """
+    Plot best displacement vs. number of restarts.
+
+    For each image: scatter of individual restart displacements + best-so-far line,
+    one line per (attack_type, budget) combination.
+    When n_images > 1, also produces a summary plot with mean ± std across images.
+    """
+    attack_types = json_results["attack_types"]
+    attack_budgets = json_results["attack_budgets"]
+    dataset = json_results["dataset"]
+    max_restarts = json_results["max_restarts"]
+    n_images = json_results["n_images"]
+    image_ids = json_results.get("image_ids", [str(i) for i in range(n_images)])
+    colors = plt.cm.tab10.colors
+
+    os.makedirs(plot_dir, exist_ok=True)
+
+    for img_idx in range(n_images):
+        fig, ax = plt.subplots(figsize=(7, 5))
+        color_idx = 0
+        for attack_type in attack_types:
+            for budget_idx, budget in enumerate(attack_budgets):
+                bkey = f"budget_{budget:.6f}"
+                ikey = f"image_{img_idx}"
+                color = colors[color_idx % len(colors)]
+                label = f"{attack_type} eps={budget:.3f}"
+                disps = json_results["results"][attack_type][bkey][ikey]["restart_displacements"]
+                best_k = json_results["results"][attack_type][bkey][ikey]["best_after_k"]
+                xs = list(range(1, len(disps) + 1))
+                ax.scatter(xs, disps, color=color, alpha=0.4, s=30, zorder=2)
+                ax.plot(range(1, len(best_k) + 1), best_k, color=color, label=label, linewidth=2, zorder=3)
+                color_idx += 1
+        ax.set_xlabel("Number of restarts")
+        ax.set_ylabel("Displacement (km)")
+        img_label = image_ids[img_idx] if img_idx < len(image_ids) else str(img_idx)
+        ax.set_title(f"Best displacement vs. restarts — {dataset.upper()} — image {img_label}")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        suffix = f"_image_{img_idx}" if n_images > 1 else ""
+        path = os.path.join(plot_dir, f"{dataset}_restarts_success{suffix}.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Plot saved to: {path}")
+
+    if n_images > 1:
+        fig, ax = plt.subplots(figsize=(7, 5))
+        color_idx = 0
+        for attack_type in attack_types:
+            for budget_idx, budget in enumerate(attack_budgets):
+                bkey = f"budget_{budget:.6f}"
+                color = colors[color_idx % len(colors)]
+                label = f"{attack_type} eps={budget:.3f}"
+                curves = np.array([
+                    json_results["results"][attack_type][bkey][f"image_{i}"]["best_after_k"]
+                    for i in range(n_images)
+                ])
+                mean = curves.mean(axis=0)
+                std = curves.std(axis=0)
+                xs = list(range(1, max_restarts + 1))
+                ax.plot(xs, mean, color=color, label=label, linewidth=2)
+                ax.fill_between(xs, mean - std, mean + std, color=color, alpha=0.2)
+                color_idx += 1
+        ax.set_xlabel("Number of restarts")
+        ax.set_ylabel("Displacement (km)")
+        ax.set_title(f"Best displacement vs. restarts — {dataset.upper()} — {n_images} images (mean ± std)")
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        path = os.path.join(plot_dir, f"{dataset}_restarts_success_summary.png")
+        fig.savefig(path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"Summary plot saved to: {path}")
+
+
+def plot_sampling_steps_success_rate(
+    json_results: dict,
+    plot_dir: str,
+) -> None:
+    """
+    Plot attack success rate vs. number of sampling steps.
+
+    One subplot per distance threshold; one line per (attack_type, budget) pair.
+    json_results is the dict returned by evaluate_sampling_steps().
+    """
+    thresholds = json_results["success_rate_thresholds_km"]
+    eval_num_steps = json_results["eval_num_steps"]
+    attack_types = json_results["attack_types"]
+    attack_budgets = json_results["attack_budgets"]
+    dataset = json_results["dataset"]
+    # Per-type budget lists are set by merge_sampling_steps_results when combining
+    # results from different commands (e.g. encoder vs GeoShield).
+    budgets_per_type = json_results.get("attack_budgets_per_type", {})
+
+    n_thresholds = len(thresholds)
+    fig, axes = plt.subplots(1, n_thresholds, figsize=(6 * n_thresholds, 5), squeeze=False)
+    colors = plt.cm.tab10.colors
+
+    color_idx = 0
+    for attack_type in attack_types:
+        budgets = budgets_per_type.get(attack_type, attack_budgets)
+        for budget in budgets:
+            bkey = f"budget_{budget:.6f}"
+            label = f"{attack_type} eps={budget:.3f}"
+            color = colors[color_idx % len(colors)]
+            for ax_idx, thr in enumerate(thresholds):
+                ax = axes[0][ax_idx]
+                rates = [
+                    json_results["results"][attack_type][bkey][str(ns)]["success_rates"][str(thr)]
+                    for ns in eval_num_steps
+                ]
+                ax.plot(eval_num_steps, rates, marker="o", label=label, color=color)
+            color_idx += 1
+
+    for ax_idx, thr in enumerate(thresholds):
+        ax = axes[0][ax_idx]
+        ax.set_xlabel("Sampling steps")
+        ax.set_ylabel("Attack success rate")
+        ax.set_title(f"Displacement > {thr} km")
+        ax.legend(fontsize=7)
+        ax.set_ylim(0, 1)
+        ax.grid(True, alpha=0.3)
+
+    fig.suptitle(f"Attack success vs. sampling steps — {dataset.upper()}")
+    fig.tight_layout()
+    os.makedirs(plot_dir, exist_ok=True)
+    plot_path = os.path.join(plot_dir, f"{dataset}_sampling_steps_success_rate.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Plot saved to: {plot_path}")
+
+
+    
