@@ -144,7 +144,7 @@ class DiffusionAttack(AttackBase):
         reconstruction_loss_weight: float = 0.0,
         delta_init: float = 1e-4,
         num_restarts: int = 1,
-        restart_selection_metric: str = "mean_step_displacement",
+        restart_selection_metric: str = "final_step_displacement",
         device: str = "cuda",
         x0_bank: Optional[torch.Tensor] = None,  # Shared x0_bank across restarts
     ):
@@ -329,7 +329,7 @@ class ACE(DiffusionAttack):
         alpha: float = 100.0,
         delta_init: float = 1e-4,
         num_restarts: int = 1,
-        restart_selection_metric: str = "mean_step_displacement",
+        restart_selection_metric: str = "final_step_displacement",
         device: str = "cuda",
         x0_bank: Optional[torch.Tensor] = None,  # Shared x0_bank across restarts
         diagnose_grad_balance: bool = True,  # Print per-term grad norms once to check alpha
@@ -557,7 +557,7 @@ class UniDef(DiffusionAttack):
         fd: float = 0.01,
         fdje_direction: str = "embedding",  # "embedding" (UniDef latent z) or "gaussian"
         fdje_num_samples: int = 1,
-        cdd_reference: str = "auto",  # "auto" | "noise" | "clean_velocity"
+        cdd_reference: str = "clean_velocity",  # "auto" | "noise" | "clean_velocity"
         project_to_manifold: Optional[bool] = None,  # None => auto from model kind
         delta_init: float = 1e-4,
         num_restarts: int = 1,
