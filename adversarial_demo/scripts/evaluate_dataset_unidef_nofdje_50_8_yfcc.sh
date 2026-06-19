@@ -9,23 +9,21 @@ PROJECT_DIR="$(repo_root)"
 # Edit these values to match the experiment you want to run.
 CONFIG_PATH="${PROJECT_DIR}/config.yaml"
 DATASET="yfcc"
-ATTACK_TYPES=(ace)
-N_IMAGES=100
-RESULTS_DIR="${PROJECT_DIR}/results/baselines/results_ace_alpha100_50_8"
+ATTACK_TYPES=(unidef)
+N_IMAGES=200
+RESULTS_DIR="${PROJECT_DIR}/results/baselines/results_unidef_nofdje_100_8"
 PLOTS_DIR="${RESULTS_DIR}/plots"
 PARALLEL_WORKERS=4
 USE_REAL_GPS=false
 #model type: "" for RFM, "diffusion" for diffusion, "flow" for flow
 MODEL_TYPE=""
-# ACE target image (the image whose score/encoding we pull towards) and encoder-term weight.
-TARGET_IMAGE="/users/eleves-b/2023/mathias.ollu/repos/plonk/.media/MIST.png"
-ALPHA=1
+# UniDef ablation "w/o FDJE" (paper Table 4): CDD objective with exact backprop through
+# the denoiser instead of the finite-difference Jacobian estimate.
+USE_FDJE=false
 OVERRIDES=(
   "attack_budgets.yfcc=[0.0314]"  # 8/255
   "model_type=${MODEL_TYPE}"
-  "attack_train_args.yfcc.dot_product_loss=l2_target"
-  "attack_train_args.yfcc.target_image=${TARGET_IMAGE}"
-  "attack_train_args.yfcc.alpha=${ALPHA}"
+  "attack_train_args.yfcc.use_fdje=${USE_FDJE}"
 )
 
 

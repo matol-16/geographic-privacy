@@ -10,6 +10,7 @@ from attacks.attacks_core import AttackBase
 from utils.adversarial_utils import (
     conditional_preprocessing,
     compute_embedding,
+    model_dependent_embedding,
 )
 
 
@@ -69,6 +70,31 @@ def _compute_dot_alignment_loss(eps_reference, eps_prediction, dot_product_loss=
         eps_prediction_norm = torch.norm(eps_prediction, dim=-1)
         cosine_sim = dot / (eps_reference_norm * eps_prediction_norm + 1e-8)
         return -cosine_sim.mean()
+
+
+def detect_model_kind(pipeline) -> str:
+    """Identify the generative parameterization of a PLONK pipeline.
+
+    Returns one of:
+      - ``"diffusion"``: DDIM sampler; the network predicts the noise ``eps``.
+      - ``"rfm"``: Riemannian flow matching on the sphere; predicts a *velocity*
+        and samples by projecting onto the manifold each step.
+      - ``"flow"``: Euclidean flow matching; predicts a *velocity*.
+
+    Detection is based on the sampler bound to the pipeline (the source of truth
+    in ``plonk.pipe.MODELS``), with the model path as a fallback. Note the order
+    of the checks: ``"riemannian_flow_sampler"`` also contains ``"flow"``.
+    """
+    sampler_name = getattr(getattr(pipeline, "sampler", None), "__name__", "") or ""
+    model_path = str(getattr(pipeline, "model_path", "")).lower()
+    if "ddim" in sampler_name or "diffusion" in model_path:
+        return "diffusion"
+    if "riemannian" in sampler_name:
+        return "rfm"
+    if "flow" in sampler_name or "flow" in model_path:
+        return "flow"
+    # Default: the base PLONK models (no suffix) are Riemannian flow matching.
+    return "rfm"
 
 
 def build_x0_bank_from_clean_model(
@@ -453,4 +479,276 @@ class ACE(DiffusionAttack):
         config = super().get_config()
         config["alpha"] = self.alpha
         config["attack_mode"] = "targeted"
+        return config
+
+
+############################################################################################
+# UniDef: Consistent Distribution Deviation + Finite-Difference Jacobian Estimation
+############################################################################################
+
+
+class UniDef(DiffusionAttack):
+    """UniDef universal-defense attack adapted to the image-conditioned PLONK model.
+
+    Port of *UniDef: Universal Defense Against Unauthorized Image Manipulation*
+    (Shao et al., CVPR) to this geographic diffusion model, whose denoiser
+    ``eps_theta(y_t, emb, gamma)`` diffuses GPS coordinates ``y_t`` conditioned on
+    an image embedding ``emb``. The protected variable is the *conditioning
+    image*, so the perturbation enters only through ``emb``.
+
+    Two components are implemented:
+
+    1. **Consistent Distribution Deviation (CDD).** Rather than perturbing a
+       single/local denoising step, the objective maximizes the trajectory bias
+       ``||v_theta(y_t, emb', gamma) - v_theta(y_t, emb_clean, gamma)||^2``
+       integrated over the whole sampling trajectory. The trajectory integral is
+       realised exactly as in :class:`DiffusionAttack`: ``y_t`` is built from a
+       bank of plausible clean states (sampled from the clean model) with
+       timesteps ``t`` drawn uniformly, so every noise level contributes.
+       Maximizing this deviation over all steps steers the sampling ODE away from
+       the clean geographic distribution (paper Eq. 5/9).
+
+       The reference subtracted from the perturbed prediction adapts to the
+       model parameterization (auto-detected by :func:`detect_model_kind`):
+
+       - **diffusion (DDIM):** the network regresses the noise ``eps``, so the
+         reference is the *true sampled noise* and the objective is the faithful
+         UniDef ``max ||eps_theta(x_t) - eps||^2``.
+       - **flow / RFM:** the network regresses a *velocity field*, for which
+         ``eps`` is not a valid target, so the reference is the *clean conditional
+         velocity field* ``v_theta(x_t, emb_clean, gamma)`` (the best available
+         proxy for the clean data distribution).
+
+       For the manifold-native RFM model, ``x_t`` is additionally projected onto
+       the sphere so the network is queried on-manifold, as it is during sampling.
+
+    2. **Finite-Difference Jacobian Estimation (FDJE).** To avoid overfitting to
+       one denoiser's gradient (improving transfer across the RFM / diffusion /
+       flow backbones), the denoiser Jacobian is estimated by symmetric finite
+       differences instead of backpropagation. In this conditional model the
+       relevant Jacobian is ``J_e = d eps_theta / d emb``; using a direction
+       ``z`` (the clean image's embedding, UniDef's "latent z"),
+
+           J_e z ~= (eps_theta(y_t, emb' + fd*z) - eps_theta(y_t, emb' - fd*z)) / (2 fd),
+
+       and the Hutchinson identity gives ``grad_emb ||residual||^2 ~= 2 <J_e z,
+       residual> z`` (paper Eqs. 13-16). The denoiser is therefore only ever
+       evaluated forward (no autograd through it); the gradient is propagated to
+       the perturbation through the *encoder only* via a vector-Jacobian product.
+       Setting ``use_fdje=False`` recovers exact backprop (the paper's "w/o FDJE"
+       ablation).
+
+    Optimization is sign-SGD in an l_inf ball (projected gradient ascent with the
+    sign of the gradient), matching paper Eq. 17 and the rest of this module.
+    """
+
+    def __init__(
+        self,
+        pipeline,
+        source_image: Image.Image,
+        n_steps: int = 400,
+        train_batch_size: int = 64,
+        lr: float = 2e-2,
+        eps_max: float = 1.0,
+        anchor_samples: int = 256,
+        clean_num_steps: int = 200,
+        reconstruction_loss_weight: float = 0.0,
+        use_fdje: bool = True,
+        fd: float = 0.01,
+        fdje_direction: str = "embedding",  # "embedding" (UniDef latent z) or "gaussian"
+        fdje_num_samples: int = 1,
+        cdd_reference: str = "auto",  # "auto" | "noise" | "clean_velocity"
+        project_to_manifold: Optional[bool] = None,  # None => auto from model kind
+        delta_init: float = 1e-4,
+        num_restarts: int = 1,
+        restart_selection_metric: str = "final_step_displacement",
+        device: str = "cuda",
+        x0_bank: Optional[torch.Tensor] = None,  # Shared x0_bank across restarts
+    ):
+        super().__init__(
+            pipeline=pipeline,
+            source_image=source_image,
+            n_steps=n_steps,
+            train_batch_size=train_batch_size,
+            lr=lr,
+            eps_max=eps_max,
+            anchor_samples=anchor_samples,
+            clean_num_steps=clean_num_steps,
+            # CDD maximizes the l2 trajectory bias (-MSE, minimized == bias
+            # maximized). The reference subtracted from the perturbed prediction is
+            # set per model kind below (see self.cdd_reference).
+            target_pure_noise=False,
+            dot_product_loss="l2",
+            reconstruction_loss_weight=reconstruction_loss_weight,
+            delta_init=delta_init,
+            num_restarts=num_restarts,
+            restart_selection_metric=restart_selection_metric,
+            device=device,
+            x0_bank=x0_bank,
+        )
+
+        self.use_fdje = bool(use_fdje)
+        self.fd = float(fd)
+        self.fdje_direction = str(fdje_direction).lower()
+        self.fdje_num_samples = int(fdje_num_samples)
+        if self.fdje_direction not in ("embedding", "gaussian"):
+            raise ValueError(
+                f"Unknown fdje_direction={fdje_direction}. Expected 'embedding' or 'gaussian'."
+            )
+
+        # Adapt the objective to the model's parameterization (RFM / flow / DDIM).
+        self.model_kind = detect_model_kind(pipeline)
+
+        # CDD reference: what the perturbed prediction is pushed away from.
+        #   - "noise": the true sampled epsilon (faithful UniDef; valid for DDIM,
+        #     whose network regresses noise).
+        #   - "clean_velocity": the clean conditional velocity field (for flow /
+        #     RFM, whose network regresses a velocity, so epsilon is not a target).
+        reference = str(cdd_reference).lower()
+        if reference == "auto":
+            reference = "noise" if self.model_kind == "diffusion" else "clean_velocity"
+        if reference not in ("noise", "clean_velocity"):
+            raise ValueError(
+                f"Unknown cdd_reference={cdd_reference}. "
+                "Expected 'auto', 'noise', or 'clean_velocity'."
+            )
+        self.cdd_reference = reference
+
+        # Project the noisy state onto the sphere for the manifold-native RFM model,
+        # so the network is queried on-manifold as it is during RFM sampling.
+        if project_to_manifold is None:
+            project_to_manifold = self.model_kind == "rfm"
+        self.project_to_manifold = bool(project_to_manifold)
+
+        # Cache the clean-image embedding direction used as UniDef's latent z.
+        with torch.no_grad():
+            z = model_dependent_embedding(self.source_tensor, pipeline, track_grad=False)
+            z = z / (z.norm(dim=-1, keepdim=True) + 1e-8)
+        self.z_dir = z  # (1, D), unit norm
+
+    def _fdje_grad_emb(self, x_t, gamma, emb_det, residual):
+        """Estimate grad_emb ||residual||^2 by finite-difference Jacobian (no denoiser autograd)."""
+        grad_emb = torch.zeros_like(emb_det)
+        for _ in range(self.fdje_num_samples):
+            if self.fdje_direction == "gaussian":
+                z = torch.randn_like(emb_det)
+            else:
+                z = self.z_dir.expand_as(emb_det)
+            e_plus = self.pipeline.model({"y": x_t, "emb": emb_det + self.fd * z, "gamma": gamma})
+            e_minus = self.pipeline.model({"y": x_t, "emb": emb_det - self.fd * z, "gamma": gamma})
+            jz = (e_plus - e_minus) / (2.0 * self.fd)  # (B, d) ~= J_e z
+            coeff = (jz * residual).sum(dim=-1, keepdim=True)  # <J_e z, residual> (B, 1)
+            grad_emb = grad_emb + coeff * z
+        return grad_emb / self.fdje_num_samples
+
+    def run_step(
+        self,
+        delta: torch.Tensor,
+        step: int,
+        optimizer: torch.optim.Optimizer,
+    ) -> float:
+        """One sign-SGD ascent step on the CDD objective (optionally FDJE-estimated)."""
+        optimizer.zero_grad(set_to_none=True)
+
+        # Sample from x0 bank and the forward diffusion process (trajectory integral).
+        idx = torch.randint(0, self.x0_bank.shape[0], (self.train_batch_size,), device=self.device)
+        x0 = self.x0_bank[idx]
+        eps = torch.randn_like(x0)
+
+        t = torch.rand(self.train_batch_size, device=self.device)
+        gamma = self.pipeline.scheduler(t)
+
+        x_t = (
+            torch.sqrt(gamma).unsqueeze(-1) * x0
+            + torch.sqrt(1.0 - gamma).unsqueeze(-1) * eps
+        )
+        # For the manifold-native RFM model, query the network on-sphere (as during
+        # sampling). No-op for the Euclidean flow / diffusion models.
+        if self.project_to_manifold:
+            x_t = self.pipeline.manifold.projx(x_t)
+
+        # CDD reference, adapted to the model parameterization (see __init__):
+        #   - "noise": the true sampled epsilon (DDIM, whose network regresses noise),
+        #     giving the faithful UniDef objective max ||eps_theta(x_t) - eps||^2.
+        #   - "clean_velocity": the clean conditional velocity field v_theta(x_t,
+        #     emb_clean, gamma) (flow / RFM, whose network regresses a velocity).
+        # Maximizing the deviation from this reference at every (x_t, gamma) along the
+        # trajectory steers the sampling ODE away from the clean geographic
+        # distribution (paper Eq. 5/9).
+        if self.cdd_reference == "noise":
+            reference = eps
+        else:
+            with torch.no_grad():
+                emb_clean = compute_embedding(
+                    self.source_tensor,
+                    self.train_batch_size,
+                    self.pipeline,
+                    device=self.device,
+                    track_grad=False,
+                )
+                reference = self.pipeline.model(
+                    {"y": x_t, "emb": emb_clean, "gamma": gamma}
+                )
+
+        # Embedding of the perturbed conditioning image (tracks grad through the encoder).
+        perturbed_source = self.source_tensor + delta
+        emb_perturbed = compute_embedding(
+            perturbed_source,
+            self.train_batch_size,
+            self.pipeline,
+            device=self.device,
+            track_grad=True,
+        )
+
+        if not self.use_fdje:
+            # Exact backprop through the denoiser ("w/o FDJE" ablation).
+            pred_perturbed = self.pipeline.model(
+                {"y": x_t, "emb": emb_perturbed, "gamma": gamma}
+            )
+            # Maximize ||pred_perturbed - reference||^2  <=>  minimize -MSE.
+            loss = -torch.nn.functional.mse_loss(pred_perturbed, reference)
+            if self.reconstruction_loss_weight > 0:
+                loss = loss + self.reconstruction_loss_weight * torch.nn.functional.l1_loss(
+                    perturbed_source, self.source_tensor
+                )
+            loss.backward()
+            loss_value = float(loss.item())
+        else:
+            # FDJE: estimate the gradient w.r.t. the embedding without autograd through
+            # the denoiser, then propagate to delta through the encoder via a VJP.
+            with torch.no_grad():
+                emb_det = emb_perturbed.detach()
+                pred_perturbed = self.pipeline.model({"y": x_t, "emb": emb_det, "gamma": gamma})
+                residual = pred_perturbed - reference  # trajectory bias to be maximized
+                grad_emb = self._fdje_grad_emb(x_t, gamma, emb_det, residual)
+            # We maximize ||residual||^2; the sign-SGD step descends, so feed the
+            # negated estimated gradient as the upstream grad of the encoder VJP.
+            emb_perturbed.backward(gradient=-grad_emb)
+            if self.reconstruction_loss_weight > 0:
+                recon = self.reconstruction_loss_weight * torch.nn.functional.l1_loss(
+                    perturbed_source, self.source_tensor
+                )
+                recon.backward()
+            loss_value = float(-(residual ** 2).mean().item())
+
+        # Sign-SGD update in the l_inf ball (projected gradient ascent, paper Eq. 17).
+        with torch.no_grad():
+            delta.grad = torch.sign(delta.grad)
+            optimizer.step()
+            delta.data = torch.clamp(delta.data, -self.eps_max, self.eps_max)
+            delta.grad.zero_()
+
+        return loss_value
+
+    def get_config(self) -> Dict[str, Any]:
+        """Return attack configuration."""
+        config = super().get_config()
+        config["use_fdje"] = self.use_fdje
+        config["fd"] = self.fd
+        config["fdje_direction"] = self.fdje_direction
+        config["fdje_num_samples"] = self.fdje_num_samples
+        config["model_kind"] = self.model_kind
+        config["cdd_reference"] = self.cdd_reference
+        config["project_to_manifold"] = self.project_to_manifold
+        config["attack_mode"] = "untargeted"
         return config

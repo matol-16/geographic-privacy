@@ -181,6 +181,8 @@ def _display_attack_name(attack_name: str) -> str:
         return "DTD"
     if normalized == "ace":
         return "ACE"
+    if normalized == "unidef":
+        return "UniDef"
     if normalized == "encoder":
         return "Encoder"
     if normalized == "geoshield":

@@ -10,7 +10,7 @@ from PIL import Image
 
 from utils.adversarial_utils import filter_kwargs_for, add_perturbation_to_image, resolve_torch_device
 from attacks.encoder_attacks import EncoderAttack
-from attacks.trajectory_deviation import DiffusionAttack, ACE
+from attacks.trajectory_deviation import DiffusionAttack, ACE, UniDef
 from attacks.diffusion_attack_salman import DiffusionAttack as SalmanDiffusionAttack
 
 
@@ -126,6 +126,9 @@ def run_attack(
 		"diffusion_target": "ace",
 		"dtd_target": "ace",
 		"diff_target": "ace",
+		"unidef": "unidef",
+		"uni_def": "unidef",
+		"cdd": "unidef",
 	}
 	normalized_type = aliases.get(str(attack_type).lower())
 	if normalized_type is None:
@@ -167,6 +170,12 @@ def run_attack(
 		return _run_ace_attack(
 			source_image=source_image,
 			target_image=target_image,
+			pipeline=pipeline,
+			**kwargs
+		)
+	if normalized_type == "unidef":
+		return _run_unidef_attack(
+			source_image=source_image,
 			pipeline=pipeline,
 			**kwargs
 		)
@@ -402,6 +411,89 @@ def _run_ace_attack(
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
 		finalize_kwargs={"attack_mode": "targeted"},
+	)
+
+
+def _run_unidef_attack(
+	source_image: Image.Image,
+	pipeline,
+	n_steps: int = 400,
+	train_batch_size: int = 64,
+	lr: float = 2e-2,
+	eps_max: float = 1.0,
+	anchor_samples: int = 256,
+	clean_num_steps: int = 200,
+	reconstruction_loss_weight: float = 0.0,
+	use_fdje: bool = True,
+	fd: float = 0.01,
+	fdje_direction: str = "embedding",
+	fdje_num_samples: int = 1,
+	cdd_reference: str = "auto",  # "auto" | "noise" | "clean_velocity"
+	project_to_manifold: Optional[bool] = None,  # None => auto from model kind
+	delta_init: float = 1e-4,
+	num_restarts: int = 1,
+	restart_selection_metric: str = "final_step_displacement",
+	restart_eval_batch_size: int = 256,
+	restart_eval_cfg: float = 10.0,
+	restart_eval_num_steps: Optional[int] = None,
+	restart_eval_seed: int = 1234,
+	print_restart_results: bool = True,
+	show_progress: bool = True,
+	device: str = "cuda",
+	early_stopping_patience: int = 0,  # 0=disabled, >0=stop if no improvement for N steps
+	num_restart_workers: int = 1,  # Number of parallel workers for restarts; 1=sequential
+	**kwargs,  # Absorb unused kwargs
+) -> Dict[str, Any]:
+	"""Run the UniDef attack: global trajectory deviation (CDD) with optional FDJE."""
+	from attacks.trajectory_deviation import build_x0_bank_from_clean_model
+
+	# Build x0_bank once and reuse across all restarts (KEY OPTIMIZATION)
+	if show_progress:
+		print("Building x0 bank (shared across restarts)...")
+	x0_bank = build_x0_bank_from_clean_model(
+		pipeline,
+		source_image,
+		n_samples=anchor_samples,
+		num_steps=clean_num_steps,
+		cfg=0.0,
+		device=device,
+	)
+
+	attack = UniDef(
+		pipeline=pipeline,
+		source_image=source_image,
+		n_steps=n_steps,
+		train_batch_size=train_batch_size,
+		lr=lr,
+		eps_max=eps_max,
+		anchor_samples=anchor_samples,
+		clean_num_steps=clean_num_steps,
+		reconstruction_loss_weight=reconstruction_loss_weight,
+		use_fdje=use_fdje,
+		fd=fd,
+		fdje_direction=fdje_direction,
+		fdje_num_samples=fdje_num_samples,
+		cdd_reference=cdd_reference,
+		project_to_manifold=project_to_manifold,
+		delta_init=delta_init,
+		num_restarts=num_restarts,
+		restart_selection_metric=restart_selection_metric,
+		device=device,
+		x0_bank=x0_bank,  # Pass shared x0_bank
+	)
+	attack.restart_manager.print_results = print_restart_results
+
+	return _run_restartable_attack(
+		attack=attack,
+		attack_type="unidef",
+		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
+		show_progress=show_progress,
+		early_stopping_patience=early_stopping_patience,
+		restart_eval_batch_size=restart_eval_batch_size,
+		restart_eval_cfg=restart_eval_cfg,
+		restart_eval_num_steps=restart_eval_num_steps,
+		restart_eval_seed=restart_eval_seed,
+		num_restart_workers=num_restart_workers,
 	)
 
 
