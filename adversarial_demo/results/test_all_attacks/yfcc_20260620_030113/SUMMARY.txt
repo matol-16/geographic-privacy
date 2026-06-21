@@ -1,0 +1,43 @@
+[03:01:13] Test run: dataset=yfcc, n_images=10, budgets=[0.0157, 0.0314]
+[03:01:13] Attack types: encoder diffusion diffusion_salman diffusion_l2 diffusion_cosine_neg unidef ace
+[03:01:13] Sampling-steps grid: 16 64 250; parallel_workers=1
+[03:01:13] Output base: /users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/test_all_attacks/yfcc_20260620_030113
+[03:01:13] Python: conda run --no-capture-output -n plonk python
+[03:01:13] 
+[03:01:13] [Phase 1] evaluate-dataset: encoder  (log: /users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/test_all_attacks/yfcc_20260620_030113/logs/encoder.log)
+[03:01:36]            encoder: FAIL(exit=1)  (23s)
+[03:01:36] [Phase 1] evaluate-dataset: diffusion  (log: /users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/test_all_attacks/yfcc_20260620_030113/logs/diffusion.log)
+[03:01:36]            diffusion: FAIL(exit=1)  (0s)
+[03:01:36] [Phase 1] evaluate-dataset: diffusion_salman  (log: /users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/test_all_attacks/yfcc_20260620_030113/logs/diffusion_salman.log)
+[03:02:37]            diffusion_salman: FAIL(exit=1)  (61s)
+[03:02:37] [Phase 1] evaluate-dataset: diffusion_l2  (log: /users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/test_all_attacks/yfcc_20260620_030113/logs/diffusion_l2.log)
+[03:02:37]            diffusion_l2: FAIL(exit=1)  (0s)
+[03:02:37] [Phase 1] evaluate-dataset: diffusion_cosine_neg  (log: /users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/test_all_attacks/yfcc_20260620_030113/logs/diffusion_cosine_neg.log)
+[03:02:52]            diffusion_cosine_neg: FAIL(exit=1)  (15s)
+[03:02:52] [Phase 1] evaluate-dataset: unidef  (log: /users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/test_all_attacks/yfcc_20260620_030113/logs/unidef.log)
+[03:02:52]            unidef: FAIL(exit=1)  (0s)
+[03:02:52] [Phase 1] evaluate-dataset: ace  (log: /users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/test_all_attacks/yfcc_20260620_030113/logs/ace.log)
+[03:02:52]            ace: FAIL(exit=1)  (0s)
+[03:02:52] 
+[03:02:52] [Phase 2] No attacks passed; skipping combined plots.
+[03:02:52] 
+[03:02:52] ==================== SUMMARY ====================
+  encoder                FAIL(exit=1)
+  diffusion              FAIL(exit=1)
+  diffusion_salman       FAIL(exit=1)
+  diffusion_l2           FAIL(exit=1)
+  diffusion_cosine_neg   FAIL(exit=1)
+  unidef                 FAIL(exit=1)
+  ace                    FAIL(exit=1)
+[03:02:52] =================================================
+[03:02:52] Per-attack outputs : /users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/test_all_attacks/yfcc_20260620_030113/<attack>/{results,plots}
+[03:02:52] Combined plots     : /users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/test_all_attacks/yfcc_20260620_030113/combined/plots
+[03:02:52] Logs               : /users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/test_all_attacks/yfcc_20260620_030113/logs
+[03:02:52] 
+[03:02:52] What to check:
+[03:02:52]   * each /users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/test_all_attacks/yfcc_20260620_030113/<attack>/plots has: *_attack_success_rate.{png,json},
+[03:02:52]     *_final_step_displacement_*.{png,json}, *_restarts_success_summary.png,
+[03:02:52]     *_sampling_steps_success_rate.png
+[03:02:52]   * each /users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/results/test_all_attacks/yfcc_20260620_030113/<attack>/results has the *_restarts_results.json and
+[03:02:52]     *_sampling_steps_results.json ablation files
+[03:02:52]   * combined plots overlay every attack that passed

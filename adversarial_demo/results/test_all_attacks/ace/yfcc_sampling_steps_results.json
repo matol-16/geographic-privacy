@@ -1,0 +1,77 @@
+{
+  "dataset": "yfcc",
+  "attack_types": [
+    "ace"
+  ],
+  "attack_budgets": [
+    0.0157,
+    0.0314
+  ],
+  "eval_num_steps": [
+    16,
+    64,
+    250
+  ],
+  "success_rate_thresholds_km": [
+    200,
+    750,
+    2500
+  ],
+  "n_images": 10,
+  "results": {
+    "ace": {
+      "budget_0.015700": {
+        "16": {
+          "mean_displacement_km": 5954.293350219727,
+          "success_rates": {
+            "200": 1.0,
+            "750": 0.9,
+            "2500": 0.5
+          }
+        },
+        "64": {
+          "mean_displacement_km": 5050.2505914598705,
+          "success_rates": {
+            "200": 0.7,
+            "750": 0.7,
+            "2500": 0.5
+          }
+        },
+        "250": {
+          "mean_displacement_km": 5062.355848588049,
+          "success_rates": {
+            "200": 0.7,
+            "750": 0.7,
+            "2500": 0.5
+          }
+        }
+      },
+      "budget_0.031400": {
+        "16": {
+          "mean_displacement_km": 6128.565521240234,
+          "success_rates": {
+            "200": 1.0,
+            "750": 1.0,
+            "2500": 0.7
+          }
+        },
+        "64": {
+          "mean_displacement_km": 5015.799271219968,
+          "success_rates": {
+            "200": 0.7,
+            "750": 0.7,
+            "2500": 0.5
+          }
+        },
+        "250": {
+          "mean_displacement_km": 5014.086558047682,
+          "success_rates": {
+            "200": 0.7,
+            "750": 0.7,
+            "2500": 0.5
+          }
+        }
+      }
+    }
+  }
+}

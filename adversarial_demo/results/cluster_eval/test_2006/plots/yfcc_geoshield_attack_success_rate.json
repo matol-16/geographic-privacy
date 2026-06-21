@@ -1,0 +1,35 @@
+{
+  "dataset": "yfcc",
+  "metric": "final_step_displacement_predicted",
+  "thresholds_km": [
+    200.0,
+    750.0,
+    2500.0
+  ],
+  "attack_budgets": [
+    0.0157,
+    0.0314
+  ],
+  "attacks": {
+    "geoshield": {
+      "success_rate": {
+        "200.0": [
+          0.6,
+          0.6
+        ],
+        "750.0": [
+          0.4,
+          0.5
+        ],
+        "2500.0": [
+          0.4,
+          0.4
+        ]
+      },
+      "n_samples_per_budget": [
+        10,
+        10
+      ]
+    }
+  }
+}
