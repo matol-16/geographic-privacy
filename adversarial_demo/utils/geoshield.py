@@ -54,15 +54,21 @@ def _select_clean_images(
     seed: int,
     local_dir: Optional[str],
     clean_dir: str,
+    window_start: int = 0,
+    window_end: Optional[int] = None,
 ) -> Dict[str, GpsCoord]:
     """Copy the seeded, prefix-stable backbone selection into ``clean_dir``.
 
     The clean dir is repopulated from scratch each run so stale images from a previous
     selection cannot leak into the GeoShield evaluation. Returns a map from each copied
     file's name to its ground-truth GPS, so the precomputed evaluator can compute the
-    true-position metric (the pair keys are the file names).
+    true-position metric (the pair keys are the file names). ``window_start``/``window_end``
+    select the same image slice a trainable-attack shard would use.
     """
-    metadata = select_image_metadata(dataset, int(n_images), seed=int(seed), local_dir=local_dir)
+    metadata = select_image_metadata(
+        dataset, int(n_images), seed=int(seed), local_dir=local_dir,
+        window_start=int(window_start), window_end=window_end,
+    )
     if not metadata:
         raise RuntimeError("GeoShield: no clean images selected; check dataset root / config.")
 
@@ -131,6 +137,9 @@ def generate_geoshield_pairs(
     attack_budgets: Sequence[float],
     seed: int,
     geoshield_cfg: Optional[Dict[str, Any]] = None,
+    window_start: int = 0,
+    window_end: Optional[int] = None,
+    run_tag: Optional[str] = None,
 ) -> Tuple[List[str], List[str], Dict[str, GpsCoord]]:
     """Generate GeoShield-attacked images for every budget.
 
@@ -139,6 +148,11 @@ def generate_geoshield_pairs(
     so the evaluator can report the true-position metric. The clean dir is shared across
     budgets (same seeded selection); only the attacked dir changes with epsilon. Clean
     dir and output base are made dataset-specific so yfcc and osv runs never collide.
+
+    For multi-node sharding, ``window_start``/``window_end`` restrict the selection to one
+    image window and ``run_tag`` (e.g. ``"w000000_000100"``) is appended to the clean dir
+    and output base so concurrent shards never clobber each other's images. ``n_images`` is
+    the size of the full seeded pool the window is taken from.
     """
     geoshield_cfg = dict(geoshield_cfg or {})
     repos_root = geoshield_cfg.get("repos_root") or str(default_repos_root())
@@ -168,11 +182,15 @@ def generate_geoshield_pairs(
         )
 
     # Keep yfcc and osv outputs separate so concurrent / successive runs never collide.
-    clean_dir = str(Path(clean_dir_base) / dataset)
-    output_base = f"{output_base}_{dataset}"
+    # For sharded runs the run_tag (window range) further isolates each shard's dirs.
+    clean_dir = str(Path(clean_dir_base) / dataset / run_tag) if run_tag else str(Path(clean_dir_base) / dataset)
+    output_base = f"{output_base}_{dataset}_{run_tag}" if run_tag else f"{output_base}_{dataset}"
 
     local_dir = (config.get("data_dirs", {}) or {}).get(dataset)
-    gps_by_filename = _select_clean_images(dataset, n_images, seed, local_dir, clean_dir)
+    gps_by_filename = _select_clean_images(
+        dataset, n_images, seed, local_dir, clean_dir, window_start, window_end
+    )
+    num_images = len(gps_by_filename)  # actual images in this (windowed) selection
 
     clean_dirs: List[str] = []
     attacked_dirs: List[str] = []
@@ -184,7 +202,7 @@ def generate_geoshield_pairs(
             python_exe=python_exe,
             clean_dir=clean_dir,
             output_path=output_path,
-            n_images=n_images,
+            n_images=num_images,
             epsilon=int(epsilon),
             steps=steps,
         )

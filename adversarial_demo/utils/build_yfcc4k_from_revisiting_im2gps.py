@@ -16,6 +16,12 @@ METADATA_PAGE_URL = "http://www.mediafire.com/file/8v2j565997i5jed/0aaaa.r.image
 
 DEFAULT_CONFIG_PATH = "/users/eleves-b/2023/mathias.ollu/repos/plonk/adversarial_demo/config.yaml"
 
+# Default layout names (kept in sync with build_default_paths / config.build_yfcc4k), used
+# by ensure_yfcc4k to locate the download sources from just the dataset output directory.
+DEFAULT_DOWNLOADS_DIRNAME = "downloads"
+DEFAULT_IMAGES_ZIP_NAME = "yfcc4k.zip"
+DEFAULT_IMAGEDATA_TXT_NAME = "0aaaa.r.imagedata.txt"
+
 
 def load_config(config_path: str) -> dict:
     config_file = Path(config_path)
@@ -40,13 +46,13 @@ def build_default_paths(config: dict) -> dict:
     build_config = config.get("build_yfcc4k", {})
 
     yfcc_dirname = build_config.get("yfcc_dirname", "YFCC100M")
-    downloads_dirname = build_config.get("downloads_dirname", "downloads")
+    downloads_dirname = build_config.get("downloads_dirname", DEFAULT_DOWNLOADS_DIRNAME)
     dataset_dirname = build_config.get("dataset_dirname", "yfcc4k")
 
     yfcc_root = data_root / yfcc_dirname
     return {
-        "images_zip": yfcc_root / downloads_dirname / build_config.get("images_zip_name", "yfcc4k.zip"),
-        "imagedata_txt": yfcc_root / downloads_dirname / build_config.get("imagedata_txt_name", "0aaaa.r.imagedata.txt"),
+        "images_zip": yfcc_root / downloads_dirname / build_config.get("images_zip_name", DEFAULT_IMAGES_ZIP_NAME),
+        "imagedata_txt": yfcc_root / downloads_dirname / build_config.get("imagedata_txt_name", DEFAULT_IMAGEDATA_TXT_NAME),
         "output_dir": yfcc_root / dataset_dirname,
     }
 
@@ -111,17 +117,16 @@ def parse_metadata_line(line):
     return photo_id, float(lat_str), float(lon_str)
 
 
-def main(args):
-    config = load_config(args.config)
-    build_config = config.get("build_yfcc4k", {})
+def build_yfcc4k(images_zip, imagedata_txt, output_dir, overwrite=False, clean_tmp=True):
+    """Download the source files if needed, then assemble the YFCC4k dataset.
 
-    default_paths = build_default_paths(config)
-    config_dir = Path(args.config).expanduser().resolve().parent if args.config else DEFAULT_CONFIG_PATH.parent
-
-    images_zip = resolve_path(args.images_zip or str(default_paths["images_zip"]), config_dir, "build_yfcc4k.images_zip")
-    imagedata_txt = resolve_path(args.imagedata_txt or str(default_paths["imagedata_txt"]), config_dir, "build_yfcc4k.imagedata_txt")
-    output_dir = resolve_path(args.output_dir or str(default_paths["output_dir"]), config_dir, "build_yfcc4k.output_dir")
-
+    Writes ``images/<photo_id>.jpg`` and ``info.txt`` (the format the evaluation expects)
+    into ``output_dir``. ``images_zip`` / ``imagedata_txt`` are the source archive +
+    metadata file (downloaded on demand). Returns ``output_dir``.
+    """
+    images_zip = Path(images_zip)
+    imagedata_txt = Path(imagedata_txt)
+    output_dir = Path(output_dir)
     images_dir = output_dir / "images"
     extract_dir = output_dir / "_tmp_extract"
 
@@ -131,7 +136,7 @@ def main(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     images_dir.mkdir(parents=True, exist_ok=True)
 
-    if extract_dir.exists() and args.clean_tmp:
+    if extract_dir.exists() and clean_tmp:
         shutil.rmtree(extract_dir)
     extract_dir.mkdir(parents=True, exist_ok=True)
 
@@ -149,7 +154,7 @@ def main(args):
             source_image = image_by_stem[photo_id]
 
             destination_image = images_dir / f"{photo_id}.jpg"
-            if args.overwrite or not destination_image.exists():
+            if overwrite or not destination_image.exists():
                 write_jpg(source_image, destination_image)
 
             info_lines.append(build_info_line(photo_id, lon, lat))
@@ -159,13 +164,68 @@ def main(args):
     with open(info_path, "w", encoding="utf-8") as file:
         file.write("\n".join(info_lines) + "\n")
 
-    if args.clean_tmp:
+    if clean_tmp:
         shutil.rmtree(extract_dir, ignore_errors=True)
 
     print("Done.")
     print(f"Output dir: {output_dir}")
     print(f"Images written: {kept}")
     print(f"info.txt: {info_path}")
+    return output_dir
+
+
+def yfcc4k_is_present(output_dir) -> bool:
+    """True if a usable YFCC4k build (info.txt + a non-empty images/ dir) already exists."""
+    output_dir = Path(output_dir)
+    info_path = output_dir / "info.txt"
+    images_dir = output_dir / "images"
+    return info_path.exists() and images_dir.is_dir() and any(images_dir.iterdir())
+
+
+def ensure_yfcc4k(output_dir, images_zip=None, imagedata_txt=None, overwrite=False, clean_tmp=True):
+    """Build YFCC4k into ``output_dir`` on demand if it is not present yet.
+
+    Idempotent and cheap when the dataset already exists, so it is safe to call before
+    every YFCC evaluation. Download-source paths default to
+    ``<output_dir>/../downloads/<default names>`` (the layout ``build_default_paths``
+    produces), so callers only need the dataset directory. Requires internet on first build.
+    """
+    output_dir = Path(output_dir)
+    if yfcc4k_is_present(output_dir):
+        return output_dir
+
+    downloads_dir = output_dir.parent / DEFAULT_DOWNLOADS_DIRNAME
+    if images_zip is None:
+        images_zip = downloads_dir / DEFAULT_IMAGES_ZIP_NAME
+    if imagedata_txt is None:
+        imagedata_txt = downloads_dir / DEFAULT_IMAGEDATA_TXT_NAME
+
+    print(
+        f"YFCC4k not found at {output_dir}; downloading sources and building it now "
+        "(one-time, needs internet)..."
+    )
+    try:
+        return build_yfcc4k(images_zip, imagedata_txt, output_dir, overwrite=overwrite, clean_tmp=clean_tmp)
+    except Exception as exc:  # surface an actionable message (e.g. offline compute node)
+        raise RuntimeError(
+            f"Automatic YFCC4k build failed ({exc}). On a machine without internet "
+            "(e.g. a cluster compute node), run "
+            "adversarial_demo/utils/build_yfcc4k_from_revisiting_im2gps.py on a node with "
+            "internet first, or point data_dirs.yfcc at an existing build."
+        ) from exc
+
+
+def main(args):
+    config = load_config(args.config)
+
+    default_paths = build_default_paths(config)
+    config_dir = Path(args.config).expanduser().resolve().parent if args.config else DEFAULT_CONFIG_PATH.parent
+
+    images_zip = resolve_path(args.images_zip or str(default_paths["images_zip"]), config_dir, "build_yfcc4k.images_zip")
+    imagedata_txt = resolve_path(args.imagedata_txt or str(default_paths["imagedata_txt"]), config_dir, "build_yfcc4k.imagedata_txt")
+    output_dir = resolve_path(args.output_dir or str(default_paths["output_dir"]), config_dir, "build_yfcc4k.output_dir")
+
+    build_yfcc4k(images_zip, imagedata_txt, output_dir, overwrite=args.overwrite, clean_tmp=args.clean_tmp)
 
 
 if __name__ == "__main__":

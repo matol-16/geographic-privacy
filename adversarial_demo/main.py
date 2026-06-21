@@ -7,6 +7,10 @@ Commands:
     optional sampling-steps / robustness ablations, all from a single training pass).
     GeoShield can be folded in as just another attack by listing `geoshield` in
     --attack-types (generated out-of-process, then overlaid in the combined plots).
+  - evaluate-dataset-shard: Run ONE shard (one attack x one image window) of a
+    multi-node dataset evaluation. Used by the SLURM array in scripts/cluster/.
+  - merge-shards: Stitch all per-shard outputs back into the full-dataset results,
+    ablation JSONs, and plots (the artifacts evaluate-dataset would have produced).
   - evaluate-localizability: Evaluate attack effectiveness by image localizability
   - evaluate-geoshield-vs-diffusion: Evaluate precomputed clean/attacked pairs (the
     standalone GeoShield path; the integrated path above is usually preferred)
@@ -25,6 +29,7 @@ Usage:
 """
 
 import argparse
+import glob
 import os
 import sys
 from dataclasses import dataclass
@@ -37,12 +42,14 @@ import torch
 from utils.pipe_trajectory import PlonkPipelineTrajectory
 from utils.adversarial_eval import (
     evaluate_attack_on_dataset,
+    evaluate_attack_shard,
     evaluate_localizability,
     evaluate_restarts,
     evaluate_robustness,
     evaluate_sampling_steps,
     evaluate_sampling_steps_precomputed,
     merge_sampling_steps_results,
+    merge_shards,
 )
 from utils.adversarial_utils import seed_everything, expand_to_budget_count
 from utils.plots_adversarial_attacks import (
@@ -68,6 +75,7 @@ DEFAULT_SUCCESS_RATE_THRESHOLDS = [200, 750, 2500]
 DEFAULT_GEOSHIELD_ATTACK_NAME = "geoshield"
 DEFAULT_EVAL_NUM_STEPS = [10, 25, 50, 100, 250]
 DEFAULT_MAX_RESTARTS = 10
+DEFAULT_IMAGES_PER_SHARD = 100
 # Robustness ablation defaults (GeoShield Fig. 6 levels; scoped to "dtd" by default).
 DEFAULT_ROBUSTNESS_ATTACK_TYPES = ["dtd"]
 DEFAULT_ROBUSTNESS_JPEG_QUALITY_FACTORS = [10, 20, 30, 40, 50, 60]
@@ -426,13 +434,13 @@ def _run_geoshield_step(
 ) -> None:
     """Generate + evaluate GeoShield, then re-plot the combined results (trainable + GeoShield).
 
-    GeoShield has no ground-truth GPS in the precomputed-pair evaluator, so it is
-    predicted-only; the combined success-rate / displacement plots therefore use the
-    predicted metric (``gps_true=False``).
+    GeoShield selects labelled dataset images, so the GPS map returned by the generator
+    is threaded into the evaluator to also report the true-position displacement metric
+    (like the trainable attacks). The combined plots honour ``plot.gps_true``.
     """
     from utils.geoshield import generate_geoshield_pairs
 
-    clean_dirs, attacked_dirs = generate_geoshield_pairs(
+    clean_dirs, attacked_dirs, gps_by_filename = generate_geoshield_pairs(
         config=config,
         dataset=ctx.dataset,
         n_images=ctx.n_images,
@@ -452,8 +460,9 @@ def _run_geoshield_step(
         device=get_device(config),
         results_dir=ctx.results_dir,
         plots_dir=ctx.plots_dir,
-        stored_metrics=_precomputed_stored_metrics(config),
+        stored_metrics=get_nested_config(config, "plot", "stored_metrics", default=DEFAULT_STORED_METRICS),
         run_config=config,
+        gps_by_id=gps_by_filename,
     )
 
     # Overlay GeoShield with the trainable attacks in one combined set of plots.
@@ -477,6 +486,300 @@ def _run_geoshield_step(
             threshold_km=list(success_rate_thresholds),
             gps_true=plot_gps_true,
         )
+
+
+def _resolve_ablation_controls(args, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve the ablation controls shared by evaluate-dataset / -shard / merge (CLI > config > default)."""
+    return dict(
+        run_sampling_steps_ablation=bool(pick_value(
+            args.run_sampling_steps_ablation,
+            get_nested_config(config, "plot", "run_sampling_steps_ablation", default=None),
+            False,
+        )),
+        eval_num_steps=pick_value(args.eval_num_steps, config.get("eval_num_steps"), DEFAULT_EVAL_NUM_STEPS),
+        max_restarts=pick_value(args.max_restarts, config.get("max_restarts"), None),
+        run_robustness_ablation=bool(pick_value(
+            args.run_robustness_ablation,
+            get_nested_config(config, "plot", "run_robustness_ablation", default=None),
+            False,
+        )),
+        robustness_attack_types=pick_value(
+            args.robustness_attack_types,
+            get_nested_config(config, "robustness", "attack_types", default=None),
+            DEFAULT_ROBUSTNESS_ATTACK_TYPES,
+        ),
+        robustness_jpeg_quality_factors=get_nested_config(
+            config, "robustness", "jpeg_quality_factors", default=DEFAULT_ROBUSTNESS_JPEG_QUALITY_FACTORS
+        ),
+        robustness_gaussian_blur_sigmas=get_nested_config(
+            config, "robustness", "gaussian_blur_sigmas", default=DEFAULT_ROBUSTNESS_GAUSSIAN_BLUR_SIGMAS
+        ),
+        robustness_num_steps=get_nested_config(config, "robustness", "num_steps", default=None),
+        success_rate_thresholds=get_nested_config(
+            config, "plot", "attack_success_rate_thresholds", default=DEFAULT_SUCCESS_RATE_THRESHOLDS
+        ),
+        stored_metrics=get_nested_config(config, "plot", "stored_metrics", default=DEFAULT_STORED_METRICS),
+    )
+
+
+def _resolve_shard_window(args, total_images: int, config: Dict[str, Any]) -> tuple[int, Optional[int]]:
+    """Resolve the [window_start:window_end] image slice for a shard from the CLI args.
+
+    Either an explicit --window-start/--window-end, or --image-shard-index combined with
+    --images-per-shard (window k = [k*ips, (k+1)*ips)). Both are clamped to total_images.
+    """
+    if args.window_start is not None or args.window_end is not None:
+        window_start = int(args.window_start or 0)
+        window_end = None if args.window_end is None else int(args.window_end)
+    else:
+        if args.image_shard_index is None:
+            raise ValueError(
+                "Provide either --image-shard-index (with --images-per-shard) or "
+                "--window-start/--window-end to select the image window."
+            )
+        images_per_shard = int(pick_value(
+            args.images_per_shard, config.get("images_per_shard"), DEFAULT_IMAGES_PER_SHARD
+        ))
+        window_start = int(args.image_shard_index) * images_per_shard
+        window_end = window_start + images_per_shard
+
+    window_start = min(window_start, total_images)
+    if window_end is not None:
+        window_end = min(window_end, total_images)
+    return window_start, window_end
+
+
+def _run_geoshield_shard(
+    config: Dict[str, Any],
+    dataset: str,
+    seed: int,
+    total_images: int,
+    window_start: int,
+    window_end: Optional[int],
+    window_end_label: int,
+    base_results_dir: str,
+    attack_budgets: List[float],
+    geoshield_name: str,
+) -> None:
+    """Generate + evaluate GeoShield for one image window, saving a per-shard state file.
+
+    Mirrors the trainable-attack shard, but GeoShield is produced out-of-process: each
+    shard selects the same seeded image window, generates its perturbations into shard-
+    isolated clean/attacked dirs (the ``run_tag`` keeps concurrent shards from clobbering
+    one another), and evaluates the pairs with the shared precomputed-pair runner. The
+    resulting state file is stitched in by ``merge-shards`` like any other attack.
+    """
+    from utils.geoshield import generate_geoshield_pairs
+
+    geoshield_cfg = config.get("geoshield", {}) or {}
+    run_tag = f"w{window_start:06d}_{window_end_label:06d}"
+    shard_results_dir = os.path.join(base_results_dir, "shards", f"{geoshield_name}__{run_tag}")
+
+    print_run_banner(
+        f"[shard] Generating + evaluating GeoShield on {dataset.upper()} dataset",
+        attack_budgets=attack_budgets,
+        image_window=f"[{window_start}:{window_end_label}] of {total_images}",
+        results_directory=shard_results_dir,
+    )
+
+    seed_everything(seed)
+    pipeline = get_pipeline(config, dataset)
+    clean_dirs, attacked_dirs, gps_by_filename = generate_geoshield_pairs(
+        config=config,
+        dataset=dataset,
+        n_images=total_images,
+        attack_budgets=attack_budgets,
+        seed=seed,
+        geoshield_cfg=geoshield_cfg,
+        window_start=window_start,
+        window_end=window_end,
+        run_tag=run_tag,
+    )
+    run_precomputed_attack_eval(
+        pipeline=pipeline,
+        dataset=dataset,
+        attack_name=geoshield_name,
+        attack_budgets=attack_budgets,
+        clean_image_dirs=clean_dirs,
+        attacked_image_dirs=attacked_dirs,
+        n_images=None,  # the clean dir already contains exactly this window
+        seed=seed,
+        device=get_device(config),
+        results_dir=shard_results_dir,
+        plots_dir=shard_results_dir,
+        # GeoShield has the dataset's true GPS, so keep the true-position metric too.
+        stored_metrics=get_nested_config(config, "plot", "stored_metrics", default=DEFAULT_STORED_METRICS),
+        run_config=config,
+        gps_by_id=gps_by_filename,
+    )
+    print(f"\nGeoShield shard complete! Results saved to: {shard_results_dir}")
+
+
+def cmd_evaluate_dataset_shard(args, config: Dict[str, Any]) -> None:
+    """Run ONE shard of a multi-node dataset evaluation: the given attack(s) on an image window.
+
+    Writes only this shard's raw results + resumable state into a per-shard subdirectory
+    (``<results_dir>/shards/<attacks>__w<start>_<end>/``); no plotting. ``merge-shards``
+    later stitches every shard back into the full results, ablations, and plots.
+    """
+    dataset = pick_value(args.dataset, config.get("dataset"), "yfcc")
+    attack_types = pick_value(args.attack_types, config.get("attack_types"), DEFAULT_ATTACK_TYPES)
+
+    attack_budgets = get_attack_budgets(config, dataset)
+    seed = int(config.get("seed", 0))
+    total_images = int(pick_value(
+        args.total_images, config.get("total_images"), config.get("n_images_to_eval", 100)
+    ))
+    window_start, window_end = _resolve_shard_window(args, total_images, config)
+    window_end_label = window_end if window_end is not None else total_images
+    if window_start >= window_end_label:
+        print(f"Shard window [{window_start}:{window_end_label}] is empty (pool size {total_images}); nothing to do.")
+        return
+
+    base_results_dir = pick_value(args.results_dir, config.get("results_dir"), str(DEFAULT_RESULTS_DIR))
+
+    # GeoShield is out-of-process: it gets its own shard branch (one attack per shard).
+    geoshield_name = get_nested_config(config, "geoshield", "attack_name", default="geoshield")
+    if geoshield_name in attack_types:
+        if len(attack_types) > 1:
+            raise ValueError(
+                f"'{geoshield_name}' must be sharded on its own (one attack per shard); "
+                f"got --attack-types {attack_types}."
+            )
+        _run_geoshield_shard(
+            config=config,
+            dataset=dataset,
+            seed=seed,
+            total_images=total_images,
+            window_start=window_start,
+            window_end=window_end,
+            window_end_label=window_end_label,
+            base_results_dir=base_results_dir,
+            attack_budgets=attack_budgets,
+            geoshield_name=geoshield_name,
+        )
+        return
+
+    shard_tag = "-".join(attack_types)
+    shard_results_dir = os.path.join(
+        base_results_dir, "shards", f"{shard_tag}__w{window_start:06d}_{window_end_label:06d}"
+    )
+
+    ctrls = _resolve_ablation_controls(args, config)
+    parallel_workers = pick_value(args.parallel_workers, config.get("parallel_workers"), 1)
+    use_real_gps = pick_value(args.use_real_gps, config.get("use_real_gps"), False)
+
+    seed_everything(seed)
+    pipeline = get_pipeline(config, dataset)
+    attack_kwargs = get_attack_kwargs(config, dataset)
+    attack_type_kwargs = get_attack_type_kwargs(config, dataset)
+
+    print_run_banner(
+        f"[shard] Evaluating attacks on {dataset.upper()} dataset",
+        attack_types=attack_types,
+        attack_budgets=attack_budgets,
+        image_window=f"[{window_start}:{window_end_label}] of {total_images}",
+        results_directory=shard_results_dir,
+        parallel_workers=parallel_workers,
+        sampling_steps_ablation=ctrls["run_sampling_steps_ablation"],
+        robustness_ablation=ctrls["run_robustness_ablation"],
+        max_restarts=ctrls["max_restarts"],
+    )
+
+    evaluate_attack_shard(
+        attack_types=attack_types,
+        pipeline=pipeline,
+        dataset_name=dataset,
+        seed=seed,
+        total_images=total_images,
+        window_start=window_start,
+        window_end=window_end,
+        results_dir=shard_results_dir,
+        attack_budgets=attack_budgets,
+        attack_kwargs=attack_kwargs,
+        stored_metrics=ctrls["stored_metrics"],
+        parallel_workers=parallel_workers,
+        use_cuda_streams=bool(config.get("use_cuda_streams", True)),
+        use_real_gps=use_real_gps,
+        dataset_roots=config.get("data_dirs", {}),
+        attack_type_kwargs=attack_type_kwargs,
+        max_restarts=ctrls["max_restarts"],
+        run_sampling_steps_ablation=ctrls["run_sampling_steps_ablation"],
+        eval_num_steps=ctrls["eval_num_steps"],
+        success_rate_thresholds=ctrls["success_rate_thresholds"],
+        run_robustness_ablation=ctrls["run_robustness_ablation"],
+        robustness_attack_types=ctrls["robustness_attack_types"],
+        robustness_jpeg_quality_factors=ctrls["robustness_jpeg_quality_factors"],
+        robustness_gaussian_blur_sigmas=ctrls["robustness_gaussian_blur_sigmas"],
+        robustness_num_steps=ctrls["robustness_num_steps"],
+        config_dump=config,
+    )
+
+    print(f"\nShard complete! Results saved to: {shard_results_dir}")
+
+
+def cmd_merge_shards(args, config: Dict[str, Any]) -> None:
+    """Merge every per-shard output into the full-dataset results, ablations, and plots."""
+    dataset = pick_value(args.dataset, config.get("dataset"), "yfcc")
+    attack_types = pick_value(args.attack_types, config.get("attack_types"), DEFAULT_ATTACK_TYPES)
+
+    attack_budgets = get_attack_budgets(config, dataset)
+    seed = int(config.get("seed", 0))
+    total_images = int(pick_value(
+        args.total_images, config.get("total_images"), config.get("n_images_to_eval", 100)
+    ))
+    results_dir = pick_value(args.results_dir, config.get("results_dir"), str(DEFAULT_RESULTS_DIR))
+    plots_dir = pick_value(args.plots_dir, config.get("plots_dir"), str(DEFAULT_PLOTS_DIR))
+    shards_dir = args.shards_dir
+
+    # GeoShield is merged like any other attack as long as its shards exist on disk
+    # (it is keyed by filename, which merge_shards stem-normalises to the photo id).
+    geoshield_name = get_nested_config(config, "geoshield", "attack_name", default="geoshield")
+    shards_root = shards_dir or os.path.join(results_dir, "shards")
+    merge_attack_types = list(attack_types)
+    if geoshield_name in attack_types and not glob.glob(os.path.join(shards_root, f"{geoshield_name}__*")):
+        merge_attack_types = [at for at in attack_types if at != geoshield_name]
+        print(f"Note: no '{geoshield_name}' shards found under {shards_root}; excluding it from the merge.")
+
+    ctrls = _resolve_ablation_controls(args, config)
+    plot_success_rate = bool(get_nested_config(config, "plot", "plot_success_rate", default=False))
+    plot_gps_true = bool(get_nested_config(config, "plot", "gps_true", default=False))
+
+    print_run_banner(
+        f"Merging shard results on {dataset.upper()} dataset",
+        attack_types=merge_attack_types,
+        attack_budgets=attack_budgets,
+        total_images=total_images,
+        results_directory=results_dir,
+        plots_directory=plots_dir,
+        shards_directory=shards_dir or os.path.join(results_dir, "shards"),
+    )
+
+    merge_shards(
+        dataset_name=dataset,
+        attack_types=merge_attack_types,
+        attack_budgets=attack_budgets,
+        total_images=total_images,
+        seed=seed,
+        results_dir=results_dir,
+        plots_dir=plots_dir,
+        stored_metrics=ctrls["stored_metrics"],
+        dataset_roots=config.get("data_dirs", {}),
+        plot_success_rate=plot_success_rate,
+        success_rate_thresholds=ctrls["success_rate_thresholds"],
+        plot_gps_true=plot_gps_true,
+        run_sampling_steps_ablation=ctrls["run_sampling_steps_ablation"],
+        eval_num_steps=ctrls["eval_num_steps"],
+        run_robustness_ablation=ctrls["run_robustness_ablation"],
+        robustness_attack_types=ctrls["robustness_attack_types"],
+        robustness_jpeg_quality_factors=ctrls["robustness_jpeg_quality_factors"],
+        robustness_gaussian_blur_sigmas=ctrls["robustness_gaussian_blur_sigmas"],
+        robustness_num_steps=ctrls["robustness_num_steps"],
+        config_dump=config,
+        shards_dir=shards_dir,
+    )
+
+    print(f"\nMerge complete! Results in {results_dir}, plots in {plots_dir}.")
 
 
 def cmd_evaluate_localizability(args, config: Dict[str, Any]) -> None:
@@ -659,12 +962,14 @@ def run_precomputed_attack_eval(
     plots_dir: str,
     stored_metrics: List[str],
     run_config: Optional[Dict[str, Any]] = None,
+    gps_by_id: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Evaluate precomputed clean/attacked pairs and persist results like any attack.
 
     Shared by ``evaluate-geoshield-vs-diffusion`` and the GeoShield step folded into
     ``evaluate-dataset``. Returns the per-attack results dict; plotting is left to the
-    caller so it can overlay GeoShield with the other attacks.
+    caller so it can overlay GeoShield with the other attacks. ``gps_by_id`` (filename ->
+    (lat, lon)) enables the true-position displacement metric when labels are available.
     """
     precomputed_config = PrecomputedPairEvaluationConfig(
         dataset=dataset,
@@ -678,6 +983,7 @@ def run_precomputed_attack_eval(
         stored_metrics=stored_metrics,
         device=device,
         n_images=n_images,
+        gps_by_id=gps_by_id,
     )
     runner = PrecomputedPairEvaluationRunner(precomputed_config, pipeline)
     if run_config is not None:
@@ -992,6 +1298,21 @@ def add_common_eval_args(parser: argparse.ArgumentParser, n_images_help: str = "
     parser.add_argument("--plots-dir", help="Directory to save plots")
 
 
+def add_ablation_args(parser: argparse.ArgumentParser) -> None:
+    """Add the ablation controls shared by evaluate-dataset / evaluate-dataset-shard / merge-shards."""
+    parser.add_argument("--run-sampling-steps-ablation", action="store_true", default=None,
+                        help="Also re-evaluate each best perturbation across --eval-num-steps")
+    parser.add_argument("--eval-num-steps", nargs="+", type=int,
+                        help=f"Sampling step counts for the ablation (default: {DEFAULT_EVAL_NUM_STEPS})")
+    parser.add_argument("--max-restarts", type=int,
+                        help="Override num_restarts for this run (sets the restart-ablation depth)")
+    parser.add_argument("--run-robustness-ablation", action="store_true", default=None,
+                        help="Also degrade each best perturbation with JPEG/blur and re-evaluate "
+                             "(only for --robustness-attack-types; baseline sampling steps)")
+    parser.add_argument("--robustness-attack-types", nargs="+",
+                        help=f"Attack types the robustness ablation runs for (default: {DEFAULT_ROBUSTNESS_ATTACK_TYPES})")
+
+
 def add_precomputed_folder_args(parser: argparse.ArgumentParser) -> None:
     """Add the clean/attacked folder arguments shared by the precomputed commands."""
     parser.add_argument("--dataset", choices=["yfcc", "osv"], help="Dataset label used for saving results and plots")
@@ -1024,6 +1345,16 @@ Examples:
 
   # Standalone robustness ablation
   python main.py evaluate-robustness --dataset yfcc --attack-types dtd
+
+  # Multi-node: run one shard (attack x image window), then merge everything.
+  # Usually launched by the SLURM array in scripts/cluster/ rather than by hand.
+  python main.py evaluate-dataset-shard --dataset yfcc --attack-types encoder \\
+    --total-images 4000 --images-per-shard 100 --image-shard-index 7 \\
+    --results-dir results/yfcc4k_full --run-sampling-steps-ablation
+  python main.py merge-shards --dataset yfcc \\
+    --attack-types encoder sampling diffusion_l2 dtd unidef unidef_nofdje ace \\
+    --total-images 4000 --results-dir results/yfcc4k_full \\
+    --plots-dir results/yfcc4k_full/plots --run-sampling-steps-ablation
 
   # Evaluate localizability
   python main.py evaluate-localizability --dataset yfcc
@@ -1061,17 +1392,38 @@ Examples:
     eval_dataset.add_argument("--use-real-gps", action="store_true", default=None,
                               help="Use real GPS coordinates from dataset instead of clean predictions")
     eval_dataset.add_argument("--parallel-workers", type=int, help="Number of parallel workers for evaluation")
-    eval_dataset.add_argument("--run-sampling-steps-ablation", action="store_true", default=None,
-                              help="Also re-evaluate each best perturbation across --eval-num-steps")
-    eval_dataset.add_argument("--eval-num-steps", nargs="+", type=int,
-                              help=f"Sampling step counts for the ablation (default: {DEFAULT_EVAL_NUM_STEPS})")
-    eval_dataset.add_argument("--max-restarts", type=int,
-                              help="Override num_restarts for this run (sets the restart-ablation depth)")
-    eval_dataset.add_argument("--run-robustness-ablation", action="store_true", default=None,
-                              help="Also degrade each best perturbation with JPEG/blur and re-evaluate "
-                                   "(only for --robustness-attack-types; baseline sampling steps)")
-    eval_dataset.add_argument("--robustness-attack-types", nargs="+",
-                              help=f"Attack types the robustness ablation runs for (default: {DEFAULT_ROBUSTNESS_ATTACK_TYPES})")
+    add_ablation_args(eval_dataset)
+
+    # evaluate-dataset-shard (one attack x one image window; used by the SLURM array)
+    eval_shard = subparsers.add_parser("evaluate-dataset-shard",
+                                       help="Run one shard (attack x image window) of a multi-node evaluation",
+                                       parents=[global_parser])
+    add_common_eval_args(eval_shard, n_images_help="(unused; the window is set via --total-images + --image-shard-index)")
+    eval_shard.add_argument("--use-real-gps", action="store_true", default=None,
+                            help="Use real GPS coordinates from dataset instead of clean predictions")
+    eval_shard.add_argument("--parallel-workers", type=int, help="Number of parallel workers for evaluation")
+    eval_shard.add_argument("--total-images", type=int,
+                            help="Size of the full seeded image pool the windows are taken from (e.g. 4000)")
+    eval_shard.add_argument("--images-per-shard", type=int,
+                            help=f"Images per shard window (default: {DEFAULT_IMAGES_PER_SHARD})")
+    eval_shard.add_argument("--image-shard-index", type=int,
+                            help="0-based window index; window = [k*images_per_shard, (k+1)*images_per_shard)")
+    eval_shard.add_argument("--window-start", type=int,
+                            help="Explicit window start (overrides --image-shard-index)")
+    eval_shard.add_argument("--window-end", type=int,
+                            help="Explicit window end (exclusive; overrides --image-shard-index)")
+    add_ablation_args(eval_shard)
+
+    # merge-shards (stitch every shard back into the full results + plots)
+    merge_cmd = subparsers.add_parser("merge-shards",
+                                      help="Merge per-shard outputs into the full-dataset results, ablations, and plots",
+                                      parents=[global_parser])
+    add_common_eval_args(merge_cmd, n_images_help="(unused; use --total-images)")
+    merge_cmd.add_argument("--total-images", type=int,
+                           help="Size of the full seeded image pool that was sharded (e.g. 4000)")
+    merge_cmd.add_argument("--shards-dir",
+                           help="Directory holding the per-shard subdirectories (default: <results-dir>/shards)")
+    add_ablation_args(merge_cmd)
 
     # evaluate-localizability
     eval_local = subparsers.add_parser("evaluate-localizability",
@@ -1139,6 +1491,8 @@ Examples:
 
 COMMAND_HANDLERS = {
     "evaluate-dataset": cmd_evaluate_dataset,
+    "evaluate-dataset-shard": cmd_evaluate_dataset_shard,
+    "merge-shards": cmd_merge_shards,
     "evaluate-localizability": cmd_evaluate_localizability,
     "evaluate-geoshield-vs-diffusion": cmd_evaluate_geoshield_vs_diffusion,
     "evaluate-sampling-steps-precomputed": cmd_evaluate_sampling_steps_precomputed,

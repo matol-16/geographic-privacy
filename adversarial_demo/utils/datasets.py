@@ -49,8 +49,19 @@ def _default_yfcc_dir() -> str:
     return "/Data/mathias.ollu/hf_cache/datasets/YFCC100M/yfcc4k"
 
 
+def _ensure_yfcc4k(local_dir: str) -> None:
+    """Download + build YFCC4k on first use if it is not present (mirrors OSV auto-download).
+
+    Cheap no-op once the dataset exists. Imported lazily so the build deps (yaml/PIL/tqdm)
+    are only touched when a build is actually needed.
+    """
+    from utils.build_yfcc4k_from_revisiting_im2gps import ensure_yfcc4k
+    ensure_yfcc4k(local_dir)
+
+
 def _load_yfcc_rows(local_dir: str) -> List[dict]:
     """Read info.txt and keep only rows whose image exists on disk."""
+    _ensure_yfcc4k(local_dir)  # download + build the dataset on demand if missing
     info_path = os.path.join(local_dir, "info.txt")
     img_dir = os.path.join(local_dir, "images")
     if not os.path.exists(info_path):
@@ -84,6 +95,31 @@ def _select_prefix_stable(rows: List[dict], n_images_to_eval: int, seed: int) ->
     return rows[: min(n_images_to_eval, len(rows))]
 
 
+def _select_window(
+    rows: List[dict],
+    seed: int,
+    total_images: int,
+    window_start: int = 0,
+    window_end: Optional[int] = None,
+) -> List[dict]:
+    """Return the ``[window_start:window_end]`` slice of the seeded global ordering.
+
+    The global ordering is the prefix-stable selection of the first ``total_images``
+    rows (see ``_select_prefix_stable``). Slicing within it lets a multi-node run hand
+    each worker a contiguous *window* of the same deterministic ordering, so the union
+    of all windows reconstructs exactly the single-process ``n_images=total_images``
+    selection -- and any prefix stays comparable across runs.
+    """
+    pool = _select_prefix_stable(rows, total_images, seed)
+    if window_end is None:
+        window_end = len(pool)
+    window_start = max(0, int(window_start))
+    window_end = min(len(pool), int(window_end))
+    if window_start >= window_end:
+        return []
+    return pool[window_start:window_end]
+
+
 def select_yfcc_image_paths(
     n_images_to_eval: int = 100,
     seed: int = 0,
@@ -101,11 +137,18 @@ def select_yfcc_image_metadata(
     n_images_to_eval: int = 100,
     seed: int = 0,
     local_dir: Optional[str] = None,
+    window_start: int = 0,
+    window_end: Optional[int] = None,
 ) -> List[ImageMetadata]:
-    """(path, (lat, lon), id) for the seeded YFCC4k selection, without loading pixels."""
+    """(path, (lat, lon), id) for the seeded YFCC4k selection, without loading pixels.
+
+    ``window_start``/``window_end`` slice the seeded ordering (pool size
+    ``n_images_to_eval``) so external tooling (e.g. GeoShield) can attack the exact same
+    image window as a trainable-attack shard.
+    """
     if local_dir is None:
         local_dir = _default_yfcc_dir()
-    samples = _select_prefix_stable(_load_yfcc_rows(local_dir), n_images_to_eval, seed)
+    samples = _select_window(_load_yfcc_rows(local_dir), seed, n_images_to_eval, window_start, window_end)
     return [(s["path"], (s["latitude"], s["longitude"]), str(s["id"])) for s in samples]
 
 
@@ -115,10 +158,19 @@ def retrieve_yfcc_images(
     use_real_gps: bool = False,
     local_dir: Optional[str] = None,
     im_idx=None,  # If specified, retrieves only the image with this index in the dataset (after sorting by ID). Useful for debugging with a single image.
+    window_start: int = 0,
+    window_end: Optional[int] = None,
 ) -> RetrievedImages:
-    """Load up to ``n_images_to_eval`` YFCC4k images with their ground-truth GPS labels."""
+    """Load up to ``n_images_to_eval`` YFCC4k images with their ground-truth GPS labels.
+
+    When ``window_start``/``window_end`` are given, only that contiguous slice of the
+    seeded ordering (whose pool size is ``n_images_to_eval``) is loaded, so a multi-node
+    run can have each worker load just its own window. ``n_images_to_eval`` is the size
+    of the full pool the window is taken from (e.g. 4000 for the full set).
+    """
     if local_dir is None:
         local_dir = _default_yfcc_dir()
+    _ensure_yfcc4k(local_dir)  # download + build the dataset on demand if missing
     info_path = os.path.join(local_dir, "info.txt")
     img_dir = os.path.join(local_dir, "images")
     if not os.path.exists(info_path):
@@ -145,13 +197,14 @@ def retrieve_yfcc_images(
         raise ValueError(f"Metadata for image with index {im_idx} not found in info.txt. Check if im_idx is correct and if info.txt is properly formatted.")
 
     # Keep selection prefix-stable across different n_images_to_eval values:
-    # with a fixed seed, first N images of a larger run match a smaller run.
-    samples = _select_prefix_stable(_load_yfcc_rows(local_dir), n_images_to_eval, seed)
+    # with a fixed seed, first N images of a larger run match a smaller run. A window
+    # (window_start:window_end) slices that ordering for multi-node sharding.
+    samples = _select_window(_load_yfcc_rows(local_dir), seed, n_images_to_eval, window_start, window_end)
 
     source_images = [Image.open(s["path"]).convert("RGB") for s in samples]
     source_gps = [(s["latitude"], s["longitude"]) for s in samples]
     source_image_ids = [s["id"] for s in samples]
-    print(f"Loaded {len(source_images)} images from YFCC4k.")
+    print(f"Loaded {len(source_images)} images from YFCC4k (window [{window_start}:{window_end}] of pool {n_images_to_eval}).")
     return source_images, source_gps, source_image_ids
 
 
@@ -198,17 +251,23 @@ def retrieve_osv_images(
     seed: int = 0,
     use_real_gps: bool = False,
     local_dir: Optional[str] = None,
+    window_start: int = 0,
+    window_end: Optional[int] = None,
 ) -> RetrievedImages:
-    """Load up to ``n_images_to_eval`` OSV-5M test images with their ground-truth GPS labels."""
+    """Load up to ``n_images_to_eval`` OSV-5M test images with their ground-truth GPS labels.
+
+    ``window_start``/``window_end`` slice the seeded ordering for multi-node sharding,
+    exactly as in ``retrieve_yfcc_images``.
+    """
     if local_dir is None:
         local_dir = _default_osv_dir()
     # Same seeded, prefix-stable selection as YFCC (and as select_osv_image_metadata).
-    samples = _select_prefix_stable(_load_osv_rows(local_dir), n_images_to_eval, seed)
+    samples = _select_window(_load_osv_rows(local_dir), seed, n_images_to_eval, window_start, window_end)
 
     source_images = [Image.open(s["path"]).convert("RGB") for s in samples]
     source_gps = [(s["latitude"], s["longitude"]) for s in samples]
     source_image_ids = [str(s["id"]) for s in samples]
-    print(f"Loaded {len(source_images)} images from OSV-5M test set.")
+    print(f"Loaded {len(source_images)} images from OSV-5M test set (window [{window_start}:{window_end}] of pool {n_images_to_eval}).")
     return source_images, source_gps, source_image_ids
 
 
@@ -216,11 +275,16 @@ def select_osv_image_metadata(
     n_images_to_eval: int = 100,
     seed: int = 0,
     local_dir: Optional[str] = None,
+    window_start: int = 0,
+    window_end: Optional[int] = None,
 ) -> List[ImageMetadata]:
-    """(path, (lat, lon), id) for the seeded OSV-5M selection, without loading pixels."""
+    """(path, (lat, lon), id) for the seeded OSV-5M selection, without loading pixels.
+
+    ``window_start``/``window_end`` slice the seeded ordering, as for YFCC.
+    """
     if local_dir is None:
         local_dir = _default_osv_dir()
-    samples = _select_prefix_stable(_load_osv_rows(local_dir), n_images_to_eval, seed)
+    samples = _select_window(_load_osv_rows(local_dir), seed, n_images_to_eval, window_start, window_end)
     return [(s["path"], (s["latitude"], s["longitude"]), str(s["id"])) for s in samples]
 
 
@@ -229,14 +293,17 @@ def select_image_metadata(
     n_images_to_eval: int = 100,
     seed: int = 0,
     local_dir: Optional[str] = None,
+    window_start: int = 0,
+    window_end: Optional[int] = None,
 ) -> List[ImageMetadata]:
     """Dataset-agnostic seeded selection of (path, (lat, lon), id), without loading pixels.
 
     Matches the order/selection used by ``retrieve_{yfcc,osv}_images`` so external tooling
-    (GeoShield) attacks/evaluates exactly the same images as the in-process attacks.
+    (GeoShield) attacks/evaluates exactly the same images -- and the same window -- as the
+    in-process attacks.
     """
     if dataset == "yfcc":
-        return select_yfcc_image_metadata(n_images_to_eval, seed, local_dir)
+        return select_yfcc_image_metadata(n_images_to_eval, seed, local_dir, window_start, window_end)
     if dataset == "osv":
-        return select_osv_image_metadata(n_images_to_eval, seed, local_dir)
+        return select_osv_image_metadata(n_images_to_eval, seed, local_dir, window_start, window_end)
     raise ValueError(f"Unknown dataset: {dataset}")

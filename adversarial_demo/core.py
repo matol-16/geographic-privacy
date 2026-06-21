@@ -51,6 +51,13 @@ class EvaluationConfig:
     use_real_gps: bool = False
     dataset_roots: Optional[Dict[str, str]] = None
     state_suffix: str = ""
+    # Multi-node sharding: ``n_images`` is the size of the full seeded pool, and only
+    # the ``[window_start:window_end]`` slice of that pool is loaded and evaluated by
+    # this process. Defaults (0, None) load the whole pool, i.e. the single-GPU path.
+    # The per-image buffers are sized to the loaded window; ``source_image_ids`` carry
+    # the global identity so merge-shards can stitch windows back together.
+    window_start: int = 0
+    window_end: Optional[int] = None
     # Per-attack-type kwargs merged on top of the shared base only for the matching
     # attack (e.g. ACE's target_image / l2_target loss / alpha). Lets every attack
     # type run in a single evaluation without leaking settings into the others.
@@ -90,6 +97,11 @@ class PrecomputedPairEvaluationConfig:
     num_steps: Optional[int] = None
     n_images: Optional[int] = None
     state_suffix: str = ""
+    # Optional map {image_id -> (lat, lon)} of ground-truth GPS for the clean images.
+    # When provided (e.g. GeoShield, which selects labelled dataset images), the runner
+    # computes the true-position displacement metric just like the trainable attacks;
+    # left None for arbitrary precomputed folders that have no labels (predicted-only).
+    gps_by_id: Optional[Dict[str, Tuple[float, float]]] = None
 
 
 class ImageLoader:
@@ -102,8 +114,14 @@ class ImageLoader:
         seed: int = 0,
         use_real_gps: bool = False,
         dataset_roots: Optional[Dict[str, str]] = None,
+        window_start: int = 0,
+        window_end: Optional[int] = None,
     ) -> Tuple[List[Image.Image], Optional[List[Tuple[float, float]]], List[str]]:
-        """Load images, optional GPS coordinates, and stable dataset image IDs."""
+        """Load images, optional GPS coordinates, and stable dataset image IDs.
+
+        ``n_images`` is the size of the full seeded pool; ``window_start``/``window_end``
+        select the contiguous slice of that pool to load (defaults: the whole pool).
+        """
 
         dataset_roots = dataset_roots or {}
 
@@ -113,6 +131,8 @@ class ImageLoader:
                 seed=seed,
                 use_real_gps=use_real_gps,
                 local_dir=dataset_roots.get("yfcc"),
+                window_start=window_start,
+                window_end=window_end,
             )
         elif dataset == "osv":
             return retrieve_osv_images(
@@ -120,6 +140,8 @@ class ImageLoader:
                 seed=seed,
                 use_real_gps=use_real_gps,
                 local_dir=dataset_roots.get("osv"),
+                window_start=window_start,
+                window_end=window_end,
             )
         else:
             raise ValueError(f"Unknown dataset: {dataset}")
@@ -793,7 +815,7 @@ class EvaluationRunner(BaseEvaluationRunner):
     def __init__(self, config: EvaluationConfig, pipeline):
         super().__init__(config, pipeline)
 
-        # Load images
+        # Load images (only this process's window of the seeded pool; defaults to all).
         print(f"Loading {config.n_images} images from {config.dataset} dataset...")
         self.source_images, self.source_gps, self.source_image_ids = ImageLoader.load_images(
             dataset=config.dataset,
@@ -801,12 +823,17 @@ class EvaluationRunner(BaseEvaluationRunner):
             seed=config.seed,
             use_real_gps=config.use_real_gps,
             dataset_roots=config.dataset_roots,
+            window_start=config.window_start,
+            window_end=config.window_end,
         )
+        # The collector is sized to the loaded window, not the full pool. For the
+        # single-GPU path (no window) this equals config.n_images.
+        self.n_images = len(self.source_images)
 
         self.metrics_collector = MetricsCollector(
             attack_types=config.attack_types,
             attack_budgets=config.attack_budgets,
-            n_images=config.n_images,
+            n_images=self.n_images,
             stored_metrics=config.stored_metrics,
             source_gps=self.source_gps,
             source_image_ids=self.source_image_ids,
@@ -823,6 +850,8 @@ class EvaluationRunner(BaseEvaluationRunner):
             "attack_budgets": list(self.config.attack_budgets),
             "attack_kwargs": self.config.attack_kwargs,
             "n_images": self.config.n_images,
+            "window_start": self.config.window_start,
+            "window_end": self.config.window_end,
             "stored_metrics": list(self.config.stored_metrics),
             "use_real_gps": self.config.use_real_gps,
             "dataset_roots": self.config.dataset_roots or {},
@@ -838,6 +867,10 @@ class EvaluationRunner(BaseEvaluationRunner):
         }
 
     def _signature_match_keys(self) -> List[str]:
+        # window_start/window_end are intentionally NOT matched: a shard always uses its
+        # own results_dir, and _load_state_if_available already rejects a state whose
+        # source_image_ids prefix differs (which any different window would). Keeping
+        # them out preserves resume compatibility with pre-window state files.
         return [
             "dataset",
             "seed",
@@ -871,7 +904,8 @@ class EvaluationRunner(BaseEvaluationRunner):
 
     @property
     def _n_images(self) -> int:
-        return self.config.n_images
+        # The loaded window size (== config.n_images on the single-GPU path).
+        return self.n_images
 
     # ---- Task scheduling --------------------------------------------------- #
 
@@ -1038,14 +1072,49 @@ class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
             {image_id: (clean_path, attacked_path) for clean_path, attacked_path, image_id in pairs}
             for pairs in self.pairs_by_budget
         ]
+        # Align ground-truth GPS to the matched image ids (None when no labels provided),
+        # so the shared MetricsCollector can report the true-position displacement metric.
+        self.source_gps = self._build_source_gps(config.gps_by_id, self.image_ids)
         self.metrics_collector = MetricsCollector(
             attack_types=[config.attack_name],
             attack_budgets=config.attack_budgets,
             n_images=len(self.image_ids),
             stored_metrics=config.stored_metrics,
+            source_gps=self.source_gps,
             source_image_ids=self.image_ids,
         )
         self._load_state_if_available()
+
+    @staticmethod
+    def _build_source_gps(
+        gps_by_id: Optional[Dict[str, Tuple[float, float]]],
+        image_ids: List[str],
+    ) -> Optional[List[Optional[Tuple[float, float]]]]:
+        """Resolve per-image ground-truth GPS aligned to ``image_ids``.
+
+        Pair keys may be full filenames ("123.jpg") while the GPS map may be keyed by
+        filename, basename, or stem; we index by all three so GeoShield's filename keys
+        match. Returns None when no GPS resolves (keeps the path predicted-only).
+        """
+        if not gps_by_id:
+            return None
+        normalized: Dict[str, Tuple[float, float]] = {}
+        for key, gps in gps_by_id.items():
+            k = str(key)
+            normalized.setdefault(k, gps)
+            normalized.setdefault(os.path.basename(k), gps)
+            normalized.setdefault(os.path.splitext(os.path.basename(k))[0], gps)
+        resolved: List[Optional[Tuple[float, float]]] = []
+        for image_id in image_ids:
+            s = str(image_id)
+            resolved.append(
+                normalized.get(s)
+                or normalized.get(os.path.basename(s))
+                or normalized.get(os.path.splitext(os.path.basename(s))[0])
+            )
+        if all(g is None for g in resolved):
+            return None
+        return resolved
 
     # ---- State hooks ------------------------------------------------------- #
 
@@ -1208,7 +1277,7 @@ def parallel_evaluate_attacks(
             pbar.set_postfix(
                 attack=attack_type,
                 eps=f"{eps:.4f}",
-                image=f"{image_idx+1}/{config.n_images}"
+                image=f"{image_idx+1}/{runner.n_images}"
             )
             pbar.update(1)
 
@@ -1261,7 +1330,7 @@ def sequential_evaluate_attacks(
         pbar.set_postfix(
             attack=attack_type,
             eps=f"{eps:.4f}",
-            image=f"{image_idx+1}/{config.n_images}"
+            image=f"{image_idx+1}/{runner.n_images}"
         )
         pbar.update(1)
 

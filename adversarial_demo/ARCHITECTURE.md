@@ -217,6 +217,57 @@ three-step `scripts/test_all_attacks.sh` + `scripts/geoshield_common.sh` orchest
 with one command. The standalone `evaluate-geoshield-vs-diffusion` command remains for
 evaluating already-generated pairs.
 
+## Multi-node sharded evaluation (cluster)
+
+A full-dataset run (e.g. all 4000 YFCC4k images × every attack × 2 budgets × 8 restarts)
+is far too slow on one GPU, so `evaluate-dataset` can be split across many SLURM jobs and
+merged. The single-GPU command is unchanged; this is an additive path.
+
+- **`evaluate-dataset-shard`** runs ONE shard: one attack on one *image window*. Image
+  selection is prefix-stable and deterministic, so window *k* covers a fixed slice
+  `[k·images_per_shard, (k+1)·images_per_shard)` of the seeded ordering. The window is
+  loaded via `window_start`/`window_end` (threaded through `ImageLoader.load_images` →
+  `retrieve_{yfcc,osv}_images` → `_select_window` in `utils/datasets.py`). Each shard
+  writes its results + resumable state into its own subdir
+  `<results_dir>/shards/<attack>__w<start>_<end>/`, so shards are independent and
+  individually restartable. Implemented by `evaluate_attack_shard()`
+  (`utils/adversarial_eval.py`); it collects the same main + restart + sampling-steps +
+  robustness buffers as `evaluate-dataset` but does **not** plot.
+- **`merge-shards`** reads every shard's state file (which already holds all buffers,
+  keyed by global image id), maps each window back onto the full seeded ordering, and
+  reconstructs the exact artifacts a single-process run would produce: the combined
+  `<dataset>_<attack>_results.pt`, the displacement / success-rate plots, and the
+  restart / sampling-steps / robustness ablation JSONs + plots. The ablation JSONs are
+  built with the same `build_and_save_*` helpers via a thin `metrics_collector` shim, so
+  the output is byte-compatible with the single-GPU path. Implemented by `merge_shards()`.
+- **`scripts/cluster/`** holds the SLURM scaffolding: `config.sh` (one place to define
+  the run), `eval_shard.slurm` (the job array, task *t* → attack `t / num_windows`,
+  window `t % num_windows`), `merge.slurm` (CPU job), and `submit.sh` (computes the array
+  size, submits the array + a `afterok` merge job; `--dry-run` prints the mapping). See
+  `scripts/cluster/README.md`.
+- **GeoShield** is sharded too. A `geoshield` shard selects the same seeded image window,
+  generates its perturbations out-of-process into shard-isolated dirs (a `run_tag` per
+  window prevents concurrent shards from clobbering the shared clean/output dirs), and
+  evaluates the pairs with `PrecomputedPairEvaluationRunner` — saving a state file in the
+  same format. `merge_shards` stitches it in like any other attack; because GeoShield is
+  keyed by filename (`123.jpg`) while trainable attacks are keyed by photo-id stem
+  (`123`), the merge normalises ids by stem so both land at the same global index.
+  GeoShield stays predicted-only (no ground-truth-GPS metric), matching the single-GPU
+  path. Implemented by `_run_geoshield_shard()` in `main.py` reusing
+  `utils/geoshield.generate_geoshield_pairs` (now window/run_tag aware).
+
+```bash
+# one shard (normally launched by the SLURM array, not by hand)
+python main.py evaluate-dataset-shard --dataset yfcc --attack-types encoder \
+  --total-images 4000 --images-per-shard 100 --image-shard-index 7 \
+  --results-dir results/yfcc4k_full --run-sampling-steps-ablation
+# after all shards finish
+python main.py merge-shards --dataset yfcc --total-images 4000 \
+  --attack-types encoder sampling diffusion_l2 dtd unidef unidef_nofdje ace \
+  --results-dir results/yfcc4k_full --plots-dir results/yfcc4k_full/plots \
+  --run-sampling-steps-ablation
+```
+
 ## Results Structure
 
 Results are saved to the configured `results_dir` (default `./results/`):

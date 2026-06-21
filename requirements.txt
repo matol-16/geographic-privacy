@@ -1,3 +1,9 @@
+# Dependencies for the plonk fork + the adversarial_demo contributions.
+# Install the package first (`pip install -e .`, which pulls the core PLONK deps from
+# setup.py), then `pip install -r requirements.txt` for everything adversarial_demo needs.
+# Packages beyond the original PLONK env are marked "[added]".
+
+# --- core / training (mostly already pulled by `pip install -e .`) ---
 joblib
 wandb
 hydra-core
@@ -8,14 +14,19 @@ scikit-learn
 pytorch-lightning
 transformers
 accelerate
-peft
+peft                  # [added]
 geos
-reverse_geocoder
-matplotlib
-geoopt
 einops
 torchdiffeq
 webdataset==0.2.57
-reverse_geocoder # necessary in lonk/metrics/utils.py (not added in base repo)
-datasets # necessary in adversarial_eval.py (not added in base repo)
-cartopy
+
+# --- needed by adversarial_demo / metrics / dataset loading ---
+huggingface_hub       # [added] used directly by utils/datasets.py (dataset + model download)
+reverse_geocoder      # [added] used in plonk/metrics/utils.py (not in base repo)
+matplotlib            # [added] plotting in adversarial_demo
+geoopt                # [added] Riemannian flow-matching geometry
+cartopy               # [added] map plots; if pip fails: conda install -c conda-forge cartopy
+
+# datasets            # NOTE: the HuggingFace `datasets` pkg is NOT imported anywhere in this
+#                     # repo (the "datasets" in code is the local utils/datasets.py module).
+#                     # Uncomment only if you add code that needs it.

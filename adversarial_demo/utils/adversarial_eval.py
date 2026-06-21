@@ -14,9 +14,10 @@ We evaluate on OSV-5M's test set and on YFCC4k. Dataset loading lives in
 
 from __future__ import annotations
 
+import glob
 import json
 import os
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 import tqdm as tqdm_module
@@ -409,6 +410,353 @@ def evaluate_attack_on_dataset(
                 "Robustness ablation enabled but none of "
                 f"{robustness_attack_types} were among the evaluated attacks; nothing to plot."
             )
+
+
+# --------------------------------------------------------------------------- #
+# Multi-node sharding: per-shard training + merge-and-plot
+# --------------------------------------------------------------------------- #
+
+
+def evaluate_attack_shard(
+    attack_types,
+    pipeline,
+    dataset_name: str,
+    seed: int,
+    total_images: int,
+    window_start: int,
+    window_end: Optional[int],
+    results_dir: str,
+    attack_budgets: Sequence[float],
+    attack_kwargs: Sequence[Dict[str, Any]],
+    stored_metrics: Sequence[str],
+    parallel_workers: int = 1,
+    use_cuda_streams: bool = True,
+    use_real_gps: bool = False,
+    dataset_roots: Optional[Dict[str, str]] = None,
+    attack_type_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+    max_restarts: Optional[int] = None,
+    run_sampling_steps_ablation: bool = False,
+    eval_num_steps: Optional[Sequence[int]] = None,
+    success_rate_thresholds: Optional[Sequence[float]] = None,
+    run_robustness_ablation: bool = False,
+    robustness_attack_types: Optional[Sequence[str]] = None,
+    robustness_jpeg_quality_factors: Optional[Sequence[int]] = None,
+    robustness_gaussian_blur_sigmas: Optional[Sequence[float]] = None,
+    robustness_num_steps: Optional[int] = None,
+    config_dump: Optional[Dict[str, Any]] = None,
+):
+    """Train + evaluate one shard: the given attack(s) on a window of the seeded pool.
+
+    A shard is one cluster job: it covers ``attack_types`` (typically a single attack)
+    over the ``[window_start:window_end]`` slice of the deterministic ``total_images``
+    selection. It does **not** plot or build ablation JSONs -- that is left to
+    ``merge_shards``. The shard's resumable state file (which already contains the main
+    metrics plus the restart / sampling-steps / robustness buffers, all keyed by global
+    ``source_image_ids``) is the artifact ``merge_shards`` later stitches together.
+
+    Writes its results into ``results_dir`` (which the CLI sets to a per-shard
+    subdirectory so shards never collide). Returns the runner.
+    """
+    from core import EvaluationConfig, EvaluationRunner, run_evaluation
+
+    seed_everything(seed)
+    dataset_roots = dataset_roots or {}
+
+    if isinstance(attack_types, str):
+        attack_types = [attack_types]
+    attack_types = list(attack_types)
+    attack_budgets = list(attack_budgets)
+
+    attack_kwargs = expand_per_budget_kwargs(list(attack_kwargs), len(attack_budgets))
+    if max_restarts is not None:
+        attack_kwargs = [{**kw, "num_restarts": int(max_restarts)} for kw in attack_kwargs]
+
+    success_rate_thresholds = list(success_rate_thresholds) if success_rate_thresholds else [2500]
+    robustness_attack_types = ["dtd"] if robustness_attack_types is None else list(robustness_attack_types)
+    robustness_jpeg_quality_factors = (
+        [10, 20, 30, 40, 50, 60]
+        if robustness_jpeg_quality_factors is None
+        else list(robustness_jpeg_quality_factors)
+    )
+    robustness_gaussian_blur_sigmas = (
+        [0, 2, 4, 6, 8, 10]
+        if robustness_gaussian_blur_sigmas is None
+        else list(robustness_gaussian_blur_sigmas)
+    )
+
+    config = EvaluationConfig(
+        dataset=dataset_name,
+        seed=seed,
+        attack_types=attack_types,
+        attack_budgets=attack_budgets,
+        attack_kwargs=attack_kwargs,
+        n_images=int(total_images),
+        window_start=int(window_start),
+        window_end=None if window_end is None else int(window_end),
+        results_dir=results_dir,
+        plots_dir=results_dir,  # no plotting here, but ResultsManager needs a dir
+        stored_metrics=list(stored_metrics),
+        parallel_workers=parallel_workers,
+        use_cuda_streams=use_cuda_streams,
+        use_real_gps=use_real_gps,
+        dataset_roots=dataset_roots,
+        run_sampling_steps_ablation=run_sampling_steps_ablation,
+        eval_num_steps=list(eval_num_steps) if eval_num_steps else None,
+        success_rate_thresholds=success_rate_thresholds,
+        attack_type_kwargs=attack_type_kwargs or {},
+        run_robustness_ablation=run_robustness_ablation,
+        robustness_attack_types=robustness_attack_types,
+        robustness_jpeg_quality_factors=robustness_jpeg_quality_factors,
+        robustness_gaussian_blur_sigmas=robustness_gaussian_blur_sigmas,
+        robustness_num_steps=robustness_num_steps,
+    )
+
+    runner = EvaluationRunner(config, pipeline)
+    if config_dump is not None:
+        runner.save_run_config(config_dump)
+    run_evaluation(runner)
+    runner.save_results()
+    return runner
+
+
+class _MergedCollectorRunner:
+    """Minimal stand-in exposing ``.metrics_collector`` for the ablation builders."""
+
+    def __init__(self, metrics_collector):
+        self.metrics_collector = metrics_collector
+
+
+def _copy_per_image_cell(src_by_attack, dst_by_attack, attack_type, budget_idx, local_idx, global_idx) -> None:
+    """Copy one ``[attack][budget][image]`` per-image cell from a shard buffer to the merged one."""
+    src = src_by_attack.get(attack_type) if isinstance(src_by_attack, dict) else None
+    if not isinstance(src, list) or budget_idx >= len(src):
+        return
+    src_budget = src[budget_idx]
+    if not isinstance(src_budget, list) or local_idx >= len(src_budget):
+        return
+    value = src_budget[local_idx]
+    if value is None:
+        return
+    dst_by_attack[attack_type][budget_idx][global_idx] = value
+
+
+def merge_shards(
+    dataset_name: str,
+    attack_types: Sequence[str],
+    attack_budgets: Sequence[float],
+    total_images: int,
+    seed: int,
+    results_dir: str,
+    plots_dir: str,
+    stored_metrics: Sequence[str],
+    dataset_roots: Optional[Dict[str, str]] = None,
+    plot_success_rate: bool = False,
+    success_rate_thresholds: Optional[Sequence[float]] = None,
+    plot_gps_true: bool = False,
+    run_sampling_steps_ablation: bool = False,
+    eval_num_steps: Optional[Sequence[int]] = None,
+    run_robustness_ablation: bool = False,
+    robustness_attack_types: Optional[Sequence[str]] = None,
+    robustness_jpeg_quality_factors: Optional[Sequence[int]] = None,
+    robustness_gaussian_blur_sigmas: Optional[Sequence[float]] = None,
+    robustness_num_steps: Optional[int] = None,
+    config_dump: Optional[Dict[str, Any]] = None,
+    shards_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Stitch per-shard state files back into one full-dataset result set, then plot.
+
+    Reads every shard state file under ``shards_dir`` (default ``results_dir/shards``),
+    maps each shard's global ``source_image_ids`` onto the full seeded ordering of
+    ``total_images``, and fills a combined ``MetricsCollector`` sized to the whole pool.
+    Then it saves the combined per-attack results, the main + success-rate plots, and
+    the restart / sampling-steps / robustness ablation JSONs and plots -- the exact
+    artifacts a single-process ``evaluate-dataset`` would have produced.
+    """
+    from core import MetricsCollector, ResultsManager
+    from utils.datasets import select_image_metadata
+
+    attack_types = list(attack_types)
+    attack_budgets = list(attack_budgets)
+    stored_metrics = list(stored_metrics)
+    success_rate_thresholds = list(success_rate_thresholds) if success_rate_thresholds else [2500]
+    dataset_roots = dataset_roots or {}
+
+    # 1. Full seeded ordering -> id -> global index. Keyed by the raw id and by its
+    #    extension-stripped stem, so GeoShield's filename keys ("123.jpg") match the
+    #    trainable attacks' photo-id keys ("123") in the same merge.
+    metadata = select_image_metadata(
+        dataset_name, int(total_images), int(seed), dataset_roots.get(dataset_name)
+    )
+    global_ids = [str(img_id) for _, _, img_id in metadata]
+    id_to_global: Dict[str, int] = {}
+    for i, gid in enumerate(global_ids):
+        id_to_global[gid] = i
+        id_to_global.setdefault(os.path.splitext(gid)[0], i)
+
+    def _global_index(img_id: Any) -> Optional[int]:
+        key = str(img_id)
+        if key in id_to_global:
+            return id_to_global[key]
+        return id_to_global.get(os.path.splitext(key)[0])
+
+    # 2. Combined collector for the whole pool.
+    combined = MetricsCollector(
+        attack_types=attack_types,
+        attack_budgets=attack_budgets,
+        n_images=len(global_ids),
+        stored_metrics=stored_metrics,
+        source_gps=None,
+        source_image_ids=global_ids,
+    )
+
+    # 3. Discover shard state files.
+    shards_dir = shards_dir or os.path.join(results_dir, "shards")
+    state_paths = sorted(glob.glob(os.path.join(shards_dir, "*", f"{dataset_name}_seed{seed}_eval_state.pt")))
+    if not state_paths:
+        state_paths = sorted(glob.glob(os.path.join(shards_dir, "*", "*_eval_state*.pt")))
+    if not state_paths:
+        raise FileNotFoundError(
+            f"No shard state files found under {shards_dir}. Did the shard jobs run and finish?"
+        )
+    print(f"Merging {len(state_paths)} shard state file(s) from {shards_dir}")
+
+    covered: set = set()
+    unknown_ids = 0
+    for state_path in state_paths:
+        state = torch.load(state_path, map_location="cpu")
+        shard_ids = state.get("source_image_ids") or []
+        results = state.get("results") or {}
+        restart_results = state.get("restart_results") or {}
+        location_results = state.get("location_results") or {}
+        sampling_steps_results = state.get("sampling_steps_results") or {}
+        robustness_results = state.get("robustness_results") or {}
+
+        for attack_type in attack_types:
+            saved = results.get(attack_type)
+            if not isinstance(saved, dict):
+                continue
+            for budget_idx in range(len(attack_budgets)):
+                for local_idx, img_id in enumerate(shard_ids):
+                    global_idx = _global_index(img_id)
+                    if global_idx is None:
+                        unknown_ids += 1
+                        continue
+                    if location_results.get(attack_type) and \
+                       _cell_value(location_results, attack_type, budget_idx, local_idx) is None:
+                        # task not finished for this (attack, budget, image); skip cleanly
+                        continue
+                    for metric in stored_metrics:
+                        tensor = saved.get(metric)
+                        if isinstance(tensor, torch.Tensor) and budget_idx < tensor.shape[0] and local_idx < tensor.shape[1]:
+                            combined.results[attack_type][metric][budget_idx, global_idx] = tensor[budget_idx, local_idx]
+                    _copy_per_image_cell(restart_results, combined.restart_results, attack_type, budget_idx, local_idx, global_idx)
+                    _copy_per_image_cell(location_results, combined.location_results, attack_type, budget_idx, local_idx, global_idx)
+                    _copy_per_image_cell(sampling_steps_results, combined.sampling_steps_results, attack_type, budget_idx, local_idx, global_idx)
+                    _copy_per_image_cell(robustness_results, combined.robustness_results, attack_type, budget_idx, local_idx, global_idx)
+                    covered.add((attack_type, budget_idx, global_idx))
+
+    expected = len(attack_types) * len(attack_budgets) * len(global_ids)
+    print(f"Merged {len(covered)}/{expected} (attack, budget, image) cells.")
+    if len(covered) < expected:
+        print(f"  WARNING: {expected - len(covered)} cells missing (incomplete/failed shards). Plots use what is present.")
+    if unknown_ids:
+        print(f"  WARNING: {unknown_ids} shard rows had image ids absent from the seeded pool (total_images/seed mismatch?).")
+
+    # 4. Save combined per-attack results.
+    results_manager = ResultsManager(results_dir, plots_dir)
+    all_results = combined.get_results()
+    for attack_type in attack_types:
+        results_manager.save_results(all_results[attack_type], dataset_name, attack_type)
+    if config_dump is not None:
+        results_manager.save_run_config(config_dump, dataset_name, suffix="_merged")
+
+    # 5. Main plots.
+    plot_results(
+        results_dir=results_dir,
+        attack_budgets=attack_budgets,
+        plot_dir=plots_dir,
+        dataset_name=dataset_name,
+        attack_types=attack_types,
+        all_results=all_results,
+        stored_metrics=stored_metrics,
+    )
+    if plot_success_rate:
+        plot_attack_success_rate(
+            results_dir=results_dir,
+            attack_budgets=attack_budgets,
+            plot_dir=plots_dir,
+            dataset_name=dataset_name,
+            attack_types=attack_types,
+            all_results=all_results,
+            threshold_km=list(success_rate_thresholds),
+            gps_true=plot_gps_true,
+        )
+
+    # 6. Ablations (shared builders, fed the merged collector).
+    shim = _MergedCollectorRunner(combined)
+    restart_json, observed_restarts = build_and_save_restart_ablation(
+        shim, dataset_name, attack_types, attack_budgets, results_dir
+    )
+    if observed_restarts >= 2:
+        plot_restarts_success(json_results=restart_json, plot_dir=plots_dir, per_image=False)
+    else:
+        print("Restart ablation has < 2 restarts; JSON saved but plot skipped.")
+
+    if run_sampling_steps_ablation and eval_num_steps:
+        steps_json = build_and_save_sampling_steps_ablation(
+            shim,
+            dataset_name,
+            attack_types,
+            attack_budgets,
+            list(eval_num_steps),
+            list(success_rate_thresholds),
+            results_dir,
+        )
+        plot_sampling_steps_success_rate(json_results=steps_json, plot_dir=plots_dir)
+
+    if run_robustness_ablation:
+        robustness_attack_types = ["dtd"] if robustness_attack_types is None else list(robustness_attack_types)
+        robustness_jpeg_quality_factors = (
+            [10, 20, 30, 40, 50, 60]
+            if robustness_jpeg_quality_factors is None
+            else list(robustness_jpeg_quality_factors)
+        )
+        robustness_gaussian_blur_sigmas = (
+            [0, 2, 4, 6, 8, 10]
+            if robustness_gaussian_blur_sigmas is None
+            else list(robustness_gaussian_blur_sigmas)
+        )
+        robustness_json = build_and_save_robustness_ablation(
+            shim,
+            dataset_name,
+            robustness_attack_types,
+            attack_budgets,
+            robustness_jpeg_quality_factors,
+            robustness_gaussian_blur_sigmas,
+            list(success_rate_thresholds),
+            results_dir,
+            num_steps=robustness_num_steps,
+        )
+        if robustness_json is not None:
+            plot_robustness_results(json_results=robustness_json, plot_dir=plots_dir)
+        else:
+            print(
+                "Robustness ablation enabled but none of "
+                f"{robustness_attack_types} were among the merged attacks; nothing to plot."
+            )
+
+    return all_results
+
+
+def _cell_value(src_by_attack, attack_type, budget_idx, local_idx):
+    """Read one ``[attack][budget][image]`` per-image cell, or None if out of range."""
+    src = src_by_attack.get(attack_type) if isinstance(src_by_attack, dict) else None
+    if not isinstance(src, list) or budget_idx >= len(src):
+        return None
+    src_budget = src[budget_idx]
+    if not isinstance(src_budget, list) or local_idx >= len(src_budget):
+        return None
+    return src_budget[local_idx]
 
 
 def evaluate_localizability(

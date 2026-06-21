@@ -19,19 +19,144 @@ In order to install librairies and get the code running, refer to the README_ORI
 
 ## Installation
 
-From the original repository's readme, we suggets the following installation routine:
+Tested with **Python 3.10** and a CUDA-capable GPU.
 
-'''
+### 1. Clone the repository
+
+```bash
+# Pick a parent folder (referred to below as <repos>). GeoShield, if used, is cloned
+# next to plonk in this same folder (see "Installing GeoShield").
+mkdir -p <repos> && cd <repos>
+git clone https://github.com/<your-fork>/plonk.git
+cd plonk
+```
+
+### 2. Create the conda env and install the package
+
+```bash
 conda create -n plonk python=3.10
 conda activate plonk
+
+# Installs the core PLONK package + its base dependencies (from setup.py).
 pip install -e .
-'''
+```
+
+If you need a specific CUDA build of PyTorch, install it first following the
+[PyTorch guide](https://pytorch.org/get-started/locally/), then run `pip install -e .`.
+
+### 3. Install the extra dependencies for adversarial_demo
+
+The base package does **not** cover everything the `adversarial_demo` code needs (plotting,
+maps, metrics, dataset/model download). Install the full set from `requirements.txt`:
+
+```bash
+pip install -r requirements.txt
+```
+
+Notes (the file marks every package added on top of the original PLONK env with `[added]`):
+
+- **`cartopy`** (used for the map plots) needs system GEOS/PROJ libraries and can fail to
+  build via pip. If so, install it from conda-forge instead:
+  ```bash
+  conda install -c conda-forge cartopy
+  ```
+### 4. Models and cache
+
+The pretrained PLONK models (`nicolas-dufour/PLONK_YFCC`, `nicolas-dufour/PLONK_OSV_5M`,
+configured in `adversarial_demo/config.yaml` under `pipelines:`) download automatically from
+the HuggingFace Hub on first use. To keep large downloads off your home quota, point the HF
+cache at a data disk (matching `data_root` in `config.yaml`):
+
+```bash
+export HF_HOME=/Data/<you>/hf_cache        # adjust to your scratch/data path
+```
+
+## Installing GeoShield (optional — needed for the `geoshield` attack)
+
+GeoShield ([thinwayliu/Geoshield](https://github.com/thinwayliu/Geoshield.git)) is an
+out-of-process attack we fold into the evaluation pipeline as just another attack. It is run
+as a subprocess (`Geoshield/geoshield.py`), so the repo must sit **next to `plonk/`** in the
+same parent folder — the integration auto-detects the parent that holds both:
+
+```
+<repos>/
+├── plonk/        # this repository
+└── Geoshield/    # GeoShield, cloned below (note the capital G)
+```
+
+```bash
+cd <repos>
+git clone https://github.com/thinwayliu/Geoshield.git
+```
+
+**Dependencies:** GeoShield uses CLIP surrogates via HuggingFace `transformers` plus
+`hydra-core`/`omegaconf`, `torch`, `torchvision`, `numpy`, `pillow`, `tqdm` and `wandb` — all
+already provided by the `plonk` env above, so **no extra install is needed**. Just run it with
+`conda activate plonk`.
+
+**Surrogate weights:** on first run GeoShield downloads its CLIP backbones from the HuggingFace
+Hub (`openai/clip-vit-base-patch16`, `-patch32`, `-large-patch14-336`, and
+`laion/CLIP-ViT-G-14-laion2B-s12B-b42K`). The LAION ViT-G/14 model is several GB, so allow disk
+space and use the same `HF_HOME` as above. (The optional GroundingDINO region-aware mode from
+GeoShield's own README is **not** required for our default `ensemble_3models` config.)
+
+**Configuration:** GeoShield's settings live in the `geoshield:` block of
+`adversarial_demo/config.yaml`:
+
+```yaml
+geoshield:
+  attack_name: "geoshield"
+  steps: 100
+  clean_dir:   "/Data/<you>/hf_cache/clean_yfcc_images"          # where seeded clean images are copied
+  output_base: "/Data/<you>/hf_cache/attacked_yfcc_images_geoshield"  # where attacked images are written
+  epsilons: null          # null => derived per budget as round(budget * 255) (0.0314 -> 8/255)
+  repos_root: null        # null => auto-detect the folder holding plonk/ and Geoshield/
+  script: "Geoshield/geoshield.py"
+  python: null            # null => the current interpreter (run inside the plonk env)
+```
+
+GeoShield generates adversarial images then evaluates them through the same backbone as the
+trainable attacks, reporting both the predicted-displacement metric **and** the true-GPS
+displacement metric (it selects labelled dataset images, so ground truth is available).
+WandB logging is enabled inside GeoShield; run `wandb offline` (or set
+`WANDB_MODE=disabled`) beforehand to skip uploads.
 
 ## Datasets
 
-You can download the YFCC4k dataset by running the dedicated *build_yfcc4k_from_revisiting_im2gps.py* python file. You can specify you dataset folders through the argument parser. 
+You can download the **YFCC4k** dataset by running the dedicated
+`adversarial_demo/utils/build_yfcc4k_from_revisiting_im2gps.py` script. Dataset folders are
+configured under `data_root` / `data_dirs` / `build_yfcc4k` in `adversarial_demo/config.yaml`,
+and can also be overridden through the argument parser.
 
-The OSV datasets downloads automatically when calling an evaluation using it.
+The **OSV-5M** test split downloads automatically (from the HuggingFace Hub) the first time an
+evaluation uses it.
+
+## Running evaluations
+
+All commands below run from `adversarial_demo/` with `conda activate plonk`.
+
+**Single GPU** (quick test: every attack on a small image count, with the ablations):
+
+```bash
+bash scripts/test_all_attacks.sh
+```
+
+**Full dataset across many GPUs** (e.g. all 4000 YFCC4k images on Jean Zay / SLURM). The
+run is sharded into one job per `(attack × image window)`, then merged into the same
+results + plots a single-GPU run would produce. Three steps, from `scripts/cluster/`:
+
+```bash
+cd scripts/cluster
+# 1. Edit config.sh        -> dataset, TOTAL_IMAGES, IMAGES_PER_SHARD, ATTACK_TYPES, budgets, paths
+# 2. Fill the #SBATCH placeholders in eval_shard.slurm and merge.slurm (account / GPU / qos)
+# 3. Submit the shard array + a merge job that runs once it succeeds:
+./submit.sh                 # add --dry-run first to preview the task -> (attack, window) grid
+```
+
+See [`adversarial_demo/scripts/cluster/README.md`](adversarial_demo/scripts/cluster/README.md)
+for the full workflow (restartable shards, partial-failure recovery, OSV-5M subsets, GeoShield
+sharding). The underlying commands — `python main.py evaluate-dataset-shard ...` then
+`python main.py merge-shards ...` — can also be run by hand.
 
 ## Code structure
 
