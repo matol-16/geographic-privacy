@@ -310,3 +310,102 @@ def plot_sampling_steps_success_rate(
     fig.savefig(plot_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Plot saved to: {plot_path}")
+
+
+def plot_robustness_results(
+    json_results: dict,
+    plot_dir: str,
+) -> None:
+    """Plot attack robustness to JPEG compression and Gaussian blur (GeoShield Fig. 6).
+
+    Two columns (JPEG quality factor | Gaussian blur sigma). The top row shows mean
+    final-step displacement vs. transform strength; one row per distance threshold
+    follows with the attack success rate. One coloured line per (attack_type, budget),
+    with the displacement-from-clean-prediction metric drawn solid ("predicted") and
+    the displacement-from-ground-truth metric dashed ("true", the GeoShield metric).
+    ``json_results`` is the dict produced by ``build_robustness_json``.
+    """
+    from matplotlib.lines import Line2D
+
+    attack_types = json_results["attack_types"]
+    attack_budgets = json_results["attack_budgets"]
+    dataset = json_results["dataset"]
+    thresholds = json_results["success_rate_thresholds_km"]
+    num_steps = json_results.get("num_steps")
+    metrics = json_results.get("metrics", ["predicted", "true"])
+    metric_styles = {"predicted": "-", "true": "--"}
+
+    # (x-axis label, JSON sub-dict key)
+    transforms = [
+        ("JPEG quality factor", "jpeg"),
+        ("Gaussian blur σ", "blur"),
+    ]
+    colors = plt.cm.tab10.colors
+
+    n_rows = 1 + len(thresholds)  # row 0: mean displacement; then one per threshold
+    fig, axes = plt.subplots(n_rows, 2, figsize=(7 * 2, 4 * n_rows), squeeze=False)
+
+    def _sorted_levels(level_dict: dict):
+        items = sorted(level_dict.items(), key=lambda kv: float(kv[0]))
+        return [float(k) for k, _ in items], [v for _, v in items]
+
+    drawn_metrics: set = set()
+    for col_idx, (xlabel, json_key) in enumerate(transforms):
+        color_idx = 0
+        for attack_type in attack_types:
+            for budget in attack_budgets:
+                bkey = f"budget_{budget:.6f}"
+                level_dict = json_results["results"][attack_type][bkey][json_key]
+                if not level_dict:
+                    continue
+                xs, entries = _sorted_levels(level_dict)
+                color = colors[color_idx % len(colors)]
+                label = f"{_display_attack_name(attack_type)} eps={budget:.3f}"
+                for metric in metrics:
+                    style = metric_styles.get(metric, "-")
+                    means = [entry[metric]["mean_displacement_km"] for entry in entries]
+                    if all(np.isnan(m) for m in means):
+                        continue  # e.g. "true" unavailable when the dataset has no GPS
+                    drawn_metrics.add(metric)
+                    # Only the predicted (solid) line carries the colour legend label.
+                    line_label = label if metric == "predicted" else None
+                    axes[0][col_idx].plot(xs, means, marker="o", linestyle=style, label=line_label, color=color)
+                    for row_offset, thr in enumerate(thresholds, start=1):
+                        rates = [entry[metric]["success_rates"][str(thr)] for entry in entries]
+                        axes[row_offset][col_idx].plot(xs, rates, marker="o", linestyle=style, color=color)
+                color_idx += 1
+
+        axes[0][col_idx].set_xlabel(xlabel)
+        axes[0][col_idx].set_ylabel("Mean displacement (km)")
+        axes[0][col_idx].set_title("Mean displacement")
+        axes[0][col_idx].grid(True, alpha=0.3)
+        axes[0][col_idx].legend(fontsize=7)
+        for row_offset, thr in enumerate(thresholds, start=1):
+            ax = axes[row_offset][col_idx]
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel("Attack success rate")
+            ax.set_title(f"Displacement > {thr} km")
+            ax.set_ylim(0, 1)
+            ax.grid(True, alpha=0.3)
+
+    # Linestyle legend (predicted vs true) on the top-left axis, kept alongside the
+    # colour/attack legend by re-adding the latter as a separate artist.
+    style_handles = [
+        Line2D([0], [0], color="black", linestyle=metric_styles.get(m, "-"),
+               label={"predicted": "predicted (vs clean)", "true": "true (vs GT)"}.get(m, m))
+        for m in metrics if m in drawn_metrics
+    ]
+    if style_handles:
+        color_legend = axes[0][0].get_legend()
+        axes[0][0].legend(handles=style_handles, fontsize=7, loc="lower left")
+        if color_legend is not None:
+            axes[0][0].add_artist(color_legend)
+
+    steps_note = f" (eval steps = {num_steps})" if num_steps is not None else ""
+    fig.suptitle(f"Robustness to JPEG / blur — {dataset.upper()}{steps_note}")
+    fig.tight_layout()
+    os.makedirs(plot_dir, exist_ok=True)
+    plot_path = os.path.join(plot_dir, f"{dataset}_robustness_results.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Plot saved to: {plot_path}")

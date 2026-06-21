@@ -35,6 +35,7 @@ from utils.plots.results import (
 from utils.plots.ablations import (
     plot_localizability_results,
     plot_restarts_success,
+    plot_robustness_results,
     plot_sampling_steps_success_rate,
     plot_transferability_results,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "plot_attack_success_rate",
     "plot_restarts_success",
     "plot_sampling_steps_success_rate",
+    "plot_robustness_results",
     "plot_localizability_results",
     "plot_transferability_results",
     "save_plot_json",

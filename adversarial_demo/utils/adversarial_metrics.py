@@ -35,6 +35,21 @@ def mean_final_prediction_distance(gps_coords_source, gps_coords_perturbed, metr
 	distance = trajectory_displacement(gps_coords_source, gps_coords_perturbed, metric=metric)
 	return float(distance[-1].mean().item())
 
+
+def final_prediction_distance_to_point(gps_traj, point, metric="haversine") -> float:
+	"""Mean final-step distance from a batch of prediction trajectories to a fixed point.
+
+	``point`` is a (lat, lon) pair in degrees (e.g. ground-truth GPS). The distance is
+	computed exactly like ``final_step_displacement`` (final step, averaged over the
+	batch) but against a constant target, so a 'true-position' displacement is directly
+	comparable to the predicted (clean-vs-perturbed) one.
+	"""
+	if isinstance(gps_traj, np.ndarray):
+		gps_traj = torch.from_numpy(gps_traj)
+	gps_traj = gps_traj.float()
+	point_traj = torch.as_tensor(point, dtype=gps_traj.dtype).view(1, 1, 2).expand_as(gps_traj)
+	return mean_final_prediction_distance(point_traj, gps_traj, metric=metric)
+
 def select_displacement_score(
 	mean_step_disp: float,
 	final_step_disp: float,

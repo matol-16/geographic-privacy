@@ -15,6 +15,7 @@ from utils.plots import (  # noqa: F401
     plot_localizability_results,
     plot_restarts_success,
     plot_results,
+    plot_robustness_results,
     plot_sampling_steps_success_rate,
     plot_transferability_results,
     save_plot_json,

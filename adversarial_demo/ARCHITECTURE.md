@@ -10,7 +10,7 @@ The adversarial demo code has been refactored to reduce duplication and provide 
 
 - **`main.py`** - Command-line interface for all experiments
   - Commands: `evaluate-dataset`, `evaluate-localizability`, `evaluate-restarts`,
-    `evaluate-sampling-steps`, `evaluate-geoshield-vs-diffusion`,
+    `evaluate-sampling-steps`, `evaluate-robustness`, `evaluate-geoshield-vs-diffusion`,
     `evaluate-sampling-steps-precomputed`, `plot`, `list-configs`
   - Per-command boilerplate is collapsed into `prepare_training_run()` +
     `add_common_eval_args()`; commands dispatch through `COMMAND_HANDLERS`
@@ -39,8 +39,9 @@ The adversarial demo code has been refactored to reduce duplication and provide 
 - **`utils/datasets.py`** - YFCC4k / OSV-5M retrieval (split out so `core.py` no
   longer needs `adversarial_eval.py`, removing a circular import)
 - **`utils/ablations.py`** - shared ablation building blocks: `best_after_k`,
-  `evaluate_delta_at_steps`, and the restart / sampling-steps JSON builders. Used
-  by both `evaluate-dataset` and the standalone ablation commands
+  `evaluate_delta_at_steps`, `evaluate_delta_under_transforms` (JPEG/blur), the
+  JPEG/blur transforms, and the restart / sampling-steps / robustness JSON builders.
+  Used by both `evaluate-dataset` and the standalone ablation commands
 - **`utils/plots/`** - plotting package: `common` (data helpers + JSON dumping),
   `maps`, `results` (displacement + success-rate, also write JSON), `ablations`.
   `utils/plots_adversarial_attacks.py` re-exports everything for back-compat
@@ -161,15 +162,26 @@ A single `evaluate-dataset` training pass produces the main results and both abl
 - **Sampling-steps ablation (opt-in)**: `--run-sampling-steps-ablation` re-evaluates
   each image's best perturbation at every count in `--eval-num-steps` (extra pipeline
   runs, no retraining).
+- **Robustness ablation (opt-in, per attack type)**: `--run-robustness-ablation`
+  degrades each best perturbation's protected image with JPEG compression / Gaussian
+  blur (GeoShield Fig. 6 levels) and re-evaluates at the *baseline* sampling-step
+  count (no sampling-steps sweep). Unlike the other ablations it is scoped to
+  `robustness.attack_types` (config) / `--robustness-attack-types` (default `dtd`),
+  so it only runs for the listed attacks and is a no-op otherwise. Transform levels
+  and the baseline step count come from the `robustness:` config block. Each level
+  records two displacements, matching the main results: `predicted` (vs the clean
+  prediction) and `true` (vs the ground-truth GPS, the GeoShield metric).
 
 ```bash
 python main.py evaluate-dataset --dataset yfcc \
   --max-restarts 10 \
-  --run-sampling-steps-ablation --eval-num-steps 16 64 250
+  --run-sampling-steps-ablation --eval-num-steps 16 64 250 \
+  --attack-types dtd --run-robustness-ablation --robustness-attack-types dtd
 ```
 
-The standalone `evaluate-restarts` / `evaluate-sampling-steps` commands remain for
-focused runs and share the same `utils/ablations.py` code path (identical JSON).
+The standalone `evaluate-restarts` / `evaluate-sampling-steps` / `evaluate-robustness`
+commands remain for focused runs and share the same `utils/ablations.py` code path
+(identical JSON).
 
 ## Results Structure
 
@@ -183,6 +195,7 @@ Results are saved to the configured `results_dir` (default `./results/`):
   config resumes from the next unfinished image/budget pair
 - `{dataset}_restarts_results.json` - restart ablation data
 - `{dataset}_sampling_steps_results.json` - sampling-steps ablation data
+- `{dataset}_robustness_results.json` - robustness (JPEG/blur) ablation data
 - `{dataset}_metrics_localizability.pt` - localizability evaluation results
 
 Plots are saved to `plots_dir` (default `./plots/`). Every result/success-rate plot

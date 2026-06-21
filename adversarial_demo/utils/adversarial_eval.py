@@ -30,8 +30,12 @@ from utils.datasets import (  # noqa: F401
 )
 from utils.ablations import (
     build_restart_ablation_json,
+    build_robustness_json,
     build_sampling_steps_json,
+    empty_robustness_samples,
     evaluate_delta_at_steps,
+    evaluate_delta_under_transforms,
+    pred_true_from_cell,
     restart_displacements_from_results,
 )
 from utils.adversarial_utils import (
@@ -43,6 +47,7 @@ from utils.plots_adversarial_attacks import (
     plot_attack_success_rate,
     plot_restarts_success,
     plot_results,
+    plot_robustness_results,
     plot_sampling_steps_success_rate,
 )
 
@@ -136,6 +141,66 @@ def build_and_save_sampling_steps_ablation(
     return json_results
 
 
+def build_and_save_robustness_ablation(
+    runner,
+    dataset_name: str,
+    robustness_attack_types: Sequence[str],
+    attack_budgets: Sequence[float],
+    jpeg_quality_factors: Sequence[int],
+    gaussian_blur_sigmas: Sequence[float],
+    success_rate_thresholds: Sequence[float],
+    results_dir: str,
+    num_steps: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Aggregate the per-image robustness samples collected during the run.
+
+    ``robustness_attack_types`` is the subset of evaluated attacks the ablation was
+    run for (default: ["dtd"]). Returns ``None`` (and writes nothing) when none of
+    those attacks were evaluated, so enabling the toggle is a no-op until an opted-in
+    attack is part of the run.
+    """
+    mc = runner.metrics_collector
+    robustness_attack_types = [at for at in robustness_attack_types if at in mc.robustness_results]
+    if not robustness_attack_types:
+        return None
+
+    samples = empty_robustness_samples(
+        robustness_attack_types, len(attack_budgets), jpeg_quality_factors, gaussian_blur_sigmas
+    )
+
+    def _accumulate(target: dict, cell) -> None:
+        pred, true = pred_true_from_cell(cell)
+        if pred is not None:
+            target["predicted"].append(pred)
+        if true is not None:
+            target["true"].append(true)
+
+    for at in robustness_attack_types:
+        for bi in range(len(attack_budgets)):
+            for ii in range(mc.n_images):
+                record = mc.robustness_results[at][bi][ii]
+                if not record:
+                    continue
+                for quality in jpeg_quality_factors:
+                    _accumulate(samples[at][bi]["jpeg"][int(quality)], record.get("jpeg", {}).get(int(quality)))
+                for sigma in gaussian_blur_sigmas:
+                    _accumulate(samples[at][bi]["blur"][float(sigma)], record.get("blur", {}).get(float(sigma)))
+
+    json_results = build_robustness_json(
+        dataset_name,
+        robustness_attack_types,
+        attack_budgets,
+        jpeg_quality_factors,
+        gaussian_blur_sigmas,
+        success_rate_thresholds,
+        mc.n_images,
+        samples,
+        num_steps=num_steps,
+    )
+    _save_json(json_results, results_dir, f"{dataset_name}_robustness_results.json")
+    return json_results
+
+
 # --------------------------------------------------------------------------- #
 # Main dataset evaluation (+ integrated ablations)
 # --------------------------------------------------------------------------- #
@@ -165,10 +230,15 @@ def evaluate_attack_on_dataset(
     run_sampling_steps_ablation: bool = False,
     eval_num_steps: Optional[list[int]] = None,
     attack_type_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+    run_robustness_ablation: bool = False,
+    robustness_attack_types: Optional[list[str]] = None,
+    robustness_jpeg_quality_factors: Optional[list[int]] = None,
+    robustness_gaussian_blur_sigmas: Optional[list[float]] = None,
+    robustness_num_steps: Optional[int] = None,
 ):
     """Evaluate one or more attacks on images from a test dataset.
 
-    A single training pass yields the main results plus both ablations:
+    A single training pass yields the main results plus the ablations:
 
     - **Main results**: best-restart displacement per image → displacement and
       success-rate plots.
@@ -178,6 +248,10 @@ def evaluate_attack_on_dataset(
     - **Sampling-steps ablation** (opt-in via ``run_sampling_steps_ablation``):
       re-evaluates each image's best perturbation at every count in
       ``eval_num_steps`` (extra pipeline runs, no retraining).
+    - **Robustness ablation** (opt-in via ``run_robustness_ablation``, restricted to
+      ``robustness_attack_types`` -- default ["dtd"]): degrades each best
+      perturbation's protected image with JPEG compression / Gaussian blur
+      (GeoShield Fig. 6 levels) and re-evaluates at the baseline sampling-step count.
 
     Args:
         attack_types: A single attack name (str) or a list, e.g. ["encoder", "diffusion"].
@@ -191,6 +265,12 @@ def evaluate_attack_on_dataset(
             restart ablation reaches the requested depth.
         run_sampling_steps_ablation / eval_num_steps: enable + configure the
             sampling-steps ablation.
+        run_robustness_ablation / robustness_attack_types /
+            robustness_jpeg_quality_factors / robustness_gaussian_blur_sigmas /
+            robustness_num_steps: enable + configure the robustness ablation. The
+            ablation only runs for attacks in ``robustness_attack_types`` (default
+            ["dtd"]); ``robustness_num_steps`` of None uses each attack's baseline
+            ``restart_eval_num_steps``.
         attack_type_kwargs: optional ``{attack_type: {kwarg: value}}`` overrides merged
             on top of the shared kwargs only for the matching attack (e.g. ACE's
             target_image / l2_target loss / alpha), so every attack type can run in one
@@ -217,6 +297,20 @@ def evaluate_attack_on_dataset(
 
     success_rate_thresholds = plot_success_rate_thresholds or [2500]
 
+    # Robustness-ablation defaults (only consulted when run_robustness_ablation).
+    # GeoShield Fig. 6 levels; restricted to ``robustness_attack_types`` (default dtd).
+    robustness_attack_types = ["dtd"] if robustness_attack_types is None else list(robustness_attack_types)
+    robustness_jpeg_quality_factors = (
+        [10, 20, 30, 40, 50, 60]
+        if robustness_jpeg_quality_factors is None
+        else list(robustness_jpeg_quality_factors)
+    )
+    robustness_gaussian_blur_sigmas = (
+        [0, 2, 4, 6, 8, 10]
+        if robustness_gaussian_blur_sigmas is None
+        else list(robustness_gaussian_blur_sigmas)
+    )
+
     config = EvaluationConfig(
         dataset=dataset_name,
         seed=seed,
@@ -235,6 +329,11 @@ def evaluate_attack_on_dataset(
         eval_num_steps=list(eval_num_steps) if eval_num_steps else None,
         success_rate_thresholds=list(success_rate_thresholds),
         attack_type_kwargs=attack_type_kwargs or {},
+        run_robustness_ablation=run_robustness_ablation,
+        robustness_attack_types=robustness_attack_types,
+        robustness_jpeg_quality_factors=robustness_jpeg_quality_factors,
+        robustness_gaussian_blur_sigmas=robustness_gaussian_blur_sigmas,
+        robustness_num_steps=robustness_num_steps,
     )
 
     runner = EvaluationRunner(config, pipeline)
@@ -289,6 +388,27 @@ def evaluate_attack_on_dataset(
             results_dir,
         )
         plot_sampling_steps_success_rate(json_results=steps_json, plot_dir=plot_dir)
+
+    # ---- Robustness ablation (opt-in, per attack type) --------------------- #
+    if run_robustness_ablation and (robustness_jpeg_quality_factors or robustness_gaussian_blur_sigmas):
+        robustness_json = build_and_save_robustness_ablation(
+            runner,
+            dataset_name,
+            robustness_attack_types,
+            attack_budgets,
+            robustness_jpeg_quality_factors,
+            robustness_gaussian_blur_sigmas,
+            list(success_rate_thresholds),
+            results_dir,
+            num_steps=robustness_num_steps,
+        )
+        if robustness_json is not None:
+            plot_robustness_results(json_results=robustness_json, plot_dir=plot_dir)
+        else:
+            print(
+                "Robustness ablation enabled but none of "
+                f"{robustness_attack_types} were among the evaluated attacks; nothing to plot."
+            )
 
 
 def evaluate_localizability(
@@ -527,6 +647,125 @@ def evaluate_sampling_steps(
         samples,
     )
     _save_json(json_results, results_dir, f"{dataset_name}_sampling_steps_results.json")
+    return json_results
+
+
+def evaluate_robustness(
+    attack_types,
+    pipeline,
+    dataset_name: str,
+    seed: int = 0,
+    n_images_to_eval: int = 20,
+    jpeg_quality_factors: list = (10, 20, 30, 40, 50, 60),
+    gaussian_blur_sigmas: list = (0, 2, 4, 6, 8, 10),
+    robustness_num_steps: Optional[int] = None,
+    results_dir: str = "./results",
+    attack_budgets: list = (2/255, 15/255, 50/255),
+    attack_kwargs: list = (),
+    success_rate_thresholds: list = (200, 750, 2500),
+    dataset_roots: dict = None,
+    config_dump: dict = None,
+    attack_type_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+):
+    """Train attacks once, then re-evaluate each perturbation under JPEG/blur.
+
+    Standalone counterpart to the robustness ablation folded into
+    ``evaluate_attack_on_dataset``. Unlike that path this trains every requested
+    ``attack_types`` (no per-attack gating) since the caller chose them explicitly.
+    Each protected image is degraded at the GeoShield levels and re-evaluated at the
+    baseline sampling-step count. Returns the JSON dict (also written to
+    ``results_dir``); the caller plots it.
+    """
+    from core import ImageLoader
+    from attacks.attacks import run_attack
+
+    seed_everything(seed)
+    dataset_roots = dataset_roots or {}
+    jpeg_quality_factors = list(jpeg_quality_factors)
+    gaussian_blur_sigmas = list(gaussian_blur_sigmas)
+
+    if isinstance(attack_types, str):
+        attack_types = [attack_types]
+    attack_types = list(attack_types)
+    attack_budgets = list(attack_budgets)
+
+    source_images, source_gps, _ = ImageLoader.load_images(
+        dataset=dataset_name,
+        n_images=n_images_to_eval,
+        seed=seed,
+        dataset_roots=dataset_roots,
+    )
+
+    attack_kwargs = expand_per_budget_kwargs(list(attack_kwargs), len(attack_budgets))
+    device = str(attack_kwargs[0].get("device", "cuda"))
+    eval_cfg = float(attack_kwargs[0].get("restart_eval_cfg", 10.0))
+    eval_batch_size = int(attack_kwargs[0].get("restart_eval_batch_size", 128))
+
+    def _accumulate(target: dict, cell) -> None:
+        pred, true = pred_true_from_cell(cell)
+        if pred is not None:
+            target["predicted"].append(pred)
+        if true is not None:
+            target["true"].append(true)
+
+    samples = empty_robustness_samples(
+        attack_types, len(attack_budgets), jpeg_quality_factors, gaussian_blur_sigmas
+    )
+    for attack_type in attack_types:
+        for budget_idx, budget in enumerate(attack_budgets):
+            kw_base = dict(attack_kwargs[budget_idx])
+            kw_base.update((attack_type_kwargs or {}).get(attack_type, {}))
+            # Baseline sampling steps: explicit override, else the attack's eval steps.
+            num_steps = robustness_num_steps
+            if num_steps is None:
+                num_steps = kw_base.get("restart_eval_num_steps")
+            print(f"Training {attack_type} attacks (eps={budget:.4f}) for robustness ablation...")
+            for image_idx, image in enumerate(tqdm_module.tqdm(source_images, desc="  images")):
+                result = run_attack(
+                    attack_type=attack_type,
+                    source_image=image,
+                    pipeline=pipeline,
+                    eps_max=budget,
+                    silent=True,
+                    **kw_base,
+                )
+                true_gps = source_gps[image_idx] if source_gps is not None else None
+                disp_by_transform = evaluate_delta_under_transforms(
+                    pipeline=pipeline,
+                    source_image=image,
+                    delta=result["delta"].detach().cpu(),
+                    jpeg_quality_factors=jpeg_quality_factors,
+                    gaussian_blur_sigmas=gaussian_blur_sigmas,
+                    cfg=eval_cfg,
+                    batch_size=eval_batch_size,
+                    seed=seed,
+                    device=device,
+                    num_steps=int(num_steps) if num_steps is not None else None,
+                    true_gps=true_gps,
+                )
+                for quality in jpeg_quality_factors:
+                    _accumulate(
+                        samples[attack_type][budget_idx]["jpeg"][int(quality)],
+                        disp_by_transform["jpeg"][int(quality)],
+                    )
+                for sigma in gaussian_blur_sigmas:
+                    _accumulate(
+                        samples[attack_type][budget_idx]["blur"][float(sigma)],
+                        disp_by_transform["blur"][float(sigma)],
+                    )
+
+    json_results = build_robustness_json(
+        dataset_name,
+        attack_types,
+        attack_budgets,
+        jpeg_quality_factors,
+        gaussian_blur_sigmas,
+        list(success_rate_thresholds),
+        n_images_to_eval,
+        samples,
+        num_steps=robustness_num_steps,
+    )
+    _save_json(json_results, results_dir, f"{dataset_name}_robustness_results.json")
     return json_results
 
 

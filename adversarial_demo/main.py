@@ -7,7 +7,7 @@ Commands:
     optional sampling-steps ablation, all from a single training pass)
   - evaluate-localizability: Evaluate attack effectiveness by image localizability
   - evaluate-geoshield-vs-diffusion: Evaluate precomputed clean/attacked pairs
-  - evaluate-restarts / evaluate-sampling-steps: standalone ablations
+  - evaluate-restarts / evaluate-sampling-steps / evaluate-robustness: standalone ablations
   - evaluate-sampling-steps-precomputed: sampling-steps ablation for precomputed pairs
   - plot: Plot saved results or attack success rates
   - list-configs: List available config parameters
@@ -15,6 +15,7 @@ Commands:
 Usage:
   python main.py evaluate-dataset --dataset yfcc --attack-types encoder diffusion
   python main.py evaluate-dataset --dataset yfcc --run-sampling-steps-ablation
+  python main.py evaluate-dataset --dataset yfcc --attack-types dtd --run-robustness-ablation
   python main.py evaluate-localizability --dataset osv
   python main.py plot success-rate --dataset yfcc
 """
@@ -34,6 +35,7 @@ from utils.adversarial_eval import (
     evaluate_attack_on_dataset,
     evaluate_localizability,
     evaluate_restarts,
+    evaluate_robustness,
     evaluate_sampling_steps,
     evaluate_sampling_steps_precomputed,
     merge_sampling_steps_results,
@@ -43,6 +45,7 @@ from utils.plots_adversarial_attacks import (
     plot_results,
     plot_attack_success_rate,
     plot_restarts_success,
+    plot_robustness_results,
     plot_sampling_steps_success_rate,
 )
 from core import (
@@ -61,6 +64,10 @@ DEFAULT_SUCCESS_RATE_THRESHOLDS = [200, 750, 2500]
 DEFAULT_GEOSHIELD_ATTACK_NAME = "geoshield"
 DEFAULT_EVAL_NUM_STEPS = [10, 25, 50, 100, 250]
 DEFAULT_MAX_RESTARTS = 10
+# Robustness ablation defaults (GeoShield Fig. 6 levels; scoped to "dtd" by default).
+DEFAULT_ROBUSTNESS_ATTACK_TYPES = ["dtd"]
+DEFAULT_ROBUSTNESS_JPEG_QUALITY_FACTORS = [10, 20, 30, 40, 50, 60]
+DEFAULT_ROBUSTNESS_GAUSSIAN_BLUR_SIGMAS = [0, 2, 4, 6, 8, 10]
 
 
 # --------------------------------------------------------------------------- #
@@ -307,6 +314,25 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
     eval_num_steps = pick_value(args.eval_num_steps, config.get("eval_num_steps"), DEFAULT_EVAL_NUM_STEPS)
     max_restarts = pick_value(args.max_restarts, config.get("max_restarts"), None)
 
+    # Robustness ablation controls (CLI > config > default). Scoped per attack type.
+    run_robustness_ablation = bool(pick_value(
+        args.run_robustness_ablation,
+        get_nested_config(config, "plot", "run_robustness_ablation", default=None),
+        False,
+    ))
+    robustness_attack_types = pick_value(
+        args.robustness_attack_types,
+        get_nested_config(config, "robustness", "attack_types", default=None),
+        DEFAULT_ROBUSTNESS_ATTACK_TYPES,
+    )
+    robustness_jpeg_quality_factors = get_nested_config(
+        config, "robustness", "jpeg_quality_factors", default=DEFAULT_ROBUSTNESS_JPEG_QUALITY_FACTORS
+    )
+    robustness_gaussian_blur_sigmas = get_nested_config(
+        config, "robustness", "gaussian_blur_sigmas", default=DEFAULT_ROBUSTNESS_GAUSSIAN_BLUR_SIGMAS
+    )
+    robustness_num_steps = get_nested_config(config, "robustness", "num_steps", default=None)
+
     print_run_banner(
         f"Evaluating attacks on {ctx.dataset.upper()} dataset",
         attack_types=ctx.attack_types,
@@ -316,6 +342,8 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
         plots_directory=ctx.plots_dir,
         parallel_workers=parallel_workers,
         sampling_steps_ablation=run_sampling_steps_ablation,
+        robustness_ablation=run_robustness_ablation,
+        robustness_attack_types=robustness_attack_types if run_robustness_ablation else None,
         max_restarts=max_restarts,
     )
 
@@ -343,6 +371,11 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
         run_sampling_steps_ablation=run_sampling_steps_ablation,
         eval_num_steps=eval_num_steps,
         attack_type_kwargs=ctx.attack_type_kwargs,
+        run_robustness_ablation=run_robustness_ablation,
+        robustness_attack_types=robustness_attack_types,
+        robustness_jpeg_quality_factors=robustness_jpeg_quality_factors,
+        robustness_gaussian_blur_sigmas=robustness_gaussian_blur_sigmas,
+        robustness_num_steps=robustness_num_steps,
     )
 
     print(f"\nEvaluation complete! Results saved to: {ctx.results_dir}")
@@ -452,6 +485,64 @@ def cmd_evaluate_sampling_steps(args, config: Dict[str, Any]) -> None:
     )
 
     plot_sampling_steps_success_rate(json_results=json_results, plot_dir=ctx.plots_dir)
+
+    print(f"\nEvaluation complete! Results saved to: {ctx.results_dir}")
+    print(f"Plots saved to: {ctx.plots_dir}")
+
+
+def cmd_evaluate_robustness(args, config: Dict[str, Any]) -> None:
+    """Standalone robustness ablation (JPEG compression / Gaussian blur)."""
+    ctx = prepare_training_run(args, config, default_n_images=20)
+    jpeg_quality_factors = pick_value(
+        args.jpeg_quality_factors,
+        get_nested_config(config, "robustness", "jpeg_quality_factors", default=None),
+        DEFAULT_ROBUSTNESS_JPEG_QUALITY_FACTORS,
+    )
+    gaussian_blur_sigmas = pick_value(
+        args.gaussian_blur_sigmas,
+        get_nested_config(config, "robustness", "gaussian_blur_sigmas", default=None),
+        DEFAULT_ROBUSTNESS_GAUSSIAN_BLUR_SIGMAS,
+    )
+    robustness_num_steps = pick_value(
+        args.robustness_num_steps,
+        get_nested_config(config, "robustness", "num_steps", default=None),
+        None,
+    )
+    success_rate_thresholds = get_nested_config(
+        config, "plot", "attack_success_rate_thresholds", default=DEFAULT_SUCCESS_RATE_THRESHOLDS
+    )
+
+    print_run_banner(
+        f"Evaluating robustness to JPEG/blur on {ctx.dataset.upper()} dataset",
+        attack_types=ctx.attack_types,
+        attack_budgets=ctx.attack_budgets,
+        images_to_evaluate=ctx.n_images,
+        jpeg_quality_factors=jpeg_quality_factors,
+        gaussian_blur_sigmas=gaussian_blur_sigmas,
+        eval_num_steps=robustness_num_steps if robustness_num_steps is not None else "baseline",
+        results_directory=ctx.results_dir,
+        plots_directory=ctx.plots_dir,
+    )
+
+    json_results = evaluate_robustness(
+        attack_types=ctx.attack_types,
+        pipeline=ctx.pipeline,
+        dataset_name=ctx.dataset,
+        seed=ctx.seed,
+        n_images_to_eval=ctx.n_images,
+        jpeg_quality_factors=jpeg_quality_factors,
+        gaussian_blur_sigmas=gaussian_blur_sigmas,
+        robustness_num_steps=robustness_num_steps,
+        results_dir=ctx.results_dir,
+        attack_budgets=ctx.attack_budgets,
+        attack_kwargs=ctx.attack_kwargs,
+        success_rate_thresholds=success_rate_thresholds,
+        dataset_roots=config.get("data_dirs", {}),
+        config_dump=config,
+        attack_type_kwargs=ctx.attack_type_kwargs,
+    )
+
+    plot_robustness_results(json_results=json_results, plot_dir=ctx.plots_dir)
 
     print(f"\nEvaluation complete! Results saved to: {ctx.results_dir}")
     print(f"Plots saved to: {ctx.plots_dir}")
@@ -788,6 +879,13 @@ Examples:
   python main.py evaluate-dataset --dataset yfcc \\
     --run-sampling-steps-ablation --eval-num-steps 16 64 250
 
+  # Also run the robustness (JPEG/blur) ablation, scoped to the dtd attack
+  python main.py evaluate-dataset --dataset yfcc --attack-types dtd encoder \\
+    --run-robustness-ablation --robustness-attack-types dtd
+
+  # Standalone robustness ablation
+  python main.py evaluate-robustness --dataset yfcc --attack-types dtd
+
   # Evaluate localizability
   python main.py evaluate-localizability --dataset yfcc
 
@@ -830,6 +928,11 @@ Examples:
                               help=f"Sampling step counts for the ablation (default: {DEFAULT_EVAL_NUM_STEPS})")
     eval_dataset.add_argument("--max-restarts", type=int,
                               help="Override num_restarts for this run (sets the restart-ablation depth)")
+    eval_dataset.add_argument("--run-robustness-ablation", action="store_true", default=None,
+                              help="Also degrade each best perturbation with JPEG/blur and re-evaluate "
+                                   "(only for --robustness-attack-types; baseline sampling steps)")
+    eval_dataset.add_argument("--robustness-attack-types", nargs="+",
+                              help=f"Attack types the robustness ablation runs for (default: {DEFAULT_ROBUSTNESS_ATTACK_TYPES})")
 
     # evaluate-localizability
     eval_local = subparsers.add_parser("evaluate-localizability",
@@ -852,6 +955,18 @@ Examples:
     add_common_eval_args(eval_steps)
     eval_steps.add_argument("--eval-num-steps", nargs="+", type=int,
                             help=f"Sampling step counts to evaluate at (default: {DEFAULT_EVAL_NUM_STEPS})")
+
+    # evaluate-robustness
+    eval_robust = subparsers.add_parser("evaluate-robustness",
+                                        help="Evaluate attack robustness to JPEG compression and Gaussian blur",
+                                        parents=[global_parser])
+    add_common_eval_args(eval_robust)
+    eval_robust.add_argument("--jpeg-quality-factors", nargs="+", type=int,
+                             help=f"JPEG quality factors to evaluate at (default: {DEFAULT_ROBUSTNESS_JPEG_QUALITY_FACTORS})")
+    eval_robust.add_argument("--gaussian-blur-sigmas", nargs="+", type=float,
+                             help=f"Gaussian blur sigmas to evaluate at (default: {DEFAULT_ROBUSTNESS_GAUSSIAN_BLUR_SIGMAS})")
+    eval_robust.add_argument("--robustness-num-steps", type=int,
+                             help="Baseline sampling steps for re-evaluation (default: each attack's restart_eval_num_steps)")
 
     # evaluate-geoshield-vs-diffusion
     eval_geo = subparsers.add_parser("evaluate-geoshield-vs-diffusion",
@@ -890,6 +1005,7 @@ COMMAND_HANDLERS = {
     "evaluate-sampling-steps-precomputed": cmd_evaluate_sampling_steps_precomputed,
     "evaluate-restarts": cmd_evaluate_restarts,
     "evaluate-sampling-steps": cmd_evaluate_sampling_steps,
+    "evaluate-robustness": cmd_evaluate_robustness,
     "plot": cmd_plot,
     "list-configs": cmd_list_configs,
 }
