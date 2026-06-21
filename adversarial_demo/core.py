@@ -1,21 +1,25 @@
 """
-Core refactored components for adversarial attack evaluations.
+Core evaluation engine for adversarial attack experiments.
 
-Consolidates common patterns for:
-- Image loading and management
-- Results storage and loading
-- Metrics collection
-- Evaluation execution
+Responsibilities:
+- Loading test images (``ImageLoader``)
+- Saving/loading results, attack args, run config, and resumable state (``ResultsManager``)
+- Collecting per-attack metrics, restart evaluations, and the optional
+  sampling-steps ablation (``MetricsCollector``)
+- Driving the evaluation loop, sequentially or in parallel, with resume support
+  (``EvaluationRunner`` / ``PrecomputedPairEvaluationRunner``)
+
+The two runners share all of their resume/state machinery through
+``BaseEvaluationRunner``; each subclass only declares what makes a saved state
+reusable (its signature keys and per-budget identity).
 """
 
 from __future__ import annotations
 
-import json
 import os
 import yaml
 from typing import Any, Dict, List, Optional, Tuple
-from dataclasses import dataclass, asdict
-from pathlib import Path
+from dataclasses import dataclass
 
 import torch
 import numpy as np
@@ -23,15 +27,16 @@ from PIL import Image
 import tqdm as tqdm_module
 
 from utils.adversarial_metrics import trajectory_displacement
-from utils.adversarial_eval import retrieve_yfcc_images, retrieve_osv_images
+from utils.datasets import retrieve_yfcc_images, retrieve_osv_images
+from utils.ablations import evaluate_delta_at_steps
 from utils.adversarial_utils import collect_common_image_pairs, run_paired_pipeline_with_shared_noise
 
-# Note: adversarial_eval imports and attacks imports are deferred to avoid circular imports
+# Note: attacks imports are deferred inside the loop functions to avoid circular imports.
 
 
 @dataclass
 class EvaluationConfig:
-    """Configuration for an evaluation run."""
+    """Configuration for an attack evaluation run."""
     dataset: str
     seed: int
     attack_types: List[str]
@@ -46,6 +51,15 @@ class EvaluationConfig:
     use_real_gps: bool = False
     dataset_roots: Optional[Dict[str, str]] = None
     state_suffix: str = ""
+    # Per-attack-type kwargs merged on top of the shared base only for the matching
+    # attack (e.g. ACE's target_image / l2_target loss / alpha). Lets every attack
+    # type run in a single evaluation without leaking settings into the others.
+    attack_type_kwargs: Optional[Dict[str, Dict[str, Any]]] = None
+    # Sampling-steps ablation (opt-in): re-evaluate the best perturbation of each
+    # image at every step count in ``eval_num_steps`` during the same run.
+    run_sampling_steps_ablation: bool = False
+    eval_num_steps: Optional[List[int]] = None
+    success_rate_thresholds: Optional[List[float]] = None
 
 
 @dataclass
@@ -70,7 +84,7 @@ class PrecomputedPairEvaluationConfig:
 
 class ImageLoader:
     """Unified image loading interface for different datasets."""
-    
+
     @staticmethod
     def load_images(
         dataset: str,
@@ -82,7 +96,7 @@ class ImageLoader:
         """Load images, optional GPS coordinates, and stable dataset image IDs."""
 
         dataset_roots = dataset_roots or {}
-        
+
         if dataset == "yfcc":
             return retrieve_yfcc_images(
                 n_images_to_eval=n_images,
@@ -103,22 +117,22 @@ class ImageLoader:
 
 class ResultsManager:
     """Manages saving and loading evaluation results."""
-    
+
     def __init__(self, results_dir: str, plots_dir: str):
         self.results_dir = results_dir
         self.plots_dir = plots_dir
         os.makedirs(results_dir, exist_ok=True)
         os.makedirs(plots_dir, exist_ok=True)
-    
+
     def get_results_path(self, dataset: str, attack_type: str, suffix: str = "") -> str:
         """Get the path for saving results of a specific attack type."""
         filename = f"{dataset}_{attack_type}_results{suffix}.pt"
         return os.path.join(self.results_dir, filename)
-    
+
     def get_attack_args_path(self, dataset: str) -> str:
         """Get the path for saving attack arguments."""
         return os.path.join(self.results_dir, f"{dataset}_attack_args.pt")
-    
+
     def get_metrics_path(self, dataset: str, suffix: str = "") -> str:
         """Get the path for saving metrics."""
         filename = f"{dataset}_metrics{suffix}.pt"
@@ -133,7 +147,7 @@ class ResultsManager:
         """Get the path for saving incremental evaluation state."""
         filename = f"{dataset}_seed{seed}_eval_state{suffix}.pt"
         return os.path.join(self.results_dir, filename)
-    
+
     def save_results(
         self,
         results: Dict[str, Any],
@@ -145,7 +159,7 @@ class ResultsManager:
         path = self.get_results_path(dataset, attack_type, suffix)
         torch.save(results, path)
         print(f"Saved results to: {path}")
-    
+
     def load_results(
         self,
         dataset: str,
@@ -157,7 +171,7 @@ class ResultsManager:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Results file not found: {path}")
         return torch.load(path)
-    
+
     def save_attack_args(
         self,
         attack_budgets: List[float],
@@ -173,7 +187,7 @@ class ResultsManager:
             "attack_kwargs": attack_kwargs,
         }, path)
         print(f"Saved attack args to: {path}")
-    
+
     def load_attack_args(self, dataset: str, suffix: str = "") -> Dict[str, Any]:
         """Load saved attack arguments."""
         filename = f"{dataset}_attack_args{suffix}.pt"
@@ -181,7 +195,7 @@ class ResultsManager:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Attack args file not found: {path}")
         return torch.load(path)
-    
+
     def save_metrics(
         self,
         metrics: Dict[str, Any],
@@ -230,7 +244,7 @@ class ResultsManager:
         if not os.path.exists(path):
             return None
         return torch.load(path, map_location="cpu")
-    
+
     def load_metrics(self, dataset: str, suffix: str = "") -> Dict[str, Any]:
         """Load saved metrics."""
         path = self.get_metrics_path(dataset, suffix)
@@ -240,8 +254,13 @@ class ResultsManager:
 
 
 class MetricsCollector:
-    """Unified metrics collection for evaluations."""
-    
+    """Collects per-attack metrics, restart evaluations, and sampling-steps samples.
+
+    Buffers are indexed ``[attack_type][budget_idx][image_idx]`` so a run can be
+    resumed image-by-image. The main metric tensors are NaN-initialised and filled
+    in as attacks complete.
+    """
+
     def __init__(
         self,
         attack_types: List[str],
@@ -257,7 +276,7 @@ class MetricsCollector:
         self.stored_metrics = stored_metrics
         self.source_gps = source_gps
         self.source_image_ids = source_image_ids
-        
+
         # Initialize result tensors for each attack type and metric
         self.results = {
             attack_type: {
@@ -271,6 +290,11 @@ class MetricsCollector:
             for attack_type in attack_types
         }
         self.location_results: Dict[str, List[List[Optional[Dict[str, Any]]]]] = {
+            attack_type: [[None for _ in range(n_images)] for _ in attack_budgets]
+            for attack_type in attack_types
+        }
+        # Optional sampling-steps ablation: per image, {num_steps: displacement_km}.
+        self.sampling_steps_results: Dict[str, List[List[Optional[Dict[int, float]]]]] = {
             attack_type: [[None for _ in range(n_images)] for _ in attack_budgets]
             for attack_type in attack_types
         }
@@ -326,7 +350,7 @@ class MetricsCollector:
         normalized["true_gps"] = torch.tensor(true_gps, dtype=torch.float32) if true_gps is not None else None
 
         return normalized
-    
+
     def record_metric(
         self,
         attack_type: str,
@@ -339,7 +363,7 @@ class MetricsCollector:
         if metric_name not in self.stored_metrics:
             raise ValueError(f"Unknown metric: {metric_name}")
         self.results[attack_type][metric_name][budget_index, image_index] = value
-    
+
     def record_attack_result(
         self,
         attack_type: str,
@@ -352,7 +376,7 @@ class MetricsCollector:
             raise ValueError("Attack result missing 'best_metrics' key")
 
         true_gps = self.source_gps[image_index] if self.source_gps is not None else None
-        
+
         best_metrics = attack_result["best_metrics"]
         restart_results = [
             self._normalize_restart_result(restart_result, true_gps=true_gps)
@@ -405,7 +429,17 @@ class MetricsCollector:
                     metric,
                     float(best_metrics["final_step_displacement"]),
                 )
-    
+
+    def record_sampling_steps(
+        self,
+        attack_type: str,
+        budget_index: int,
+        image_index: int,
+        displacement_by_steps: Dict[int, float],
+    ) -> None:
+        """Record the sampling-steps ablation samples for one image."""
+        self.sampling_steps_results[attack_type][budget_index][image_index] = dict(displacement_by_steps)
+
     def get_results(self) -> Dict[str, Dict[str, Any]]:
         """Get all collected results."""
         combined_results: Dict[str, Dict[str, Any]] = {}
@@ -423,21 +457,292 @@ class MetricsCollector:
     def is_task_complete(self, attack_type: str, budget_index: int, image_index: int) -> bool:
         """Check whether a specific attack/budget/image tuple has already been recorded."""
         return self.location_results[attack_type][budget_index][image_index] is not None
-    
+
     def get_attack_type_results(self, attack_type: str) -> Dict[str, torch.Tensor]:
         """Get results for a specific attack type."""
         return self.results[attack_type]
 
 
-class EvaluationRunner:
-    """Base class for running evaluations with unified logic."""
-    
-    def __init__(self, config: EvaluationConfig, pipeline):
+class BaseEvaluationRunner:
+    """Shared resume/state/save machinery for evaluation runners.
+
+    Subclasses set ``self.metrics_collector`` and the image accessors, then call
+    ``self._load_state_if_available()`` at the end of their ``__init__``. They only
+    need to declare what makes a saved state reusable: the signature dict
+    (``_build_state_signature``), which keys must match exactly
+    (``_signature_match_keys``), and how to identify a budget row for partial reuse
+    (``_budget_identity_from_signature``).
+    """
+
+    state_kind: str = "evaluation"
+
+    def __init__(self, config, pipeline):
         self.config = config
         self.pipeline = pipeline
         self.results_manager = ResultsManager(config.results_dir, config.plots_dir)
         self.state_signature = self._build_state_signature()
-        
+
+    # ---- Subclass hooks ---------------------------------------------------- #
+
+    def _build_state_signature(self) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    def _signature_match_keys(self) -> List[str]:
+        """Signature keys that must match exactly for a saved state to be reusable."""
+        raise NotImplementedError
+
+    def _budget_identity_from_signature(self, signature: Dict[str, Any], budget_idx: int) -> Any:
+        """Identity of one budget row, used to match current vs saved budgets."""
+        raise NotImplementedError
+
+    @property
+    def attack_types(self) -> List[str]:
+        """Attack types tracked by the collector (used by save/merge)."""
+        raise NotImplementedError
+
+    @property
+    def _state_image_ids(self) -> Optional[List[str]]:
+        raise NotImplementedError
+
+    @property
+    def _n_images(self) -> int:
+        raise NotImplementedError
+
+    # ---- Shared state persistence ----------------------------------------- #
+
+    def _build_state(self) -> Dict[str, Any]:
+        """Collect the current incremental state for persistence."""
+        mc = self.metrics_collector
+        results = {
+            attack_type: {
+                metric: tensor.detach().cpu()
+                for metric, tensor in attack_results.items()
+            }
+            for attack_type, attack_results in mc.results.items()
+        }
+        ids = self._state_image_ids
+        return {
+            "version": 1,
+            "signature": self.state_signature,
+            "source_image_ids": list(ids) if ids is not None else None,
+            "image_indices": list(range(self._n_images)),
+            "results": results,
+            "restart_results": mc.restart_results,
+            "location_results": mc.location_results,
+            "sampling_steps_results": mc.sampling_steps_results,
+        }
+
+    def save_state(self) -> None:
+        """Persist the current incremental evaluation state."""
+        self.results_manager.save_state(
+            self._build_state(),
+            self.config.dataset,
+            self.config.seed,
+            suffix=self.config.state_suffix,
+        )
+
+    def _load_state_if_available(self) -> None:
+        """Restore progress from a previous interrupted run when compatible."""
+        state = self.results_manager.load_state(
+            self.config.dataset,
+            self.config.seed,
+            suffix=self.config.state_suffix,
+        )
+        if state is None:
+            return
+
+        saved_signature = state.get("signature")
+        if not self._is_state_compatible(saved_signature):
+            print(f"Existing {self.state_kind} state is incompatible with the current configuration; starting fresh.")
+            return
+
+        saved_image_ids = state.get("source_image_ids")
+        if not isinstance(saved_image_ids, list):
+            print(f"Existing {self.state_kind} state does not include image IDs; starting fresh.")
+            return
+
+        current_image_ids = list(self._state_image_ids)
+        shared_n_images = min(len(saved_image_ids), len(current_image_ids))
+        if saved_image_ids[:shared_n_images] != current_image_ids[:shared_n_images]:
+            print(f"Existing {self.state_kind} state was built from a different image ordering; starting fresh.")
+            return
+
+        results = state.get("results")
+        restart_results = state.get("restart_results")
+        location_results = state.get("location_results")
+        if results is None or restart_results is None or location_results is None:
+            print(f"Existing {self.state_kind} state is incomplete; starting fresh.")
+            return
+
+        reusable_budget_pairs = self._get_reusable_budget_pairs(saved_signature)
+        if not reusable_budget_pairs:
+            print(f"Existing {self.state_kind} state has no reusable budget overlap; starting fresh.")
+            return
+
+        self._merge_saved_state(
+            results=results,
+            restart_results=restart_results,
+            location_results=location_results,
+            sampling_steps_results=state.get("sampling_steps_results"),
+            shared_n_images=shared_n_images,
+            reusable_budget_pairs=reusable_budget_pairs,
+        )
+        print(
+            f"Reused {len(reusable_budget_pairs)}/{len(self.config.attack_budgets)} budget rows from saved {self.state_kind} state."
+        )
+        print(
+            f"Resumed {self.state_kind} state from "
+            f"{self.results_manager.get_state_path(self.config.dataset, self.config.seed, self.config.state_suffix)}"
+        )
+
+    def _is_state_compatible(self, saved_signature: Any) -> bool:
+        """Check whether a saved state can be partially merged into the current run."""
+        if not isinstance(saved_signature, dict):
+            return False
+        for key in self._signature_match_keys():
+            if saved_signature.get(key) != self.state_signature.get(key):
+                return False
+        return True
+
+    def _get_reusable_budget_pairs(self, saved_signature: Dict[str, Any]) -> List[Tuple[int, int]]:
+        """Return (current_budget_idx, saved_budget_idx) pairs that are safe to reuse."""
+        saved_budgets = saved_signature.get("attack_budgets")
+        if not isinstance(saved_budgets, list):
+            return []
+
+        current_budgets = list(self.config.attack_budgets)
+        used_saved_indices: set[int] = set()
+        reusable_pairs: List[Tuple[int, int]] = []
+        for current_idx, budget in enumerate(current_budgets):
+            current_id = self._budget_identity_from_signature(self.state_signature, current_idx)
+            match_idx: Optional[int] = None
+            for saved_idx, saved_budget in enumerate(saved_budgets):
+                if saved_idx in used_saved_indices or saved_budget != budget:
+                    continue
+                if self._budget_identity_from_signature(saved_signature, saved_idx) != current_id:
+                    continue
+                match_idx = saved_idx
+                break
+            if match_idx is None:
+                continue
+            used_saved_indices.add(match_idx)
+            reusable_pairs.append((current_idx, match_idx))
+        return reusable_pairs
+
+    def _merge_saved_state(
+        self,
+        results: Any,
+        restart_results: Any,
+        location_results: Any,
+        sampling_steps_results: Any,
+        shared_n_images: int,
+        reusable_budget_pairs: List[Tuple[int, int]],
+    ) -> None:
+        """Copy overlap from a compatible saved state into current in-memory buffers."""
+        if not isinstance(results, dict) or not isinstance(restart_results, dict) or not isinstance(location_results, dict):
+            return
+
+        mc = self.metrics_collector
+        for attack_type in self.attack_types:
+            saved_attack_results = results.get(attack_type)
+            if isinstance(saved_attack_results, dict):
+                for metric in self.config.stored_metrics:
+                    saved_metric = saved_attack_results.get(metric)
+                    if not isinstance(saved_metric, torch.Tensor):
+                        continue
+                    current_metric = mc.results[attack_type][metric]
+                    image_limit = min(current_metric.shape[1], saved_metric.shape[1], shared_n_images)
+                    if image_limit == 0:
+                        continue
+                    for current_budget_idx, saved_budget_idx in reusable_budget_pairs:
+                        if current_budget_idx >= current_metric.shape[0] or saved_budget_idx >= saved_metric.shape[0]:
+                            continue
+                        current_metric[current_budget_idx, :image_limit] = (
+                            saved_metric[saved_budget_idx, :image_limit].detach().cpu()
+                        )
+
+            self._merge_per_image_lists(
+                attack_type=attack_type,
+                restart_results=restart_results,
+                location_results=location_results,
+                sampling_steps_results=sampling_steps_results,
+                shared_n_images=shared_n_images,
+                reusable_budget_pairs=reusable_budget_pairs,
+            )
+
+    def _merge_per_image_lists(
+        self,
+        attack_type: str,
+        restart_results: Any,
+        location_results: Any,
+        sampling_steps_results: Any,
+        shared_n_images: int,
+        reusable_budget_pairs: List[Tuple[int, int]],
+    ) -> None:
+        """Copy the per-image restart / location / sampling-steps buffers for one attack type."""
+        mc = self.metrics_collector
+        saved_restart_by_budget = restart_results.get(attack_type)
+        saved_location_by_budget = location_results.get(attack_type)
+        if not isinstance(saved_restart_by_budget, list) or not isinstance(saved_location_by_budget, list):
+            return
+        saved_steps_by_budget = (
+            sampling_steps_results.get(attack_type) if isinstance(sampling_steps_results, dict) else None
+        )
+
+        current_restart_by_budget = mc.restart_results[attack_type]
+        current_location_by_budget = mc.location_results[attack_type]
+        current_steps_by_budget = mc.sampling_steps_results[attack_type]
+        for current_budget_idx, saved_budget_idx in reusable_budget_pairs:
+            if current_budget_idx >= len(current_restart_by_budget) or current_budget_idx >= len(current_location_by_budget):
+                continue
+            if saved_budget_idx >= len(saved_restart_by_budget) or saved_budget_idx >= len(saved_location_by_budget):
+                continue
+
+            current_restart_by_image = current_restart_by_budget[current_budget_idx]
+            current_location_by_image = current_location_by_budget[current_budget_idx]
+            current_steps_by_image = current_steps_by_budget[current_budget_idx]
+            saved_restart_by_image = saved_restart_by_budget[saved_budget_idx]
+            saved_location_by_image = saved_location_by_budget[saved_budget_idx]
+            if not isinstance(saved_restart_by_image, list) or not isinstance(saved_location_by_image, list):
+                continue
+            saved_steps_by_image = (
+                saved_steps_by_budget[saved_budget_idx]
+                if isinstance(saved_steps_by_budget, list) and saved_budget_idx < len(saved_steps_by_budget)
+                else None
+            )
+
+            image_limit = min(
+                len(current_restart_by_image),
+                len(current_location_by_image),
+                len(saved_restart_by_image),
+                len(saved_location_by_image),
+                shared_n_images,
+            )
+            for image_idx in range(image_limit):
+                if saved_restart_by_image[image_idx] is not None:
+                    current_restart_by_image[image_idx] = saved_restart_by_image[image_idx]
+                if saved_location_by_image[image_idx] is not None:
+                    current_location_by_image[image_idx] = saved_location_by_image[image_idx]
+                if (
+                    isinstance(saved_steps_by_image, list)
+                    and image_idx < len(saved_steps_by_image)
+                    and saved_steps_by_image[image_idx] is not None
+                ):
+                    current_steps_by_image[image_idx] = saved_steps_by_image[image_idx]
+
+    def save_run_config(self, run_config: Dict[str, Any], suffix: str = "") -> None:
+        """Save the resolved experiment configuration used for the run."""
+        self.results_manager.save_run_config(run_config, self.config.dataset, suffix=suffix)
+
+
+class EvaluationRunner(BaseEvaluationRunner):
+    """Runs attacks over a dataset, with resume support and an optional ablation."""
+
+    state_kind = "evaluation"
+
+    def __init__(self, config: EvaluationConfig, pipeline):
+        super().__init__(config, pipeline)
+
         # Load images
         print(f"Loading {config.n_images} images from {config.dataset} dataset...")
         self.source_images, self.source_gps, self.source_image_ids = ImageLoader.load_images(
@@ -458,8 +763,9 @@ class EvaluationRunner:
         )
         self._load_state_if_available()
 
+    # ---- State hooks ------------------------------------------------------- #
+
     def _build_state_signature(self) -> Dict[str, Any]:
-        """Create a compact signature that guards resume compatibility."""
         return {
             "dataset": self.config.dataset,
             "seed": self.config.seed,
@@ -471,208 +777,43 @@ class EvaluationRunner:
             "use_real_gps": self.config.use_real_gps,
             "dataset_roots": self.config.dataset_roots or {},
             "state_suffix": self.config.state_suffix,
+            "run_sampling_steps_ablation": self.config.run_sampling_steps_ablation,
+            "eval_num_steps": list(self.config.eval_num_steps) if self.config.eval_num_steps else None,
+            "attack_type_kwargs": self.config.attack_type_kwargs or {},
         }
 
-    def _build_state(self) -> Dict[str, Any]:
-        """Collect the current incremental state for persistence."""
-        results = {
-            attack_type: {
-                metric: tensor.detach().cpu()
-                for metric, tensor in attack_results.items()
-            }
-            for attack_type, attack_results in self.metrics_collector.results.items()
-        }
-        return {
-            "version": 1,
-            "signature": self.state_signature,
-            "source_image_ids": list(self.source_image_ids) if self.source_image_ids is not None else None,
-            "image_indices": list(range(self.config.n_images)),
-            "results": results,
-            "restart_results": self.metrics_collector.restart_results,
-            "location_results": self.metrics_collector.location_results,
-        }
-
-    def _load_state_if_available(self) -> None:
-        """Restore progress from a previous interrupted run when compatible."""
-        state = self.results_manager.load_state(
-            self.config.dataset,
-            self.config.seed,
-            suffix=self.config.state_suffix,
-        )
-        if state is None:
-            return
-
-        saved_signature = state.get("signature")
-        if not self._is_state_compatible(saved_signature):
-            print("Existing evaluation state is incompatible with the current configuration; starting fresh.")
-            return
-
-        saved_image_ids = state.get("source_image_ids")
-        if not isinstance(saved_image_ids, list):
-            print("Existing evaluation state does not include image IDs; starting fresh.")
-            return
-
-        current_image_ids = list(self.source_image_ids)
-        shared_n_images = min(len(saved_image_ids), len(current_image_ids))
-        if saved_image_ids[:shared_n_images] != current_image_ids[:shared_n_images]:
-            print("Existing evaluation state was built from a different image ordering; starting fresh.")
-            return
-
-        results = state.get("results")
-        restart_results = state.get("restart_results")
-        location_results = state.get("location_results")
-        if results is None or restart_results is None or location_results is None:
-            print("Existing evaluation state is incomplete; starting fresh.")
-            return
-
-        reusable_budget_pairs = self._get_reusable_budget_pairs(saved_signature)
-        if not reusable_budget_pairs:
-            print("Existing evaluation state has no reusable budget overlap; starting fresh.")
-            return
-
-        self._merge_saved_state(
-            results=results,
-            restart_results=restart_results,
-            location_results=location_results,
-            shared_n_images=shared_n_images,
-            reusable_budget_pairs=reusable_budget_pairs,
-        )
-        print(
-            f"Reused {len(reusable_budget_pairs)}/{len(self.config.attack_budgets)} budget rows from saved state."
-        )
-        print(f"Resumed evaluation state from {self.results_manager.get_state_path(self.config.dataset, self.config.seed, self.config.state_suffix)}")
-
-    def _is_state_compatible(self, saved_signature: Any) -> bool:
-        """Check whether a saved state can be partially merged into the current run."""
-        if not isinstance(saved_signature, dict):
-            return False
-
-        keys_that_must_match = [
+    def _signature_match_keys(self) -> List[str]:
+        return [
             "dataset",
             "seed",
             "stored_metrics",
             "use_real_gps",
             "dataset_roots",
             "state_suffix",
+            "run_sampling_steps_ablation",
+            "eval_num_steps",
+            "attack_type_kwargs",
         ]
-        for key in keys_that_must_match:
-            if saved_signature.get(key) != self.state_signature.get(key):
-                return False
 
-        return True
+    def _budget_identity_from_signature(self, signature: Dict[str, Any], budget_idx: int) -> Any:
+        kwargs = signature.get("attack_kwargs")
+        if isinstance(kwargs, list) and budget_idx < len(kwargs):
+            return kwargs[budget_idx]
+        return None
 
-    def _get_reusable_budget_pairs(self, saved_signature: Dict[str, Any]) -> List[Tuple[int, int]]:
-        """Return (current_budget_idx, saved_budget_idx) pairs that are safe to reuse."""
-        saved_budgets = saved_signature.get("attack_budgets")
-        saved_kwargs = saved_signature.get("attack_kwargs")
-        if not isinstance(saved_budgets, list) or not isinstance(saved_kwargs, list):
-            return []
+    @property
+    def attack_types(self) -> List[str]:
+        return list(self.config.attack_types)
 
-        current_budgets = list(self.config.attack_budgets)
-        current_kwargs = list(self.config.attack_kwargs)
+    @property
+    def _state_image_ids(self) -> Optional[List[str]]:
+        return self.source_image_ids
 
-        used_saved_indices: set[int] = set()
-        reusable_pairs: List[Tuple[int, int]] = []
-        for current_idx, budget in enumerate(current_budgets):
-            current_kwarg = current_kwargs[current_idx] if current_idx < len(current_kwargs) else None
-            match_idx: Optional[int] = None
-            for saved_idx, saved_budget in enumerate(saved_budgets):
-                if saved_idx in used_saved_indices:
-                    continue
-                if saved_budget != budget:
-                    continue
-                saved_kwarg = saved_kwargs[saved_idx] if saved_idx < len(saved_kwargs) else None
-                if saved_kwarg != current_kwarg:
-                    continue
-                match_idx = saved_idx
-                break
+    @property
+    def _n_images(self) -> int:
+        return self.config.n_images
 
-            if match_idx is None:
-                continue
-            used_saved_indices.add(match_idx)
-            reusable_pairs.append((current_idx, match_idx))
-
-        return reusable_pairs
-
-    def _merge_saved_state(
-        self,
-        results: Any,
-        restart_results: Any,
-        location_results: Any,
-        shared_n_images: int,
-        reusable_budget_pairs: List[Tuple[int, int]],
-    ) -> None:
-        """Copy overlap from a compatible saved state into current in-memory buffers."""
-        if not isinstance(results, dict):
-            return
-        if not isinstance(restart_results, dict):
-            return
-        if not isinstance(location_results, dict):
-            return
-
-        for attack_type in self.config.attack_types:
-            if attack_type not in results:
-                continue
-            saved_attack_results = results.get(attack_type)
-            if not isinstance(saved_attack_results, dict):
-                continue
-
-            for metric in self.config.stored_metrics:
-                saved_metric = saved_attack_results.get(metric)
-                if not isinstance(saved_metric, torch.Tensor):
-                    continue
-                current_metric = self.metrics_collector.results[attack_type][metric]
-                image_limit = min(current_metric.shape[1], saved_metric.shape[1], shared_n_images)
-                if image_limit == 0:
-                    continue
-                for current_budget_idx, saved_budget_idx in reusable_budget_pairs:
-                    if current_budget_idx >= current_metric.shape[0] or saved_budget_idx >= saved_metric.shape[0]:
-                        continue
-                    current_metric[current_budget_idx, :image_limit] = (
-                        saved_metric[saved_budget_idx, :image_limit].detach().cpu()
-                    )
-
-            saved_restart_by_budget = restart_results.get(attack_type)
-            saved_location_by_budget = location_results.get(attack_type)
-            if not isinstance(saved_restart_by_budget, list) or not isinstance(saved_location_by_budget, list):
-                continue
-
-            current_restart_by_budget = self.metrics_collector.restart_results[attack_type]
-            current_location_by_budget = self.metrics_collector.location_results[attack_type]
-            for current_budget_idx, saved_budget_idx in reusable_budget_pairs:
-                if current_budget_idx >= len(current_restart_by_budget) or current_budget_idx >= len(current_location_by_budget):
-                    continue
-                if saved_budget_idx >= len(saved_restart_by_budget) or saved_budget_idx >= len(saved_location_by_budget):
-                    continue
-
-                current_restart_by_image = current_restart_by_budget[current_budget_idx]
-                current_location_by_image = current_location_by_budget[current_budget_idx]
-                saved_restart_by_image = saved_restart_by_budget[saved_budget_idx]
-                saved_location_by_image = saved_location_by_budget[saved_budget_idx]
-                if not isinstance(saved_restart_by_image, list) or not isinstance(saved_location_by_image, list):
-                    continue
-
-                image_limit = min(
-                    len(current_restart_by_image),
-                    len(current_location_by_image),
-                    len(saved_restart_by_image),
-                    len(saved_location_by_image),
-                    shared_n_images,
-                )
-                for image_idx in range(image_limit):
-                    if saved_restart_by_image[image_idx] is not None:
-                        current_restart_by_image[image_idx] = saved_restart_by_image[image_idx]
-                    if saved_location_by_image[image_idx] is not None:
-                        current_location_by_image[image_idx] = saved_location_by_image[image_idx]
-
-    def save_state(self) -> None:
-        """Persist the current incremental evaluation state."""
-        self.results_manager.save_state(
-            self._build_state(),
-            self.config.dataset,
-            self.config.seed,
-            suffix=self.config.state_suffix,
-        )
+    # ---- Task scheduling --------------------------------------------------- #
 
     def get_attack_configs(self, pending_only: bool = True) -> List[Tuple[str, int, int, Image.Image]]:
         """Build the evaluation task list, optionally skipping completed tasks."""
@@ -684,7 +825,7 @@ class EvaluationRunner:
                         continue
                     attack_configs.append((attack_type, budget_idx, image_idx, image))
         return attack_configs
-    
+
     def save_results(self) -> None:
         """Save collected results and attack arguments."""
         results = self.metrics_collector.get_results()
@@ -694,26 +835,68 @@ class EvaluationRunner:
                 self.config.dataset,
                 attack_type,
             )
-        
+
         self.results_manager.save_attack_args(
             self.config.attack_budgets,
             self.config.attack_kwargs,
             self.config.dataset,
         )
 
-    def save_run_config(self, run_config: Dict[str, Any], suffix: str = "") -> None:
-        """Save the resolved experiment configuration used for the run."""
-        self.results_manager.save_run_config(run_config, self.config.dataset, suffix=suffix)
+    # ---- Per-attack kwargs ------------------------------------------------- #
+
+    def merge_attack_kwargs(self, attack_type: str, budget_idx: int) -> Dict[str, Any]:
+        """Shared per-budget kwargs with the per-attack-type overrides applied on top."""
+        kwargs = dict(self.config.attack_kwargs[budget_idx])
+        kwargs.update((self.config.attack_type_kwargs or {}).get(attack_type, {}))
+        return kwargs
+
+    # ---- Sampling-steps ablation ------------------------------------------ #
+
+    def compute_sampling_steps_samples(
+        self,
+        attack_type: str,
+        budget_idx: int,
+        image: Image.Image,
+        result: Dict[str, Any],
+    ) -> Optional[Dict[int, float]]:
+        """Re-evaluate the best perturbation at every ``eval_num_steps`` count.
+
+        Returns ``{num_steps: displacement_km}`` or ``None`` when the ablation is
+        disabled or no usable delta is available. GPU work only; recording into the
+        collector is done separately so it can stay on the main thread.
+        """
+        if not self.config.run_sampling_steps_ablation:
+            return None
+        eval_num_steps = self.config.eval_num_steps or []
+        if not eval_num_steps:
+            return None
+        delta = result.get("delta")
+        if delta is None:
+            return None
+
+        kwargs = self.merge_attack_kwargs(attack_type, budget_idx)
+        return evaluate_delta_at_steps(
+            pipeline=self.pipeline,
+            source_image=image,
+            delta=delta,
+            eval_num_steps=eval_num_steps,
+            cfg=float(kwargs.get("restart_eval_cfg", 10.0)),
+            batch_size=int(kwargs.get("restart_eval_batch_size", 128)),
+            # Constant eval seed (matches the standalone evaluate_sampling_steps path):
+            # the shared evaluation noise is identical for clean vs perturbed, so the
+            # paired displacement is comparable across images and step counts.
+            seed=int(self.config.seed),
+            device=str(kwargs.get("device", "cuda")),
+        )
 
 
-class PrecomputedPairEvaluationRunner:
+class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
     """Evaluation runner for precomputed clean/attacked image pairs."""
 
+    state_kind = "precomputed evaluation"
+
     def __init__(self, config: PrecomputedPairEvaluationConfig, pipeline):
-        self.config = config
-        self.pipeline = pipeline
-        self.results_manager = ResultsManager(config.results_dir, config.plots_dir)
-        self.state_signature = self._build_state_signature()
+        super().__init__(config, pipeline)
 
         self.pairs_by_budget = [
             collect_common_image_pairs(clean_dir, attacked_dir)
@@ -748,6 +931,8 @@ class PrecomputedPairEvaluationRunner:
         )
         self._load_state_if_available()
 
+    # ---- State hooks ------------------------------------------------------- #
+
     def _build_state_signature(self) -> Dict[str, Any]:
         return {
             "dataset": self.config.dataset,
@@ -765,81 +950,8 @@ class PrecomputedPairEvaluationRunner:
             "state_suffix": self.config.state_suffix,
         }
 
-    def _build_state(self) -> Dict[str, Any]:
-        results = {
-            attack_type: {
-                metric: tensor.detach().cpu()
-                for metric, tensor in attack_results.items()
-            }
-            for attack_type, attack_results in self.metrics_collector.results.items()
-        }
-        return {
-            "version": 1,
-            "signature": self.state_signature,
-            "source_image_ids": list(self.image_ids),
-            "image_indices": list(range(len(self.image_ids))),
-            "results": results,
-            "restart_results": self.metrics_collector.restart_results,
-            "location_results": self.metrics_collector.location_results,
-        }
-
-    def _load_state_if_available(self) -> None:
-        state = self.results_manager.load_state(
-            self.config.dataset,
-            self.config.seed,
-            suffix=self.config.state_suffix,
-        )
-        if state is None:
-            return
-
-        saved_signature = state.get("signature")
-        if not self._is_state_compatible(saved_signature):
-            print("Existing precomputed evaluation state is incompatible with the current configuration; starting fresh.")
-            return
-
-        saved_image_ids = state.get("source_image_ids")
-        if not isinstance(saved_image_ids, list):
-            print("Existing precomputed evaluation state does not include image IDs; starting fresh.")
-            return
-
-        current_image_ids = list(self.image_ids)
-        shared_n_images = min(len(saved_image_ids), len(current_image_ids))
-        if saved_image_ids[:shared_n_images] != current_image_ids[:shared_n_images]:
-            print("Existing precomputed evaluation state was built from a different image ordering; starting fresh.")
-            return
-
-        results = state.get("results")
-        restart_results = state.get("restart_results")
-        location_results = state.get("location_results")
-        if results is None or restart_results is None or location_results is None:
-            print("Existing precomputed evaluation state is incomplete; starting fresh.")
-            return
-
-        reusable_budget_pairs = self._get_reusable_budget_pairs(saved_signature)
-        if not reusable_budget_pairs:
-            print("Existing precomputed evaluation state has no reusable budget overlap; starting fresh.")
-            return
-
-        self._merge_saved_state(
-            results=results,
-            restart_results=restart_results,
-            location_results=location_results,
-            shared_n_images=shared_n_images,
-            reusable_budget_pairs=reusable_budget_pairs,
-        )
-        print(
-            f"Reused {len(reusable_budget_pairs)}/{len(self.config.attack_budgets)} precomputed budget rows from saved state."
-        )
-        print(
-            f"Resumed precomputed evaluation state from {self.results_manager.get_state_path(self.config.dataset, self.config.seed, self.config.state_suffix)}"
-        )
-
-    def _is_state_compatible(self, saved_signature: Any) -> bool:
-        """Check whether a saved precomputed state can be partially merged."""
-        if not isinstance(saved_signature, dict):
-            return False
-
-        keys_that_must_match = [
+    def _signature_match_keys(self) -> List[str]:
+        return [
             "dataset",
             "attack_name",
             "seed",
@@ -850,126 +962,27 @@ class PrecomputedPairEvaluationRunner:
             "num_steps",
             "state_suffix",
         ]
-        for key in keys_that_must_match:
-            if saved_signature.get(key) != self.state_signature.get(key):
-                return False
 
-        return True
+    def _budget_identity_from_signature(self, signature: Dict[str, Any], budget_idx: int) -> Any:
+        clean_dirs = signature.get("clean_image_dirs")
+        attacked_dirs = signature.get("attacked_image_dirs")
+        clean = clean_dirs[budget_idx] if isinstance(clean_dirs, list) and budget_idx < len(clean_dirs) else None
+        attacked = attacked_dirs[budget_idx] if isinstance(attacked_dirs, list) and budget_idx < len(attacked_dirs) else None
+        return (clean, attacked)
 
-    def _get_reusable_budget_pairs(self, saved_signature: Dict[str, Any]) -> List[Tuple[int, int]]:
-        """Return (current_budget_idx, saved_budget_idx) pairs that are safe to reuse."""
-        saved_budgets = saved_signature.get("attack_budgets")
-        saved_clean_dirs = saved_signature.get("clean_image_dirs")
-        saved_attacked_dirs = saved_signature.get("attacked_image_dirs")
-        if not isinstance(saved_budgets, list) or not isinstance(saved_clean_dirs, list) or not isinstance(saved_attacked_dirs, list):
-            return []
+    @property
+    def attack_types(self) -> List[str]:
+        return [self.config.attack_name]
 
-        current_budgets = list(self.config.attack_budgets)
-        current_clean_dirs = list(self.config.clean_image_dirs)
-        current_attacked_dirs = list(self.config.attacked_image_dirs)
+    @property
+    def _state_image_ids(self) -> Optional[List[str]]:
+        return self.image_ids
 
-        used_saved_indices: set[int] = set()
-        reusable_pairs: List[Tuple[int, int]] = []
-        for current_idx, budget in enumerate(current_budgets):
-            current_clean = current_clean_dirs[current_idx] if current_idx < len(current_clean_dirs) else None
-            current_attacked = current_attacked_dirs[current_idx] if current_idx < len(current_attacked_dirs) else None
-            match_idx: Optional[int] = None
+    @property
+    def _n_images(self) -> int:
+        return len(self.image_ids)
 
-            for saved_idx, saved_budget in enumerate(saved_budgets):
-                if saved_idx in used_saved_indices:
-                    continue
-                if saved_budget != budget:
-                    continue
-                saved_clean = saved_clean_dirs[saved_idx] if saved_idx < len(saved_clean_dirs) else None
-                saved_attacked = saved_attacked_dirs[saved_idx] if saved_idx < len(saved_attacked_dirs) else None
-                if saved_clean != current_clean or saved_attacked != current_attacked:
-                    continue
-                match_idx = saved_idx
-                break
-
-            if match_idx is None:
-                continue
-            used_saved_indices.add(match_idx)
-            reusable_pairs.append((current_idx, match_idx))
-
-        return reusable_pairs
-
-    def _merge_saved_state(
-        self,
-        results: Any,
-        restart_results: Any,
-        location_results: Any,
-        shared_n_images: int,
-        reusable_budget_pairs: List[Tuple[int, int]],
-    ) -> None:
-        """Copy overlap from a compatible precomputed state into current buffers."""
-        if not isinstance(results, dict):
-            return
-        if not isinstance(restart_results, dict):
-            return
-        if not isinstance(location_results, dict):
-            return
-
-        attack_type = self.config.attack_name
-        saved_attack_results = results.get(attack_type)
-        if not isinstance(saved_attack_results, dict):
-            return
-
-        for metric in self.config.stored_metrics:
-            saved_metric = saved_attack_results.get(metric)
-            if not isinstance(saved_metric, torch.Tensor):
-                continue
-            current_metric = self.metrics_collector.results[attack_type][metric]
-            image_limit = min(current_metric.shape[1], saved_metric.shape[1], shared_n_images)
-            if image_limit == 0:
-                continue
-            for current_budget_idx, saved_budget_idx in reusable_budget_pairs:
-                if current_budget_idx >= current_metric.shape[0] or saved_budget_idx >= saved_metric.shape[0]:
-                    continue
-                current_metric[current_budget_idx, :image_limit] = (
-                    saved_metric[saved_budget_idx, :image_limit].detach().cpu()
-                )
-
-        saved_restart_by_budget = restart_results.get(attack_type)
-        saved_location_by_budget = location_results.get(attack_type)
-        if not isinstance(saved_restart_by_budget, list) or not isinstance(saved_location_by_budget, list):
-            return
-
-        current_restart_by_budget = self.metrics_collector.restart_results[attack_type]
-        current_location_by_budget = self.metrics_collector.location_results[attack_type]
-        for current_budget_idx, saved_budget_idx in reusable_budget_pairs:
-            if current_budget_idx >= len(current_restart_by_budget) or current_budget_idx >= len(current_location_by_budget):
-                continue
-            if saved_budget_idx >= len(saved_restart_by_budget) or saved_budget_idx >= len(saved_location_by_budget):
-                continue
-
-            current_restart_by_image = current_restart_by_budget[current_budget_idx]
-            current_location_by_image = current_location_by_budget[current_budget_idx]
-            saved_restart_by_image = saved_restart_by_budget[saved_budget_idx]
-            saved_location_by_image = saved_location_by_budget[saved_budget_idx]
-            if not isinstance(saved_restart_by_image, list) or not isinstance(saved_location_by_image, list):
-                continue
-
-            image_limit = min(
-                len(current_restart_by_image),
-                len(current_location_by_image),
-                len(saved_restart_by_image),
-                len(saved_location_by_image),
-                shared_n_images,
-            )
-            for image_idx in range(image_limit):
-                if saved_restart_by_image[image_idx] is not None:
-                    current_restart_by_image[image_idx] = saved_restart_by_image[image_idx]
-                if saved_location_by_image[image_idx] is not None:
-                    current_location_by_image[image_idx] = saved_location_by_image[image_idx]
-
-    def save_state(self) -> None:
-        self.results_manager.save_state(
-            self._build_state(),
-            self.config.dataset,
-            self.config.seed,
-            suffix=self.config.state_suffix,
-        )
+    # ---- Task scheduling --------------------------------------------------- #
 
     def get_attack_configs(self, pending_only: bool = True) -> List[Tuple[str, int, int, Image.Image, Image.Image]]:
         attack_configs: List[Tuple[str, int, int, Image.Image, Image.Image]] = []
@@ -1002,30 +1015,27 @@ class PrecomputedPairEvaluationRunner:
             suffix=self.config.state_suffix,
         )
 
-    def save_run_config(self, run_config: Dict[str, Any], suffix: str = "") -> None:
-        self.results_manager.save_run_config(run_config, self.config.dataset, suffix=suffix)
-
 
 def parallel_evaluate_attacks(
     runner: EvaluationRunner,
     attack_configs: List[Tuple[str, int, int, Image.Image]],  # (attack_type, budget_idx, image_idx, image)
 ) -> None:
-    """Run attacks in parallel with thread pool."""
+    """Run attacks in parallel with a thread pool (each worker on its own CUDA stream)."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     from attacks.attacks import run_attack
-    
+
     config = runner.config
     total = len(attack_configs)
-    
+
     pbar = tqdm_module.tqdm(total=total, desc="Evaluating attacks")
-    
+
     def _evaluate_task(attack_type: str, budget_idx: int, image_idx: int, image: Image.Image):
-        """Worker task for parallel evaluation."""
+        """Worker task: train the attack and (optionally) run the sampling-steps ablation."""
         eps = config.attack_budgets[budget_idx]
-        kwargs = dict(config.attack_kwargs[budget_idx])
-        
+        kwargs = runner.merge_attack_kwargs(attack_type, budget_idx)
+
         # Handle CUDA streams if requested
-        if (config.use_cuda_streams and 
+        if (config.use_cuda_streams and
             str(kwargs.get("device", "cpu")).startswith("cuda")):
             import torch
             stream = torch.cuda.Stream(device=kwargs.get("device", "cuda"))
@@ -1038,6 +1048,7 @@ def parallel_evaluate_attacks(
                     silent=True,
                     **kwargs,
                 )
+                steps_samples = runner.compute_sampling_steps_samples(attack_type, budget_idx, image, result)
             stream.synchronize()
         else:
             result = run_attack(
@@ -1048,23 +1059,28 @@ def parallel_evaluate_attacks(
                 silent=True,
                 **kwargs,
             )
-        
-        return attack_type, budget_idx, image_idx, result
-    
+            steps_samples = runner.compute_sampling_steps_samples(attack_type, budget_idx, image, result)
+
+        return attack_type, budget_idx, image_idx, result, steps_samples
+
     with ThreadPoolExecutor(max_workers=config.parallel_workers) as executor:
         futures = [
             executor.submit(_evaluate_task, at, bi, ii, img)
             for at, bi, ii, img in attack_configs
         ]
-        
+
         for future in as_completed(futures):
-            attack_type, budget_idx, image_idx, result = future.result()
+            attack_type, budget_idx, image_idx, result, steps_samples = future.result()
             runner.metrics_collector.record_attack_result(
                 attack_type,
                 budget_idx,
                 image_idx,
                 result,
             )
+            if steps_samples is not None:
+                runner.metrics_collector.record_sampling_steps(
+                    attack_type, budget_idx, image_idx, steps_samples
+                )
             runner.save_state()
             eps = config.attack_budgets[budget_idx]
             pbar.set_postfix(
@@ -1073,7 +1089,7 @@ def parallel_evaluate_attacks(
                 image=f"{image_idx+1}/{config.n_images}"
             )
             pbar.update(1)
-    
+
     pbar.close()
 
 
@@ -1087,12 +1103,12 @@ def sequential_evaluate_attacks(
     if attack_configs is None:
         attack_configs = runner.get_attack_configs(pending_only=True)
     total = len(attack_configs)
-    
+
     pbar = tqdm_module.tqdm(total=total, desc="Evaluating attacks")
-    
+
     for attack_type, budget_idx, image_idx, image in attack_configs:
         eps = config.attack_budgets[budget_idx]
-        kwargs = dict(config.attack_kwargs[budget_idx])
+        kwargs = runner.merge_attack_kwargs(attack_type, budget_idx)
 
         result = run_attack(
             attack_type=attack_type,
@@ -1108,6 +1124,11 @@ def sequential_evaluate_attacks(
             image_idx,
             result,
         )
+        steps_samples = runner.compute_sampling_steps_samples(attack_type, budget_idx, image, result)
+        if steps_samples is not None:
+            runner.metrics_collector.record_sampling_steps(
+                attack_type, budget_idx, image_idx, steps_samples
+            )
         runner.save_state()
 
         pbar.set_postfix(
@@ -1116,12 +1137,12 @@ def sequential_evaluate_attacks(
             image=f"{image_idx+1}/{config.n_images}"
         )
         pbar.update(1)
-    
+
     pbar.close()
 
 
 def run_evaluation(runner: EvaluationRunner) -> None:
-    """Execute evaluation with appropriate execution strategy."""
+    """Execute evaluation with the appropriate execution strategy."""
     attack_configs = runner.get_attack_configs(pending_only=True)
     if len(attack_configs) == 0:
         print("No pending evaluation tasks. Using existing saved state/results.")

@@ -101,18 +101,45 @@ The builder reads its defaults from [config.yaml](config.yaml). The intended lay
 python main.py list-configs
 ```
 
+## Gathering main results + ablations in one pass
+
+`evaluate-dataset` produces the main results, the **restart ablation** (always — it
+is free, derived from the per-restart evaluations done during training), and an
+opt-in **sampling-steps ablation** from a single training pass:
+
+```bash
+# Main results + restart ablation up to 10 restarts + sampling-steps ablation
+python main.py evaluate-dataset --dataset yfcc \
+  --max-restarts 10 \
+  --run-sampling-steps-ablation --eval-num-steps 16 64 250
+```
+
+- `--max-restarts N` runs each attack with N restarts (sets the restart-ablation depth).
+- `--run-sampling-steps-ablation` re-evaluates each best perturbation at every
+  `--eval-num-steps` count (extra pipeline runs, no retraining).
+
+The standalone `evaluate-restarts` and `evaluate-sampling-steps` commands still exist
+for focused runs and share the same code/JSON format.
+
 ## Output Structure
 
 After running an evaluation, check:
 
-- `results_dir` in [config.yaml](config.yaml) - All result files are saved there
-  - `{dataset}_{attack_type}_results.pt` - Metric tensors
-  - `{dataset}_{attack_type}_results.pt` also includes `image_ids` and `image_indices` so results can be mapped back to the source dataset order without storing extra per-image metadata
-  - `{dataset}_attack_args.pt` - Hyperparameters used
-- Resumable evaluations also save a state file named `{dataset}_seed{seed}_eval_state.pt` in `results_dir`, and rerunning the same evaluation resumes from the next unfinished image/budget pair when the state matches the current config
-- `plots_dir` in [config.yaml](config.yaml) - All generated plots are saved there
+- `results_dir` - all result files are saved there
+  - `{dataset}_{attack_type}_results.pt` - metric tensors; also includes `image_ids`
+    and `image_indices` so results map back to the source dataset order
+  - `{dataset}_attack_args.pt` - hyperparameters used
+  - `{dataset}_run_config.yaml` - the resolved config for the run
+  - `{dataset}_restarts_results.json` - restart-ablation data
+  - `{dataset}_sampling_steps_results.json` - sampling-steps-ablation data (when enabled)
+- Resumable evaluations save `{dataset}_seed{seed}_eval_state.pt`; rerunning the same
+  config resumes from the next unfinished image/budget pair
+- `plots_dir` - all generated plots, **plus a JSON sidecar next to each result plot**:
+  - `{dataset}_{attacks}_{metric}.json` - per-budget mean/median/q25/q75
+  - `{dataset}_{attacks}_attack_success_rate.json` - per-threshold success rates
 
-The evaluation path is intentionally thin now: `core.py` orchestrates the loop, `attacks.py` dispatches to the attack implementation, and the attack classes handle the optimization details. That keeps the hot path focused on the per-image work, which matters most for large batches.
+For strict reproducibility use `--parallel-workers 1` (or `parallel_workers: 1`);
+parallel workers + CUDA streams trade exact determinism for throughput.
 
 ## Codebase Structure
 
@@ -120,18 +147,26 @@ The refactored codebase is organized as:
 
 ```
 adversarial_demo/
-├── main.py              # CLI entry point
-├── config.yaml          # Configuration file
-├── core.py              # Refactored evaluation engine (NEW)
-├── adversarial_eval.py  # Evaluation functions (simplified)
-├── attacks.py           # Attack dispatch and execution
-├── encoder_attacks.py   # Encoder attack implementation
-├── trajectory_deviation.py  # Diffusion attack implementation
-├── plots_adversarial_attacks.py  # Plotting functions
-├── adversarial_metrics.py  # Metric computation
-├── adversarial_utils.py    # Utility functions
-├── ARCHITECTURE.md      # Detailed architecture documentation
-└── QUICKSTART.md        # This file
+├── main.py                  # CLI entry point (shared arg/context helpers)
+├── config.yaml              # Configuration file
+├── core.py                  # Evaluation engine (BaseEvaluationRunner + runners)
+├── utils/
+│   ├── adversarial_eval.py  # Evaluation entry points (thin orchestration)
+│   ├── datasets.py          # YFCC4k / OSV-5M retrieval (breaks a circular import)
+│   ├── ablations.py         # Shared restart + sampling-steps helpers
+│   ├── adversarial_metrics.py
+│   ├── adversarial_utils.py
+│   ├── pipe_trajectory.py
+│   ├── plots_adversarial_attacks.py  # Back-compat facade -> utils/plots/
+│   └── plots/               # common, maps, results (+JSON), ablations
+├── attacks/
+│   ├── attacks.py           # Attack dispatch (run_attack) + wrappers
+│   ├── attacks_core.py
+│   ├── encoder_attacks.py
+│   ├── trajectory_deviation.py
+│   └── diffusion_attack_salman.py
+├── ARCHITECTURE.md          # Detailed architecture documentation
+└── QUICKSTART.md            # This file
 ```
 
 ## Key Design Improvements

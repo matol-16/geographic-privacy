@@ -9,7 +9,7 @@ PROJECT_DIR="$(repo_root)"
 # Edit these values to match the experiment you want to run.
 CONFIG_PATH="${PROJECT_DIR}/config.yaml"
 DATASET="yfcc"
-ATTACK_TYPES=(diffusion_l2 diffusion_cosine_neg diffusion_salman encoder)
+ATTACK_TYPES=(diffusion_l2 dtd sampling encoder)
 N_IMAGES=50
 MAX_RESTARTS=10
 RESULTS_DIR="${PROJECT_DIR}/results/ablations/results_restarts_dtd_l2_cosneg_salman_encoder"

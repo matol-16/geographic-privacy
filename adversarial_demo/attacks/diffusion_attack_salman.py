@@ -1,4 +1,4 @@
-"""Diffusion attack from Salman et al. paper."""
+"""Sampling attack (Salman et al.): backpropagates through the full DDIM trajectory."""
 
 from typing import Any, Dict, Optional
 
@@ -11,11 +11,8 @@ from attacks.attacks_core import AttackBase
 from utils.adversarial_utils import compute_embedding
 
 
-class DiffusionAttack(AttackBase):
-    """Diffusion attack by Salman et a.
-        Direclty optimizes haversine distance between perturbed and clean predictions of the model (after a full DDIM sampling trajectory).
-        It backpropagates through the entire sampling trajectory.
-    """
+class SamplingAttack(AttackBase):
+    """Directly optimizes haversine distance by backpropagating through the full DDIM sampling trajectory."""
 
     def __init__(
         self,

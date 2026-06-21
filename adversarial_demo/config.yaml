@@ -37,9 +37,9 @@ pipelines:
 
 # Attack budgets (epsilon values) per dataset
 attack_budgets:
-  yfcc: [0.0157, 0.0314, 0.0628] #4,8,16/255
-  # yfcc: [0.0157, 0.0314] #4,8,16/255
-  osv: [0.0157, 0.0314, 0.0628] #4,8,16/255
+  # yfcc: [0.0157, 0.0314, 0.0628] #4,8,16/255
+  yfcc: [0.0157, 0.0314] #4,8,16/255
+  osv: [0.0157, 0.0314] #4,8,16/255
 
 # Baseline attack training arguments
 attack_train_args:
@@ -59,6 +59,14 @@ attack_train_args:
     restart_eval_batch_size: 128
     restart_eval_seed: seed
     restart_eval_num_steps: 250
+    # Per-attack-type overrides, merged on top of the above only for the matching
+    # attack so every attack type can run in a single evaluation. `ace` is targeted:
+    # it pulls the score/encoding towards target_image (l2_target loss, weight alpha).
+    per_attack:
+      ace:
+        dot_product_loss: "l2_target"
+        target_image: "/users/eleves-b/2023/mathias.ollu/repos/plonk/.media/MIST.png"
+        alpha: 1
   osv:
     n_steps: 60
     train_batch_size: 256
@@ -75,10 +83,22 @@ attack_train_args:
     restart_eval_batch_size: 128
     restart_eval_seed: seed
     restart_eval_num_steps: 250
+    per_attack:
+      ace:
+        dot_product_loss: "l2_target"
+        target_image: "/users/eleves-b/2023/mathias.ollu/repos/plonk/.media/MIST.png"
+        alpha: 1
 
 
 # Default attack types to evaluate
-attack_types: ["encoder", "diffusion", "diffusion_salman"]
+attack_types: ["encoder", "diffusion", "sampling"]
+
+# Ablation defaults (evaluate-dataset and the standalone ablation commands).
+# - max_restarts overrides num_restarts for the run so the always-on restart
+#   ablation reaches this depth. Leave null to keep the per-dataset num_restarts.
+# - eval_num_steps: sampling-step counts used by the sampling-steps ablation.
+max_restarts: 8
+eval_num_steps: [8, 16, 32, 64, 128, 250]
 
 # Localizability evaluation options
 localizability:
@@ -90,3 +110,7 @@ plot:
   plot_success_rate: true
   attack_success_rate_thresholds: [200, 750, 2500] # Distance thresholds in km
   stored_metrics: ["final_step_displacement_predicted", "final_step_displacement_true"]
+  # Opt-in: re-evaluate each best perturbation across eval_num_steps during
+  # evaluate-dataset (extra pipeline runs; no retraining). The restart ablation
+  # is always produced (it is free).
+  run_sampling_steps_ablation: true

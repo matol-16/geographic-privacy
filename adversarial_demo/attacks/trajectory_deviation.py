@@ -21,7 +21,7 @@ from utils.adversarial_utils import (
 ############################################################################################
 
 
-def _compute_dot_alignment_loss(eps_reference, eps_prediction, dot_product_loss="squared"):
+def _compute_alignment_loss(eps_reference, eps_prediction, dot_product_loss="squared"):
     """Compute alignment loss from dot products between reference and predicted directions."""
     metric_aliases = {
         "l2": "l2",
@@ -140,7 +140,7 @@ class DiffusionAttack(AttackBase):
         anchor_samples: int = 256,
         clean_num_steps: int = 200,
         target_pure_noise: bool = False,
-        dot_product_loss: str = "absolute",
+        dot_product_loss: str = "l2",
         reconstruction_loss_weight: float = 0.0,
         delta_init: float = 1e-4,
         num_restarts: int = 1,
@@ -251,7 +251,7 @@ class DiffusionAttack(AttackBase):
             eps_pred = eps
         
         # Alignment loss
-        loss = _compute_dot_alignment_loss(eps_pred, eps_pred_perturbed, dot_product_loss=self.dot_product_loss)
+        loss = _compute_alignment_loss(eps_pred, eps_pred_perturbed, dot_product_loss=self.dot_product_loss)
         
         # Reconstruction loss
         if self.reconstruction_loss_weight > 0:
@@ -422,7 +422,7 @@ class ACE(DiffusionAttack):
 
         # Term 1: score-alignment loss pulling the perturbed score towards the target
         # prediction (default l2_target = MSE; configurable via dot_product_loss).
-        score_loss = _compute_dot_alignment_loss(
+        score_loss = _compute_alignment_loss(
             eps_pred_target, eps_pred_perturbed, dot_product_loss=self.dot_product_loss
         )
         loss = score_loss

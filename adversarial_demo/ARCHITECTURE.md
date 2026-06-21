@@ -6,37 +6,51 @@ The adversarial demo code has been refactored to reduce duplication and provide 
 
 ## File Structure
 
-### Core Modules
+### CLI + engine
 
-- **`main.py`** - Command-line interface for running all experiments
-  - Provides commands: `evaluate-dataset`, `evaluate-localizability`, `plot`
-  - Supports configuration file overrides from terminal
-- **`config.yaml`** - Baseline configuration file
-  - Stores default parameters for all experiments
-  - Organized by dataset (yfcc, osv)
-  - Easily overridable from command line
+- **`main.py`** - Command-line interface for all experiments
+  - Commands: `evaluate-dataset`, `evaluate-localizability`, `evaluate-restarts`,
+    `evaluate-sampling-steps`, `evaluate-geoshield-vs-diffusion`,
+    `evaluate-sampling-steps-precomputed`, `plot`, `list-configs`
+  - Per-command boilerplate is collapsed into `prepare_training_run()` +
+    `add_common_eval_args()`; commands dispatch through `COMMAND_HANDLERS`
+  - Supports config-file overrides from the terminal (`--override key=value`)
+- **`config.yaml`** - Baseline configuration (per-dataset budgets, hyperparameters,
+  pipelines, plotting options), overridable from the command line
 
-- **`core.py`** - Refactored evaluation engine (NEW)
-  - `EvaluationConfig`: Configuration dataclass for evaluations
-  - `ImageLoader`: Unified image loading interface
-  - `ResultsManager`: Centralized results storage and loading
-  - `MetricsCollector`: Unified metric collection
-  - `EvaluationRunner`: Base class with common evaluation logic
-  - `run_evaluation()`: Executes evaluations (parallel or sequential)
+- **`core.py`** - Evaluation engine
+  - `EvaluationConfig` / `PrecomputedPairEvaluationConfig`: run configuration
+  - `ImageLoader`: dataset-agnostic image loading
+  - `ResultsManager`: results / attack-args / run-config / resumable-state I/O
+  - `MetricsCollector`: per-attack metrics, per-restart evaluations, and the
+    optional per-image sampling-steps samples
+  - `BaseEvaluationRunner`: shared resume/state/merge machinery (both runners
+    subclass it; previously this logic was duplicated)
+  - `EvaluationRunner` / `PrecomputedPairEvaluationRunner`
+  - `run_evaluation()` / `run_precomputed_pair_evaluation()`: sequential or parallel
 
-### Existing Modules (Refactored)
+### Modules
 
-- **`adversarial_eval.py`** - Evaluation entry points
-  - `evaluate_attack_on_dataset()` - Now uses core module
-  - `evaluate_localizability()` - Now uses core module
-  - `evaluate_attack_transferability()` - Kept for direct API (not in CLI)
-
-- **`attacks.py`** - Attack dispatch and execution
-- **`encoder_attacks.py`** - Encoder attack implementation
-- **`trajectory_deviation.py`** - Diffusion attack implementation
-- **`adversarial_metrics.py`** - Metric computation
-- **`adversarial_utils.py`** - Utility functions
-- **`plots_adversarial_attacks.py`** - Plotting functions
+- **`utils/adversarial_eval.py`** - Evaluation entry points (thin orchestration)
+  - `evaluate_attack_on_dataset()` - main results **plus** the restart ablation
+    (always) and the sampling-steps ablation (opt-in), from one training pass
+  - `evaluate_localizability()`, `evaluate_restarts()`, `evaluate_sampling_steps()`,
+    `evaluate_sampling_steps_precomputed()`, `merge_sampling_steps_results()`
+- **`utils/datasets.py`** - YFCC4k / OSV-5M retrieval (split out so `core.py` no
+  longer needs `adversarial_eval.py`, removing a circular import)
+- **`utils/ablations.py`** - shared ablation building blocks: `best_after_k`,
+  `evaluate_delta_at_steps`, and the restart / sampling-steps JSON builders. Used
+  by both `evaluate-dataset` and the standalone ablation commands
+- **`utils/plots/`** - plotting package: `common` (data helpers + JSON dumping),
+  `maps`, `results` (displacement + success-rate, also write JSON), `ablations`.
+  `utils/plots_adversarial_attacks.py` re-exports everything for back-compat
+- **`attacks/attacks.py`** - attack dispatch (`run_attack`) + per-attack wrappers
+  sharing `_build_shared_x0_bank()`
+- **`attacks/encoder_attacks.py`**, **`attacks/trajectory_deviation.py`**,
+  **`attacks/diffusion_attack_salman.py`**, **`attacks/attacks_core.py`** - attack
+  implementations (numerical mechanisms, left unchanged)
+- **`utils/adversarial_metrics.py`** - metric computation
+- **`utils/adversarial_utils.py`** - device/image/embedding/config utilities
 
 ## Usage Examples
 
@@ -135,15 +149,57 @@ python main.py evaluate-dataset --dataset yfcc
 python main.py evaluate-dataset --dataset yfcc --parallel-workers 4
 ```
 
+## Integrated ablations (evaluate-dataset)
+
+A single `evaluate-dataset` training pass produces the main results and both ablations:
+
+- **Main results**: best-restart displacement per image → displacement and
+  success-rate plots.
+- **Restart ablation (always on)**: best-displacement-after-k-restarts, derived for
+  free from the per-restart evaluations already collected during training. It reaches
+  depth `num_restarts`; raise it for a run with `--max-restarts N`.
+- **Sampling-steps ablation (opt-in)**: `--run-sampling-steps-ablation` re-evaluates
+  each image's best perturbation at every count in `--eval-num-steps` (extra pipeline
+  runs, no retraining).
+
+```bash
+python main.py evaluate-dataset --dataset yfcc \
+  --max-restarts 10 \
+  --run-sampling-steps-ablation --eval-num-steps 16 64 250
+```
+
+The standalone `evaluate-restarts` / `evaluate-sampling-steps` commands remain for
+focused runs and share the same `utils/ablations.py` code path (identical JSON).
+
 ## Results Structure
 
-All results are automatically saved to `./results/` by default:
+Results are saved to the configured `results_dir` (default `./results/`):
 
-- `{dataset}_{attack_type}_results.pt` - Metric tensors [budgets, images]
-- `{dataset}_attack_args.pt` - Attack parameters used
-- `{dataset}_metrics_localizability.pt` - Localizability evaluation results
+- `{dataset}_{attack_type}_results.pt` - metric tensors [budgets, images] (+ image
+  ids/indices, per-restart and per-image location results)
+- `{dataset}_attack_args.pt` - attack parameters used
+- `{dataset}_run_config{suffix}.yaml` - resolved config for the run (reproducibility)
+- `{dataset}_seed{seed}_eval_state{suffix}.pt` - resumable state; rerunning the same
+  config resumes from the next unfinished image/budget pair
+- `{dataset}_restarts_results.json` - restart ablation data
+- `{dataset}_sampling_steps_results.json` - sampling-steps ablation data
+- `{dataset}_metrics_localizability.pt` - localizability evaluation results
 
-Plots are saved to `./plots/` by default.
+Plots are saved to `plots_dir` (default `./plots/`). Every result/success-rate plot
+now writes a JSON sidecar next to the PNG with the plotted numbers:
+
+- `{dataset}_{attacks}_{metric}.json` - per-budget mean/median/q25/q75 (+ sample counts)
+- `{dataset}_{attacks}_attack_success_rate.json` - per-threshold, per-budget success rates
+
+## Reproducibility
+
+- Every command calls `seed_everything(seed)`; image selection is seeded and
+  prefix-stable (the first N of a large run match a smaller run).
+- The global `seed` flows into `restart_eval_seed`, and the sampling-steps re-eval
+  uses a fixed evaluation seed so clean vs perturbed share identical noise.
+- For strict bitwise reproducibility use `parallel_workers: 1`. With
+  `parallel_workers > 1`, the thread pool + per-worker CUDA streams can reorder GPU
+  ops, which may perturb results slightly; parallelism is a throughput option.
 
 ## Configuration Management
 

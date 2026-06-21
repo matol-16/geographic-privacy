@@ -8,10 +8,10 @@ from typing import Any, Callable, Dict, Optional
 import torch
 from PIL import Image
 
-from utils.adversarial_utils import filter_kwargs_for, add_perturbation_to_image, resolve_torch_device
+from utils.adversarial_utils import resolve_torch_device
 from attacks.encoder_attacks import EncoderAttack
 from attacks.trajectory_deviation import DiffusionAttack, ACE, UniDef
-from attacks.diffusion_attack_salman import DiffusionAttack as SalmanDiffusionAttack
+from attacks.diffusion_attack_salman import SamplingAttack
 
 
 def _run_restartable_attack(
@@ -76,6 +76,29 @@ def _run_restartable_attack(
 	return attack.finalize_result(attack_type=attack_type, **finalize_kwargs)
 
 
+def _build_shared_x0_bank(
+	pipeline,
+	source_image: Image.Image,
+	anchor_samples: int,
+	clean_num_steps: int,
+	device: str,
+	show_progress: bool,
+) -> torch.Tensor:
+	"""Build the clean-model x0 bank once so it can be reused across all restarts (KEY OPTIMIZATION)."""
+	from attacks.trajectory_deviation import build_x0_bank_from_clean_model
+
+	if show_progress:
+		print("Building x0 bank (shared across restarts)...")
+	return build_x0_bank_from_clean_model(
+		pipeline,
+		source_image,
+		n_samples=anchor_samples,
+		num_steps=clean_num_steps,
+		cfg=0.0,
+		device=device,
+	)
+
+
 def run_attack(
 	attack_type: str,
 	source_image: Image.Image,
@@ -91,7 +114,7 @@ def run_attack(
 	chosen attack class will be forwarded (unrecognised keys are ignored).
 
 	Args:
-		attack_type: "encoder", "diffusion", "ace", or "diffusion_salman".
+		attack_type: "encoder", "diffusion", "ace", "sampling", or "diffusion_salman" (alias).
 		source_image: PIL source image to attack.
 		pipeline: PLONK pipeline instance.
 		target_image: Target image for targeted attacks ("encoder" and "ace").
@@ -118,10 +141,12 @@ def run_attack(
 		"enc": "encoder",
 		"diffusion": "diffusion",
 		"diff": "diffusion",
-		"diffusion_salman": "diffusion_salman",
-		"salman": "diffusion_salman",
+		"sampling": "sampling",
+		"diffusion_salman": "sampling",  # backward-compatible alias for Sampling
+		"salman": "sampling",            # backward-compatible alias for Sampling
 		"diffusion_l2": "diffusion_l2",
-		"diffusion_cosine_neg": "diffusion_cosine_neg",
+		"dtd": "dtd",
+		"diffusion_cosine_neg": "dtd",  # backward-compatible alias for DTD
 		"ace": "ace",
 		"diffusion_target": "ace",
 		"dtd_target": "ace",
@@ -129,6 +154,7 @@ def run_attack(
 		"unidef": "unidef",
 		"uni_def": "unidef",
 		"cdd": "unidef",
+		"unidef_nofdje": "unidef_nofdje",
 	}
 	normalized_type = aliases.get(str(attack_type).lower())
 	if normalized_type is None:
@@ -158,12 +184,20 @@ def run_attack(
 			attack_type_label="diffusion_l2",
 			**kwargs
 		)
-	if normalized_type == "diffusion_cosine_neg":
+	if normalized_type == "dtd":
+		# DTD (Diffusion Trajectory Deviation): raw (signed) cosine-similarity
+		# objective between the clean and perturbed eps predictions.
 		kwargs["dot_product_loss"] = "cosine_similarity_negative"
 		return _run_diffusion_attack(
 			source_image=source_image,
 			pipeline=pipeline,
-			attack_type_label="diffusion_cosine_neg",
+			attack_type_label="dtd",
+			**kwargs
+		)
+	if normalized_type == "sampling":
+		return _run_diffusion_salman_attack(
+			source_image=source_image,
+			pipeline=pipeline,
 			**kwargs
 		)
 	if normalized_type == "ace":
@@ -179,11 +213,15 @@ def run_attack(
 			pipeline=pipeline,
 			**kwargs
 		)
-	return _run_diffusion_salman_attack(
-		source_image=source_image,
-		pipeline=pipeline,
-		**kwargs
-	)
+	if normalized_type == "unidef_nofdje":
+		kwargs["use_fdje"] = False
+		return _run_unidef_attack(
+			source_image=source_image,
+			pipeline=pipeline,
+			attack_type_label="unidef_nofdje",
+			**kwargs
+		)
+	raise ValueError(f"Unhandled normalized attack type: {normalized_type}")
 
 
 def _run_encoder_attack(
@@ -273,18 +311,13 @@ def _run_diffusion_attack(
 	**kwargs,  # Absorb unused kwargs
 ) -> Dict[str, Any]:
 	"""Run diffusion attack with optimizations: shared x0_bank, early stopping, and parallel restarts."""
-	from attacks.trajectory_deviation import build_x0_bank_from_clean_model
-
-	# Build x0_bank once and reuse across all restarts (KEY OPTIMIZATION)
-	if show_progress:
-		print("Building x0 bank (shared across restarts)...")
-	x0_bank = build_x0_bank_from_clean_model(
+	x0_bank = _build_shared_x0_bank(
 		pipeline,
 		source_image,
-		n_samples=anchor_samples,
-		num_steps=clean_num_steps,
-		cfg=0.0,
+		anchor_samples=anchor_samples,
+		clean_num_steps=clean_num_steps,
 		device=device,
+		show_progress=show_progress,
 	)
 
 	# Create attack with shared x0_bank
@@ -354,8 +387,6 @@ def _run_ace_attack(
 
 	Combines a target score-alignment term with an encoder l2 term weighted by ``alpha``.
 	"""
-	from attacks.trajectory_deviation import build_x0_bank_from_clean_model
-
 	if target_image is None:
 		raise ValueError("attack_type='ace' requires a target_image.")
 
@@ -364,16 +395,13 @@ def _run_ace_attack(
 	if isinstance(target_image, str):
 		target_image = Image.open(target_image).convert("RGB")
 
-	# Build x0_bank once and reuse across all restarts (KEY OPTIMIZATION)
-	if show_progress:
-		print("Building x0 bank (shared across restarts)...")
-	x0_bank = build_x0_bank_from_clean_model(
+	x0_bank = _build_shared_x0_bank(
 		pipeline,
 		source_image,
-		n_samples=anchor_samples,
-		num_steps=clean_num_steps,
-		cfg=0.0,
+		anchor_samples=anchor_samples,
+		clean_num_steps=clean_num_steps,
 		device=device,
+		show_progress=show_progress,
 	)
 
 	# Create attack with shared x0_bank
@@ -442,21 +470,17 @@ def _run_unidef_attack(
 	device: str = "cuda",
 	early_stopping_patience: int = 0,  # 0=disabled, >0=stop if no improvement for N steps
 	num_restart_workers: int = 1,  # Number of parallel workers for restarts; 1=sequential
+	attack_type_label: str = "unidef",  # Label stored in result dict
 	**kwargs,  # Absorb unused kwargs
 ) -> Dict[str, Any]:
 	"""Run the UniDef attack: global trajectory deviation (CDD) with optional FDJE."""
-	from attacks.trajectory_deviation import build_x0_bank_from_clean_model
-
-	# Build x0_bank once and reuse across all restarts (KEY OPTIMIZATION)
-	if show_progress:
-		print("Building x0 bank (shared across restarts)...")
-	x0_bank = build_x0_bank_from_clean_model(
+	x0_bank = _build_shared_x0_bank(
 		pipeline,
 		source_image,
-		n_samples=anchor_samples,
-		num_steps=clean_num_steps,
-		cfg=0.0,
+		anchor_samples=anchor_samples,
+		clean_num_steps=clean_num_steps,
 		device=device,
+		show_progress=show_progress,
 	)
 
 	attack = UniDef(
@@ -485,7 +509,7 @@ def _run_unidef_attack(
 
 	return _run_restartable_attack(
 		attack=attack,
-		attack_type="unidef",
+		attack_type=attack_type_label,
 		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
 		show_progress=show_progress,
 		early_stopping_patience=early_stopping_patience,
@@ -525,7 +549,7 @@ def _run_diffusion_salman_attack(
 	**kwargs,
 ) -> Dict[str, Any]:
 	"""Run the Salman diffusion attack through the full sampling trajectory."""
-	attack = SalmanDiffusionAttack(
+	attack = SamplingAttack(
 		pipeline=pipeline,
 		source_image=source_image,
 		n_steps=n_steps,
@@ -547,7 +571,7 @@ def _run_diffusion_salman_attack(
 
 	return _run_restartable_attack(
 		attack=attack,
-		attack_type="diffusion_salman",
+		attack_type="sampling",
 		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
 		show_progress=show_progress,
 		early_stopping_patience=early_stopping_patience,
@@ -557,33 +581,4 @@ def _run_diffusion_salman_attack(
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
 	)
-
-
-def run_attack_and_build_image(
-	attack_type: str,
-	source_image: Image.Image,
-	pipeline,
-	**kwargs,
-) -> Dict[str, Any]:
-	"""
-	Run an attack and directly return the perturbed PIL image.
-
-	Returns a dict with:
-	  - attack_result: output of run_attack(...)
-	  - perturbed_image: PIL image built from source_image + learned delta
-   
-   Not used !
-	"""
-	attack_result = run_attack(
-		attack_type=attack_type,
-		source_image=source_image,
-		pipeline=pipeline,
-		**kwargs,
-	)
-	perturbed_image = add_perturbation_to_image(source_image, attack_result["delta"], pipeline)
-
-	return {
-		"attack_result": attack_result,
-		"perturbed_image": perturbed_image,
-	}
 
