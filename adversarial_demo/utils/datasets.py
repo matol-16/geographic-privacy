@@ -15,13 +15,15 @@ import csv
 import os
 import random
 import zipfile
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
 from huggingface_hub import hf_hub_download
 
 GpsCoord = Tuple[float, float]
 RetrievedImages = Tuple[List[Image.Image], List[GpsCoord], List[str]]
+# (image path, (lat, lon), image id) for the seeded selection, without loading pixels.
+ImageMetadata = Tuple[str, GpsCoord, str]
 
 
 def load_osv5m_test(local_dir: str = "/Data/mathias.ollu/hf_cache/datasets/osv5m") -> None:
@@ -92,10 +94,19 @@ def select_yfcc_image_paths(
     Uses the exact same selection as ``retrieve_yfcc_images`` so external tooling
     (e.g. GeoShield) can attack/evaluate the same images as the attack backbone.
     """
+    return [path for path, _, _ in select_yfcc_image_metadata(n_images_to_eval, seed, local_dir)]
+
+
+def select_yfcc_image_metadata(
+    n_images_to_eval: int = 100,
+    seed: int = 0,
+    local_dir: Optional[str] = None,
+) -> List[ImageMetadata]:
+    """(path, (lat, lon), id) for the seeded YFCC4k selection, without loading pixels."""
     if local_dir is None:
         local_dir = _default_yfcc_dir()
     samples = _select_prefix_stable(_load_yfcc_rows(local_dir), n_images_to_eval, seed)
-    return [s["path"] for s in samples]
+    return [(s["path"], (s["latitude"], s["longitude"]), str(s["id"])) for s in samples]
 
 
 def retrieve_yfcc_images(
@@ -144,6 +155,44 @@ def retrieve_yfcc_images(
     return source_images, source_gps, source_image_ids
 
 
+def _default_osv_dir() -> str:
+    return "/Data/mathias.ollu/hf_cache/datasets/osv5m"
+
+
+def _load_osv_rows(local_dir: str) -> List[dict]:
+    """Read the OSV-5M test split and keep only rows whose image exists on disk.
+
+    Returns rows shaped like the YFCC rows ({id, path, latitude, longitude}) so the
+    shared ``_select_prefix_stable`` selection applies to both datasets identically.
+    """
+    load_osv5m_test(local_dir=local_dir)  # download & extract if needed
+
+    csv_path = os.path.join(local_dir, "test.csv")
+    with open(csv_path, "r") as f:
+        reader = csv.DictReader(f)
+        rows = list(reader)
+
+    img_dir = os.path.join(local_dir, "images", "test")
+    subdirs = sorted(d for d in os.listdir(img_dir) if os.path.isdir(os.path.join(img_dir, d)))
+    id_to_path = {}
+    for sd in subdirs:
+        sd_path = os.path.join(img_dir, sd)
+        for fname in os.listdir(sd_path):
+            img_id = os.path.splitext(fname)[0]
+            id_to_path[img_id] = os.path.join(sd_path, fname)
+
+    return [
+        {
+            "id": r["id"],
+            "path": id_to_path[r["id"]],
+            "latitude": float(r["latitude"]),
+            "longitude": float(r["longitude"]),
+        }
+        for r in rows
+        if r["id"] in id_to_path
+    ]
+
+
 def retrieve_osv_images(
     n_images_to_eval: int = 100,
     seed: int = 0,
@@ -152,36 +201,42 @@ def retrieve_osv_images(
 ) -> RetrievedImages:
     """Load up to ``n_images_to_eval`` OSV-5M test images with their ground-truth GPS labels."""
     if local_dir is None:
-        local_dir = "/Data/mathias.ollu/hf_cache/datasets/osv5m"
-    load_osv5m_test(local_dir=local_dir)  # download & extract if needed
+        local_dir = _default_osv_dir()
+    # Same seeded, prefix-stable selection as YFCC (and as select_osv_image_metadata).
+    samples = _select_prefix_stable(_load_osv_rows(local_dir), n_images_to_eval, seed)
 
-    # Load test metadata from CSV
-    csv_path = os.path.join(local_dir, "test.csv")
-    with open(csv_path, "r") as f:
-        reader = csv.DictReader(f)
-        rows = list(reader)
-
-    img_dir = os.path.join(local_dir, "images", "test")
-    subdirs = sorted(d for d in os.listdir(img_dir) if os.path.isdir(os.path.join(img_dir, d)))
-    # Build a lookup: image_id -> file path
-    id_to_path = {}
-    for sd in subdirs:
-        sd_path = os.path.join(img_dir, sd)
-        for fname in os.listdir(sd_path):
-            img_id = os.path.splitext(fname)[0]
-            id_to_path[img_id] = os.path.join(sd_path, fname)
-
-    # Keep only rows whose image exists on disk
-    rows = [r for r in rows if r["id"] in id_to_path]
-
-    # Keep selection prefix-stable across different n_images_to_eval values.
-    rows = sorted(rows, key=lambda r: str(r["id"]))
-    rng = random.Random(seed)
-    rng.shuffle(rows)
-    samples = rows[: min(n_images_to_eval, len(rows))]
-
-    source_images = [Image.open(id_to_path[s["id"]]).convert("RGB") for s in samples]
-    source_gps = [(float(s["latitude"]), float(s["longitude"])) for s in samples]
-    source_image_ids = [s["id"] for s in samples]
+    source_images = [Image.open(s["path"]).convert("RGB") for s in samples]
+    source_gps = [(s["latitude"], s["longitude"]) for s in samples]
+    source_image_ids = [str(s["id"]) for s in samples]
     print(f"Loaded {len(source_images)} images from OSV-5M test set.")
     return source_images, source_gps, source_image_ids
+
+
+def select_osv_image_metadata(
+    n_images_to_eval: int = 100,
+    seed: int = 0,
+    local_dir: Optional[str] = None,
+) -> List[ImageMetadata]:
+    """(path, (lat, lon), id) for the seeded OSV-5M selection, without loading pixels."""
+    if local_dir is None:
+        local_dir = _default_osv_dir()
+    samples = _select_prefix_stable(_load_osv_rows(local_dir), n_images_to_eval, seed)
+    return [(s["path"], (s["latitude"], s["longitude"]), str(s["id"])) for s in samples]
+
+
+def select_image_metadata(
+    dataset: str,
+    n_images_to_eval: int = 100,
+    seed: int = 0,
+    local_dir: Optional[str] = None,
+) -> List[ImageMetadata]:
+    """Dataset-agnostic seeded selection of (path, (lat, lon), id), without loading pixels.
+
+    Matches the order/selection used by ``retrieve_{yfcc,osv}_images`` so external tooling
+    (GeoShield) attacks/evaluates exactly the same images as the in-process attacks.
+    """
+    if dataset == "yfcc":
+        return select_yfcc_image_metadata(n_images_to_eval, seed, local_dir)
+    if dataset == "osv":
+        return select_osv_image_metadata(n_images_to_eval, seed, local_dir)
+    raise ValueError(f"Unknown dataset: {dataset}")

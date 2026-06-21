@@ -4,9 +4,12 @@ Command-line interface for adversarial attack experiments.
 
 Commands:
   - evaluate-dataset: Evaluate attacks on a dataset (main results + restart ablation,
-    optional sampling-steps ablation, all from a single training pass)
+    optional sampling-steps / robustness ablations, all from a single training pass).
+    GeoShield can be folded in as just another attack by listing `geoshield` in
+    --attack-types (generated out-of-process, then overlaid in the combined plots).
   - evaluate-localizability: Evaluate attack effectiveness by image localizability
-  - evaluate-geoshield-vs-diffusion: Evaluate precomputed clean/attacked pairs
+  - evaluate-geoshield-vs-diffusion: Evaluate precomputed clean/attacked pairs (the
+    standalone GeoShield path; the integrated path above is usually preferred)
   - evaluate-restarts / evaluate-sampling-steps / evaluate-robustness: standalone ablations
   - evaluate-sampling-steps-precomputed: sampling-steps ablation for precomputed pairs
   - plot: Plot saved results or attack success rates
@@ -16,6 +19,7 @@ Usage:
   python main.py evaluate-dataset --dataset yfcc --attack-types encoder diffusion
   python main.py evaluate-dataset --dataset yfcc --run-sampling-steps-ablation
   python main.py evaluate-dataset --dataset yfcc --attack-types dtd --run-robustness-ablation
+  python main.py evaluate-dataset --dataset yfcc --attack-types dtd encoder geoshield
   python main.py evaluate-localizability --dataset osv
   python main.py plot success-rate --dataset yfcc
 """
@@ -295,8 +299,21 @@ def prepare_training_run(args, config: Dict[str, Any], default_n_images: int) ->
 
 
 def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
-    """Evaluate attacks on a dataset (main results + restart/sampling-steps ablations)."""
+    """Evaluate attacks on a dataset (main results + restart/sampling-steps ablations).
+
+    GeoShield, an out-of-process attack, is folded in here as "just another attack":
+    list ``geoshield`` in ``--attack-types`` (or set ``geoshield.enabled``) and it is
+    generated + evaluated after the trainable attacks and overlaid in the combined plot.
+    """
     ctx = prepare_training_run(args, config, default_n_images=100)
+
+    # GeoShield is generated out-of-process, so split it off from the trainable attacks.
+    geoshield_cfg = config.get("geoshield", {}) or {}
+    geoshield_name = geoshield_cfg.get("attack_name", "geoshield")
+    run_geoshield = bool(
+        get_nested_config(config, "geoshield", "enabled", default=False)
+    ) or (geoshield_name in ctx.attack_types)
+    trainable_attack_types = [at for at in ctx.attack_types if at != geoshield_name]
 
     parallel_workers = pick_value(args.parallel_workers, config.get("parallel_workers"), 1)
     plot_gps_true = bool(get_nested_config(config, "plot", "gps_true", default=False))
@@ -344,42 +361,122 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
         sampling_steps_ablation=run_sampling_steps_ablation,
         robustness_ablation=run_robustness_ablation,
         robustness_attack_types=robustness_attack_types if run_robustness_ablation else None,
+        geoshield=run_geoshield,
         max_restarts=max_restarts,
     )
 
-    evaluate_attack_on_dataset(
-        attack_types=ctx.attack_types,
-        pipeline=ctx.pipeline,
-        dataset_name=ctx.dataset,
-        source_image=None,
-        seed=ctx.seed,
-        use_real_gps=pick_value(args.use_real_gps, config.get("use_real_gps"), False),
-        n_images_to_eval=ctx.n_images,
-        plot_dir=ctx.plots_dir,
-        results_dir=ctx.results_dir,
-        attack_budgets=ctx.attack_budgets,
-        stored_metrics=get_nested_config(config, "plot", "stored_metrics", default=DEFAULT_STORED_METRICS),
-        attack_kwargs=ctx.attack_kwargs,
-        parallel_workers=parallel_workers,
-        use_cuda_streams=bool(config.get("use_cuda_streams", True)),
-        dataset_roots=config.get("data_dirs", {}),
-        plot_success_rate=plot_success_rate,
-        plot_success_rate_thresholds=success_rate_thresholds,
-        plot_gps_true=plot_gps_true,
-        config_dump=config,
-        max_restarts=max_restarts,
-        run_sampling_steps_ablation=run_sampling_steps_ablation,
-        eval_num_steps=eval_num_steps,
-        attack_type_kwargs=ctx.attack_type_kwargs,
-        run_robustness_ablation=run_robustness_ablation,
-        robustness_attack_types=robustness_attack_types,
-        robustness_jpeg_quality_factors=robustness_jpeg_quality_factors,
-        robustness_gaussian_blur_sigmas=robustness_gaussian_blur_sigmas,
-        robustness_num_steps=robustness_num_steps,
-    )
+    if trainable_attack_types:
+        evaluate_attack_on_dataset(
+            attack_types=trainable_attack_types,
+            pipeline=ctx.pipeline,
+            dataset_name=ctx.dataset,
+            source_image=None,
+            seed=ctx.seed,
+            use_real_gps=pick_value(args.use_real_gps, config.get("use_real_gps"), False),
+            n_images_to_eval=ctx.n_images,
+            plot_dir=ctx.plots_dir,
+            results_dir=ctx.results_dir,
+            attack_budgets=ctx.attack_budgets,
+            stored_metrics=get_nested_config(config, "plot", "stored_metrics", default=DEFAULT_STORED_METRICS),
+            attack_kwargs=ctx.attack_kwargs,
+            parallel_workers=parallel_workers,
+            use_cuda_streams=bool(config.get("use_cuda_streams", True)),
+            dataset_roots=config.get("data_dirs", {}),
+            plot_success_rate=plot_success_rate,
+            plot_success_rate_thresholds=success_rate_thresholds,
+            plot_gps_true=plot_gps_true,
+            config_dump=config,
+            max_restarts=max_restarts,
+            run_sampling_steps_ablation=run_sampling_steps_ablation,
+            eval_num_steps=eval_num_steps,
+            attack_type_kwargs=ctx.attack_type_kwargs,
+            run_robustness_ablation=run_robustness_ablation,
+            robustness_attack_types=robustness_attack_types,
+            robustness_jpeg_quality_factors=robustness_jpeg_quality_factors,
+            robustness_gaussian_blur_sigmas=robustness_gaussian_blur_sigmas,
+            robustness_num_steps=robustness_num_steps,
+        )
+
+    # GeoShield: generate out-of-process, evaluate the pairs, overlay in combined plots.
+    if run_geoshield:
+        _run_geoshield_step(
+            config=config,
+            ctx=ctx,
+            geoshield_cfg=geoshield_cfg,
+            geoshield_name=geoshield_name,
+            trainable_attack_types=trainable_attack_types,
+            plot_success_rate=plot_success_rate,
+            success_rate_thresholds=success_rate_thresholds,
+            plot_gps_true=plot_gps_true,
+        )
 
     print(f"\nEvaluation complete! Results saved to: {ctx.results_dir}")
     print(f"Plots saved to: {ctx.plots_dir}")
+
+
+def _run_geoshield_step(
+    config: Dict[str, Any],
+    ctx: "TrainingRunContext",
+    geoshield_cfg: Dict[str, Any],
+    geoshield_name: str,
+    trainable_attack_types: List[str],
+    plot_success_rate: bool,
+    success_rate_thresholds: List[float],
+    plot_gps_true: bool,
+) -> None:
+    """Generate + evaluate GeoShield, then re-plot the combined results (trainable + GeoShield).
+
+    GeoShield has no ground-truth GPS in the precomputed-pair evaluator, so it is
+    predicted-only; the combined success-rate / displacement plots therefore use the
+    predicted metric (``gps_true=False``).
+    """
+    from utils.geoshield import generate_geoshield_pairs
+
+    clean_dirs, attacked_dirs = generate_geoshield_pairs(
+        config=config,
+        dataset=ctx.dataset,
+        n_images=ctx.n_images,
+        attack_budgets=ctx.attack_budgets,
+        seed=ctx.seed,
+        geoshield_cfg=geoshield_cfg,
+    )
+    run_precomputed_attack_eval(
+        pipeline=ctx.pipeline,
+        dataset=ctx.dataset,
+        attack_name=geoshield_name,
+        attack_budgets=ctx.attack_budgets,
+        clean_image_dirs=clean_dirs,
+        attacked_image_dirs=attacked_dirs,
+        n_images=ctx.n_images,
+        seed=ctx.seed,
+        device=get_device(config),
+        results_dir=ctx.results_dir,
+        plots_dir=ctx.plots_dir,
+        stored_metrics=_precomputed_stored_metrics(config),
+        run_config=config,
+    )
+
+    # Overlay GeoShield with the trainable attacks in one combined set of plots.
+    combined_attack_types = trainable_attack_types + [geoshield_name]
+    plot_results(
+        results_dir=ctx.results_dir,
+        attack_budgets=ctx.attack_budgets,
+        plot_dir=ctx.plots_dir,
+        dataset_name=ctx.dataset,
+        attack_types=combined_attack_types,
+        all_results=None,
+        stored_metrics=get_nested_config(config, "plot", "stored_metrics", default=DEFAULT_STORED_METRICS),
+    )
+    if plot_success_rate:
+        plot_attack_success_rate(
+            results_dir=ctx.results_dir,
+            attack_budgets=ctx.attack_budgets,
+            plot_dir=ctx.plots_dir,
+            dataset_name=ctx.dataset,
+            attack_types=combined_attack_types,
+            threshold_km=list(success_rate_thresholds),
+            gps_true=plot_gps_true,
+        )
 
 
 def cmd_evaluate_localizability(args, config: Dict[str, Any]) -> None:
@@ -548,6 +645,56 @@ def cmd_evaluate_robustness(args, config: Dict[str, Any]) -> None:
     print(f"Plots saved to: {ctx.plots_dir}")
 
 
+def run_precomputed_attack_eval(
+    pipeline,
+    dataset: str,
+    attack_name: str,
+    attack_budgets: List[float],
+    clean_image_dirs: List[str],
+    attacked_image_dirs: List[str],
+    n_images: Optional[int],
+    seed: int,
+    device: str,
+    results_dir: str,
+    plots_dir: str,
+    stored_metrics: List[str],
+    run_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Evaluate precomputed clean/attacked pairs and persist results like any attack.
+
+    Shared by ``evaluate-geoshield-vs-diffusion`` and the GeoShield step folded into
+    ``evaluate-dataset``. Returns the per-attack results dict; plotting is left to the
+    caller so it can overlay GeoShield with the other attacks.
+    """
+    precomputed_config = PrecomputedPairEvaluationConfig(
+        dataset=dataset,
+        attack_name=attack_name,
+        seed=seed,
+        attack_budgets=list(attack_budgets),
+        clean_image_dirs=list(clean_image_dirs),
+        attacked_image_dirs=list(attacked_image_dirs),
+        results_dir=results_dir,
+        plots_dir=plots_dir,
+        stored_metrics=stored_metrics,
+        device=device,
+        n_images=n_images,
+    )
+    runner = PrecomputedPairEvaluationRunner(precomputed_config, pipeline)
+    if run_config is not None:
+        runner.save_run_config(run_config, suffix=precomputed_config.state_suffix)
+    run_precomputed_pair_evaluation(runner)
+    runner.save_results()
+    return runner.metrics_collector.get_results()
+
+
+def _precomputed_stored_metrics(config: Dict[str, Any]) -> List[str]:
+    """Stored metrics for precomputed pairs: drop the true-GPS metric (no labels)."""
+    stored_metrics = get_nested_config(config, "plot", "stored_metrics", default=DEFAULT_STORED_METRICS)
+    return [m for m in stored_metrics if m != "final_step_displacement_true"] or [
+        "final_step_displacement_predicted"
+    ]
+
+
 def _resolve_precomputed_folders(args, config, dataset, attack_budgets):
     """Resolve and validate the clean/attacked folder lists for precomputed evaluation."""
     clean_image_dirs = pick_value(args.clean_image_dirs, config.get("clean_image_dirs"), None)
@@ -592,10 +739,7 @@ def cmd_evaluate_geoshield_vs_diffusion(args, config: Dict[str, Any]) -> None:
         config, "plot", "attack_success_rate_thresholds", default=DEFAULT_SUCCESS_RATE_THRESHOLDS
     )
 
-    stored_metrics = get_nested_config(config, "plot", "stored_metrics", default=DEFAULT_STORED_METRICS)
-    resolved_stored_metrics = [
-        metric for metric in stored_metrics if metric != "final_step_displacement_true"
-    ] or ["final_step_displacement_predicted"]
+    resolved_stored_metrics = _precomputed_stored_metrics(config)
 
     resolved_config = dict(config)
     resolved_config.update(
@@ -628,26 +772,21 @@ def cmd_evaluate_geoshield_vs_diffusion(args, config: Dict[str, Any]) -> None:
         images_to_evaluate=n_images,
     )
 
-    precomputed_config = PrecomputedPairEvaluationConfig(
+    all_results = run_precomputed_attack_eval(
+        pipeline=pipeline,
         dataset=dataset,
         attack_name=attack_name,
-        seed=seed,
         attack_budgets=list(attack_budgets),
         clean_image_dirs=list(clean_image_dirs),
         attacked_image_dirs=list(attacked_image_dirs),
+        n_images=n_images,
+        seed=seed,
+        device=device,
         results_dir=results_dir,
         plots_dir=plots_dir,
         stored_metrics=resolved_stored_metrics,
-        device=device,
-        n_images=n_images,
+        run_config=resolved_config,
     )
-    runner = PrecomputedPairEvaluationRunner(precomputed_config, pipeline)
-    runner.save_run_config(resolved_config, suffix=precomputed_config.state_suffix)
-
-    run_precomputed_pair_evaluation(runner)
-    runner.save_results()
-
-    all_results = runner.metrics_collector.get_results()
 
     plot_results(
         results_dir=results_dir,

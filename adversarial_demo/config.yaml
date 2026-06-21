@@ -113,6 +113,25 @@ robustness:
   gaussian_blur_sigmas: [0, 2, 4, 6, 8, 10]
   num_steps: null
 
+# GeoShield integration (yfcc only). GeoShield is generated out-of-process by the
+# separate Geoshield repo and folded into evaluate-dataset as just another attack:
+# list "geoshield" in attack_types (or set enabled: true) and a single evaluate-dataset
+# run trains the in-process attacks, generates + evaluates GeoShield on the same seeded
+# images/budgets, and overlays everything in the combined plots.
+# - epsilons: null => derived per budget as round(budget * 255) (0.0314 -> 8/255).
+# - repos_root: null => auto-detected (the dir holding both plonk/ and Geoshield/).
+# - python: null => the current interpreter (run inside the plonk env).
+geoshield:
+  enabled: false
+  attack_name: "geoshield"
+  steps: 100
+  clean_dir: "/Data/mathias.ollu/hf_cache/clean_yfcc_images"
+  output_base: "/Data/mathias.ollu/hf_cache/attacked_yfcc_images_geoshield"
+  epsilons: null
+  repos_root: null
+  script: "Geoshield/geoshield.py"
+  python: null
+
 # Localizability evaluation options
 localizability:
   monte_carlo_samples: 256

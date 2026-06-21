@@ -38,6 +38,10 @@ The adversarial demo code has been refactored to reduce duplication and provide 
     `evaluate_sampling_steps_precomputed()`, `merge_sampling_steps_results()`
 - **`utils/datasets.py`** - YFCC4k / OSV-5M retrieval (split out so `core.py` no
   longer needs `adversarial_eval.py`, removing a circular import)
+- **`utils/geoshield.py`** - folds GeoShield (an out-of-process attack from the
+  separate Geoshield repo) into `evaluate-dataset`: seeded clean-image selection,
+  running `Geoshield/geoshield.py` per budget, and returning the clean/attacked dir
+  pairs for the precomputed-pair evaluator. Replaces the old `scripts/geoshield_common.sh`
 - **`utils/ablations.py`** - shared ablation building blocks: `best_after_k`,
   `evaluate_delta_at_steps`, `evaluate_delta_under_transforms` (JPEG/blur), the
   JPEG/blur transforms, and the restart / sampling-steps / robustness JSON builders.
@@ -182,6 +186,36 @@ python main.py evaluate-dataset --dataset yfcc \
 The standalone `evaluate-restarts` / `evaluate-sampling-steps` / `evaluate-robustness`
 commands remain for focused runs and share the same `utils/ablations.py` code path
 (identical JSON).
+
+## GeoShield as just another attack (evaluate-dataset)
+
+GeoShield is not a trainable attack type — its perturbations are produced by the
+separate **Geoshield** repo (`Geoshield/geoshield.py`). It is folded into
+`evaluate-dataset` so a single run covers it alongside the in-process attacks:
+
+```bash
+python main.py evaluate-dataset --dataset yfcc \
+  --attack-types encoder dtd geoshield
+```
+
+When `geoshield` is in `--attack-types` (or `geoshield.enabled: true`), the run:
+
+1. trains the in-process attacks as usual;
+2. selects the **same seeded** clean images (`select_yfcc_image_paths`), runs
+   `Geoshield/geoshield.py` once per budget (epsilon = `round(budget*255)` unless
+   `geoshield.epsilons` is set), via `utils/geoshield.generate_geoshield_pairs`;
+3. evaluates the clean/attacked pairs through the shared `PrecomputedPairEvaluationRunner`
+   (`run_precomputed_attack_eval`), saving `{dataset}_geoshield_results.pt`;
+4. re-plots the **combined** results so GeoShield overlays the other attacks.
+
+GeoShield has no ground-truth GPS in the precomputed-pair evaluator, so it is
+predicted-only (its line is absent from the `final_step_displacement_true` plot).
+Generation settings live in the `geoshield:` config block (`steps`, `clean_dir`,
+`output_base`, `epsilons`, `repos_root`, `script`, `python`); `repos_root` auto-detects
+the directory holding both `plonk/` and `Geoshield/`. This replaces the former
+three-step `scripts/test_all_attacks.sh` + `scripts/geoshield_common.sh` orchestration
+with one command. The standalone `evaluate-geoshield-vs-diffusion` command remains for
+evaluating already-generated pairs.
 
 ## Results Structure
 
