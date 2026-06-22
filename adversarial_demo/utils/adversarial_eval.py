@@ -30,12 +30,14 @@ from utils.datasets import (  # noqa: F401
     retrieve_osv_images,
 )
 from utils.ablations import (
+    build_model_transfer_json,
     build_restart_ablation_json,
     build_robustness_json,
     build_sampling_steps_json,
     empty_robustness_samples,
     evaluate_delta_at_steps,
     evaluate_delta_under_transforms,
+    model_type_label,
     pred_true_from_cell,
     restart_displacements_from_results,
 )
@@ -46,6 +48,7 @@ from utils.adversarial_utils import (
 )
 from utils.plots_adversarial_attacks import (
     plot_attack_success_rate,
+    plot_model_transfer_success_rate,
     plot_restarts_success,
     plot_results,
     plot_robustness_results,
@@ -112,8 +115,14 @@ def build_and_save_sampling_steps_ablation(
     eval_num_steps: Sequence[int],
     success_rate_thresholds: Sequence[float],
     results_dir: str,
+    out_filename: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Aggregate the per-image sampling-steps samples collected during the run."""
+    """Aggregate the per-image sampling-steps samples collected during the run.
+
+    Saved to ``out_filename`` (default ``<dataset>_sampling_steps_results.json``). A caller
+    overlaying a precomputed attack (e.g. GeoShield) onto the trainable ablation passes an
+    attack-specific name so it does not clobber the trainable JSON before merging.
+    """
     mc = runner.metrics_collector
     eval_num_steps = list(eval_num_steps)
     samples = {
@@ -138,7 +147,54 @@ def build_and_save_sampling_steps_ablation(
         mc.n_images,
         samples,
     )
-    _save_json(json_results, results_dir, f"{dataset_name}_sampling_steps_results.json")
+    _save_json(json_results, results_dir, out_filename or f"{dataset_name}_sampling_steps_results.json")
+    return json_results
+
+
+def build_and_save_model_transfer_ablation(
+    runner,
+    dataset_name: str,
+    attack_types: Sequence[str],
+    attack_budgets: Sequence[float],
+    model_labels: Sequence[str],
+    success_rate_thresholds: Sequence[float],
+    results_dir: str,
+    attacked_model_label: Optional[str] = None,
+    num_steps: Optional[int] = None,
+    out_filename: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Aggregate the per-image cross-model transfer samples collected during the run.
+
+    Mirrors ``build_and_save_sampling_steps_ablation`` with the model variant as the
+    swept axis. Saved to ``out_filename`` (default ``<dataset>_model_transfer_results.json``).
+    """
+    mc = runner.metrics_collector
+    model_labels = list(model_labels)
+    samples = {
+        at: {bi: {label: [] for label in model_labels} for bi in range(len(attack_budgets))}
+        for at in attack_types
+    }
+    for at in attack_types:
+        for bi in range(len(attack_budgets)):
+            for ii in range(mc.n_images):
+                record = mc.model_transfer_results[at][bi][ii]
+                if not record:
+                    continue
+                for label in model_labels:
+                    if label in record:
+                        samples[at][bi][label].append(float(record[label]))
+    json_results = build_model_transfer_json(
+        dataset_name,
+        attack_types,
+        attack_budgets,
+        model_labels,
+        success_rate_thresholds,
+        mc.n_images,
+        samples,
+        attacked_model_label=attacked_model_label,
+        num_steps=num_steps,
+    )
+    _save_json(json_results, results_dir, out_filename or f"{dataset_name}_model_transfer_results.json")
     return json_results
 
 
@@ -152,13 +208,16 @@ def build_and_save_robustness_ablation(
     success_rate_thresholds: Sequence[float],
     results_dir: str,
     num_steps: Optional[int] = None,
+    out_filename: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Aggregate the per-image robustness samples collected during the run.
 
     ``robustness_attack_types`` is the subset of evaluated attacks the ablation was
     run for (default: ["dtd"]). Returns ``None`` (and writes nothing) when none of
     those attacks were evaluated, so enabling the toggle is a no-op until an opted-in
-    attack is part of the run.
+    attack is part of the run. Saved to ``out_filename`` (default
+    ``<dataset>_robustness_results.json``); a caller overlaying a precomputed attack
+    passes an attack-specific name so it does not clobber the trainable JSON.
     """
     mc = runner.metrics_collector
     robustness_attack_types = [at for at in robustness_attack_types if at in mc.robustness_results]
@@ -198,8 +257,91 @@ def build_and_save_robustness_ablation(
         samples,
         num_steps=num_steps,
     )
-    _save_json(json_results, results_dir, f"{dataset_name}_robustness_results.json")
+    _save_json(json_results, results_dir, out_filename or f"{dataset_name}_robustness_results.json")
     return json_results
+
+
+def _overlay_attack_into_ablation_json(
+    canonical_path: str, attack_name: str, attack_json: Optional[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Merge one attack's entry from ``attack_json`` into the canonical on-disk ablation JSON.
+
+    Sampling-steps and robustness JSONs share the ``{attack_types, results}`` shape, so the
+    same union works for both: the precomputed attack's ``results[attack_name]`` is inserted
+    into (and ``attack_name`` appended to) the trainable JSON already on disk, then re-saved.
+    If that JSON is absent (no trainable attacks ran), ``attack_json`` becomes canonical.
+    Returns the merged dict (for re-plotting), or ``None`` if there is nothing to overlay.
+    """
+    src_entry = (attack_json or {}).get("results", {}).get(attack_name)
+    if src_entry is None:
+        return None
+    if os.path.exists(canonical_path):
+        with open(canonical_path) as f:
+            merged = json.load(f)
+    else:
+        merged = dict(attack_json)
+    merged.setdefault("results", {})[attack_name] = src_entry
+    if attack_name not in merged.setdefault("attack_types", []):
+        merged["attack_types"].append(attack_name)
+    with open(canonical_path, "w") as f:
+        json.dump(merged, f, indent=2)
+    print(f"Overlaid '{attack_name}' into: {canonical_path}")
+    return merged
+
+
+def overlay_precomputed_ablations(
+    runner,
+    dataset_name: str,
+    attack_budgets: Sequence[float],
+    results_dir: str,
+    plots_dir: str,
+    success_rate_thresholds: Sequence[float],
+    run_sampling_steps_ablation: bool = False,
+    eval_num_steps: Optional[Sequence[int]] = None,
+    run_robustness_ablation: bool = False,
+    robustness_jpeg_quality_factors: Optional[Sequence[int]] = None,
+    robustness_gaussian_blur_sigmas: Optional[Sequence[float]] = None,
+    robustness_num_steps: Optional[int] = None,
+) -> None:
+    """Overlay a precomputed attack's ablations onto the trainable ones (single-GPU path).
+
+    In ``evaluate-dataset`` the trainable attacks and GeoShield are evaluated by separate
+    runners, so the trainable ablation JSONs/plots are already on disk when GeoShield finishes.
+    This builds GeoShield's sampling-steps / robustness ablation from its own collector (saved to
+    an attack-specific JSON), merges its entry into the canonical trainable JSON, and re-plots the
+    combined figure -- mirroring how ``merge-shards`` overlays it in the multi-GPU path. The
+    restart ablation is intentionally omitted (a precomputed attack has a single generated image).
+    """
+    attack_name = runner.attack_types[0]
+    attack_budgets = list(attack_budgets)
+    success_rate_thresholds = list(success_rate_thresholds)
+
+    if run_sampling_steps_ablation and eval_num_steps:
+        geo_json = build_and_save_sampling_steps_ablation(
+            runner, dataset_name, [attack_name], attack_budgets, list(eval_num_steps),
+            success_rate_thresholds, results_dir,
+            out_filename=f"{dataset_name}_{attack_name}_sampling_steps_results.json",
+        )
+        merged = _overlay_attack_into_ablation_json(
+            os.path.join(results_dir, f"{dataset_name}_sampling_steps_results.json"),
+            attack_name, geo_json,
+        )
+        if merged is not None:
+            plot_sampling_steps_success_rate(json_results=merged, plot_dir=plots_dir)
+
+    if run_robustness_ablation:
+        geo_json = build_and_save_robustness_ablation(
+            runner, dataset_name, [attack_name], attack_budgets,
+            robustness_jpeg_quality_factors or [], robustness_gaussian_blur_sigmas or [],
+            success_rate_thresholds, results_dir, num_steps=robustness_num_steps,
+            out_filename=f"{dataset_name}_{attack_name}_robustness_results.json",
+        )
+        merged = _overlay_attack_into_ablation_json(
+            os.path.join(results_dir, f"{dataset_name}_robustness_results.json"),
+            attack_name, geo_json,
+        )
+        if merged is not None:
+            plot_robustness_results(json_results=merged, plot_dir=plots_dir)
 
 
 # --------------------------------------------------------------------------- #
@@ -236,6 +378,11 @@ def evaluate_attack_on_dataset(
     robustness_jpeg_quality_factors: Optional[list[int]] = None,
     robustness_gaussian_blur_sigmas: Optional[list[float]] = None,
     robustness_num_steps: Optional[int] = None,
+    run_model_transfer_ablation: bool = False,
+    model_transfer_types: Optional[list[str]] = None,
+    model_transfer_num_steps: Optional[int] = None,
+    transfer_pipelines: Optional[Dict[str, Any]] = None,
+    attacked_model_label: Optional[str] = None,
 ):
     """Evaluate one or more attacks on images from a test dataset.
 
@@ -294,7 +441,18 @@ def evaluate_attack_on_dataset(
     # Normalize per-budget kwargs and (optionally) force the restart depth.
     attack_kwargs = expand_per_budget_kwargs(attack_kwargs, len(attack_budgets))
     if max_restarts is not None:
-        attack_kwargs = [{**kw, "num_restarts": int(max_restarts)} for kw in attack_kwargs]
+        # Train ``max_restarts`` restarts so the restart ablation reaches that depth, but
+        # keep the reported/"main" result selected over only the originally configured
+        # ``num_restarts`` (see RestartManager.main_num_restarts). The extra restarts feed
+        # the ablation without changing the reported best perturbation or its metrics.
+        attack_kwargs = [
+            {
+                **kw,
+                "num_restarts": int(max_restarts),
+                "main_num_restarts": int(kw.get("num_restarts", max_restarts)),
+            }
+            for kw in attack_kwargs
+        ]
 
     success_rate_thresholds = plot_success_rate_thresholds or [2500]
 
@@ -335,9 +493,12 @@ def evaluate_attack_on_dataset(
         robustness_jpeg_quality_factors=robustness_jpeg_quality_factors,
         robustness_gaussian_blur_sigmas=robustness_gaussian_blur_sigmas,
         robustness_num_steps=robustness_num_steps,
+        run_model_transfer_ablation=run_model_transfer_ablation,
+        model_transfer_types=list(model_transfer_types) if model_transfer_types else None,
+        model_transfer_num_steps=model_transfer_num_steps,
     )
 
-    runner = EvaluationRunner(config, pipeline)
+    runner = EvaluationRunner(config, pipeline, transfer_pipelines=transfer_pipelines)
     if config_dump is not None:
         runner.save_run_config(config_dump)
     run_evaluation(runner)
@@ -411,6 +572,22 @@ def evaluate_attack_on_dataset(
                 f"{robustness_attack_types} were among the evaluated attacks; nothing to plot."
             )
 
+    # ---- Cross-model transfer ablation (opt-in) ---------------------------- #
+    if run_model_transfer_ablation and transfer_pipelines:
+        model_labels = list(transfer_pipelines.keys())
+        transfer_json = build_and_save_model_transfer_ablation(
+            runner,
+            dataset_name,
+            attack_types,
+            attack_budgets,
+            model_labels,
+            list(success_rate_thresholds),
+            results_dir,
+            attacked_model_label=attacked_model_label,
+            num_steps=model_transfer_num_steps,
+        )
+        plot_model_transfer_success_rate(json_results=transfer_json, plot_dir=plot_dir)
+
 
 # --------------------------------------------------------------------------- #
 # Multi-node sharding: per-shard training + merge-and-plot
@@ -443,6 +620,10 @@ def evaluate_attack_shard(
     robustness_jpeg_quality_factors: Optional[Sequence[int]] = None,
     robustness_gaussian_blur_sigmas: Optional[Sequence[float]] = None,
     robustness_num_steps: Optional[int] = None,
+    run_model_transfer_ablation: bool = False,
+    model_transfer_types: Optional[Sequence[str]] = None,
+    model_transfer_num_steps: Optional[int] = None,
+    transfer_pipelines: Optional[Dict[str, Any]] = None,
     config_dump: Optional[Dict[str, Any]] = None,
 ):
     """Train + evaluate one shard: the given attack(s) on a window of the seeded pool.
@@ -469,7 +650,18 @@ def evaluate_attack_shard(
 
     attack_kwargs = expand_per_budget_kwargs(list(attack_kwargs), len(attack_budgets))
     if max_restarts is not None:
-        attack_kwargs = [{**kw, "num_restarts": int(max_restarts)} for kw in attack_kwargs]
+        # Train ``max_restarts`` restarts so the restart ablation reaches that depth, but
+        # keep the reported/"main" result selected over only the originally configured
+        # ``num_restarts`` (see RestartManager.main_num_restarts). The extra restarts feed
+        # the ablation without changing the reported best perturbation or its metrics.
+        attack_kwargs = [
+            {
+                **kw,
+                "num_restarts": int(max_restarts),
+                "main_num_restarts": int(kw.get("num_restarts", max_restarts)),
+            }
+            for kw in attack_kwargs
+        ]
 
     success_rate_thresholds = list(success_rate_thresholds) if success_rate_thresholds else [2500]
     robustness_attack_types = ["dtd"] if robustness_attack_types is None else list(robustness_attack_types)
@@ -509,9 +701,12 @@ def evaluate_attack_shard(
         robustness_jpeg_quality_factors=robustness_jpeg_quality_factors,
         robustness_gaussian_blur_sigmas=robustness_gaussian_blur_sigmas,
         robustness_num_steps=robustness_num_steps,
+        run_model_transfer_ablation=run_model_transfer_ablation,
+        model_transfer_types=list(model_transfer_types) if model_transfer_types else None,
+        model_transfer_num_steps=model_transfer_num_steps,
     )
 
-    runner = EvaluationRunner(config, pipeline)
+    runner = EvaluationRunner(config, pipeline, transfer_pipelines=transfer_pipelines)
     if config_dump is not None:
         runner.save_run_config(config_dump)
     run_evaluation(runner)
@@ -540,6 +735,23 @@ def _copy_per_image_cell(src_by_attack, dst_by_attack, attack_type, budget_idx, 
     dst_by_attack[attack_type][budget_idx][global_idx] = value
 
 
+def _attack_has_per_image_records(buffer_by_attack: Any, attack_type: str) -> bool:
+    """True if any per-image cell for this attack holds data (vs. an all-None buffer).
+
+    Used to drop attacks that carry no samples for a given ablation -- e.g. the
+    out-of-process GeoShield, which records neither restarts nor sampling-steps -- so
+    they don't leak into that ablation as empty lines. This matches the single-GPU path,
+    where GeoShield is a separate runner and is never part of those ablations.
+    """
+    per_budget = buffer_by_attack.get(attack_type) if isinstance(buffer_by_attack, dict) else None
+    if not isinstance(per_budget, list):
+        return False
+    for per_image in per_budget:
+        if isinstance(per_image, list) and any(cell is not None for cell in per_image):
+            return True
+    return False
+
+
 def merge_shards(
     dataset_name: str,
     attack_types: Sequence[str],
@@ -560,6 +772,10 @@ def merge_shards(
     robustness_jpeg_quality_factors: Optional[Sequence[int]] = None,
     robustness_gaussian_blur_sigmas: Optional[Sequence[float]] = None,
     robustness_num_steps: Optional[int] = None,
+    run_model_transfer_ablation: bool = False,
+    model_transfer_types: Optional[Sequence[str]] = None,
+    model_transfer_num_steps: Optional[int] = None,
+    attacked_model_label: Optional[str] = None,
     config_dump: Optional[Dict[str, Any]] = None,
     shards_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -609,9 +825,12 @@ def merge_shards(
         source_image_ids=global_ids,
     )
 
-    # 3. Discover shard state files.
+    # 3. Discover shard state files. The trailing ``*`` catches both the trainable shards
+    #    (``..._eval_state.pt``) and the precomputed GeoShield shard, whose state file
+    #    carries the attack name (``..._eval_state_geoshield.pt``, see
+    #    PrecomputedPairEvaluationRunner._state_file_suffix).
     shards_dir = shards_dir or os.path.join(results_dir, "shards")
-    state_paths = sorted(glob.glob(os.path.join(shards_dir, "*", f"{dataset_name}_seed{seed}_eval_state.pt")))
+    state_paths = sorted(glob.glob(os.path.join(shards_dir, "*", f"{dataset_name}_seed{seed}_eval_state*.pt")))
     if not state_paths:
         state_paths = sorted(glob.glob(os.path.join(shards_dir, "*", "*_eval_state*.pt")))
     if not state_paths:
@@ -630,6 +849,7 @@ def merge_shards(
         location_results = state.get("location_results") or {}
         sampling_steps_results = state.get("sampling_steps_results") or {}
         robustness_results = state.get("robustness_results") or {}
+        model_transfer_results = state.get("model_transfer_results") or {}
 
         for attack_type in attack_types:
             saved = results.get(attack_type)
@@ -653,6 +873,7 @@ def merge_shards(
                     _copy_per_image_cell(location_results, combined.location_results, attack_type, budget_idx, local_idx, global_idx)
                     _copy_per_image_cell(sampling_steps_results, combined.sampling_steps_results, attack_type, budget_idx, local_idx, global_idx)
                     _copy_per_image_cell(robustness_results, combined.robustness_results, attack_type, budget_idx, local_idx, global_idx)
+                    _copy_per_image_cell(model_transfer_results, combined.model_transfer_results, attack_type, budget_idx, local_idx, global_idx)
                     covered.add((attack_type, budget_idx, global_idx))
 
     expected = len(attack_types) * len(attack_budgets) * len(global_ids)
@@ -692,27 +913,35 @@ def merge_shards(
             gps_true=plot_gps_true,
         )
 
-    # 6. Ablations (shared builders, fed the merged collector).
+    # 6. Ablations (shared builders, fed the merged collector). Each ablation is restricted
+    #    to the attacks that actually carry its per-image samples, so out-of-process attacks
+    #    like GeoShield (which record neither restarts nor sampling-steps) don't leak in as
+    #    empty lines -- matching the single-GPU path, where they're never part of them.
     shim = _MergedCollectorRunner(combined)
+    restart_attack_types = [at for at in attack_types if _attack_has_per_image_records(combined.restart_results, at)]
     restart_json, observed_restarts = build_and_save_restart_ablation(
-        shim, dataset_name, attack_types, attack_budgets, results_dir
+        shim, dataset_name, restart_attack_types, attack_budgets, results_dir
     )
-    if observed_restarts >= 2:
+    if restart_attack_types and observed_restarts >= 2:
         plot_restarts_success(json_results=restart_json, plot_dir=plots_dir, per_image=False)
     else:
         print("Restart ablation has < 2 restarts; JSON saved but plot skipped.")
 
     if run_sampling_steps_ablation and eval_num_steps:
-        steps_json = build_and_save_sampling_steps_ablation(
-            shim,
-            dataset_name,
-            attack_types,
-            attack_budgets,
-            list(eval_num_steps),
-            list(success_rate_thresholds),
-            results_dir,
-        )
-        plot_sampling_steps_success_rate(json_results=steps_json, plot_dir=plots_dir)
+        steps_attack_types = [at for at in attack_types if _attack_has_per_image_records(combined.sampling_steps_results, at)]
+        if steps_attack_types:
+            steps_json = build_and_save_sampling_steps_ablation(
+                shim,
+                dataset_name,
+                steps_attack_types,
+                attack_budgets,
+                list(eval_num_steps),
+                list(success_rate_thresholds),
+                results_dir,
+            )
+            plot_sampling_steps_success_rate(json_results=steps_json, plot_dir=plots_dir)
+        else:
+            print("Sampling-steps ablation: no merged attack carries sampling-steps samples; skipped.")
 
     if run_robustness_ablation:
         robustness_attack_types = ["dtd"] if robustness_attack_types is None else list(robustness_attack_types)
@@ -744,6 +973,27 @@ def merge_shards(
                 "Robustness ablation enabled but none of "
                 f"{robustness_attack_types} were among the merged attacks; nothing to plot."
             )
+
+    if run_model_transfer_ablation and model_transfer_types:
+        model_labels = [model_type_label(mt) for mt in model_transfer_types]
+        transfer_attack_types = [
+            at for at in attack_types if _attack_has_per_image_records(combined.model_transfer_results, at)
+        ]
+        if transfer_attack_types:
+            transfer_json = build_and_save_model_transfer_ablation(
+                shim,
+                dataset_name,
+                transfer_attack_types,
+                attack_budgets,
+                model_labels,
+                list(success_rate_thresholds),
+                results_dir,
+                attacked_model_label=attacked_model_label,
+                num_steps=model_transfer_num_steps,
+            )
+            plot_model_transfer_success_rate(json_results=transfer_json, plot_dir=plots_dir)
+        else:
+            print("Model-transfer ablation: no merged attack carries transfer samples; skipped.")
 
     return all_results
 

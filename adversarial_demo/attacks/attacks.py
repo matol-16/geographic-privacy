@@ -26,9 +26,14 @@ def _run_restartable_attack(
 	restart_eval_seed: int,
 	num_restart_workers: int,
 	finalize_kwargs: Optional[Dict[str, Any]] = None,
+	main_num_restarts: Optional[int] = None,
 ) -> Dict[str, Any]:
 	"""Train, evaluate, and select the best restart for a restartable attack."""
 	finalize_kwargs = finalize_kwargs or {}
+	# Restrict the reported best to the first ``main_num_restarts`` restarts; the rest are
+	# still evaluated to populate the restart ablation (see RestartManager.update_best).
+	if main_num_restarts is not None:
+		attack.restart_manager.main_num_restarts = int(main_num_restarts)
 
 	def run_single_restart(restart_idx: int):
 		"""Run one restart end-to-end."""
@@ -240,6 +245,7 @@ def _run_encoder_attack(
 	restart_eval_batch_size: int = 256,
 	restart_eval_cfg: float = 10.0,
 	restart_eval_num_steps: Optional[int] = None,
+	main_num_restarts: Optional[int] = None,
 	restart_eval_seed: int = 1234,
 	print_restart_results: bool = True,
 	show_progress: bool = True,
@@ -275,6 +281,7 @@ def _run_encoder_attack(
 		restart_eval_num_steps=restart_eval_num_steps,
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
+		main_num_restarts=main_num_restarts,
 		finalize_kwargs={
 			"attack_mode": attack.attack_mode,
 			"z_source": attack.z_source,
@@ -301,6 +308,7 @@ def _run_diffusion_attack(
 	restart_eval_batch_size: int = 256,
 	restart_eval_cfg: float = 10.0,
 	restart_eval_num_steps: Optional[int] = None,
+	main_num_restarts: Optional[int] = None,
 	restart_eval_seed: int = 1234,
 	print_restart_results: bool = True,
 	show_progress: bool = True,
@@ -352,6 +360,7 @@ def _run_diffusion_attack(
 		restart_eval_num_steps=restart_eval_num_steps,
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
+		main_num_restarts=main_num_restarts,
 	)
 
 
@@ -374,6 +383,7 @@ def _run_ace_attack(
 	restart_eval_batch_size: int = 256,
 	restart_eval_cfg: float = 10.0,
 	restart_eval_num_steps: Optional[int] = None,
+	main_num_restarts: Optional[int] = None,
 	restart_eval_seed: int = 1234,
 	print_restart_results: bool = True,
 	show_progress: bool = True,
@@ -438,6 +448,7 @@ def _run_ace_attack(
 		restart_eval_num_steps=restart_eval_num_steps,
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
+		main_num_restarts=main_num_restarts,
 		finalize_kwargs={"attack_mode": "targeted"},
 	)
 
@@ -464,6 +475,7 @@ def _run_unidef_attack(
 	restart_eval_batch_size: int = 256,
 	restart_eval_cfg: float = 10.0,
 	restart_eval_num_steps: Optional[int] = None,
+	main_num_restarts: Optional[int] = None,
 	restart_eval_seed: int = 1234,
 	print_restart_results: bool = True,
 	show_progress: bool = True,
@@ -518,6 +530,7 @@ def _run_unidef_attack(
 		restart_eval_num_steps=restart_eval_num_steps,
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
+		main_num_restarts=main_num_restarts,
 	)
 
 
@@ -540,6 +553,7 @@ def _run_diffusion_salman_attack(
 	restart_eval_batch_size: int = 256,
 	restart_eval_cfg: float = 10.0,
 	restart_eval_num_steps: Optional[int] = None,
+	main_num_restarts: Optional[int] = None,
 	restart_eval_seed: int = 1234,
 	print_restart_results: bool = True,
 	show_progress: bool = True,
@@ -580,5 +594,6 @@ def _run_diffusion_salman_attack(
 		restart_eval_num_steps=restart_eval_num_steps,
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
+		main_num_restarts=main_num_restarts,
 	)
 

@@ -78,13 +78,23 @@ class RestartManager:
         num_restarts: int = 1,
         selection_metric: str = "mean_step_displacement",
         print_results: bool = True,
+        main_num_restarts: Optional[int] = None,
     ):
         if int(num_restarts) < 1:
             raise ValueError("num_restarts must be >= 1")
-        
+
         self.num_restarts = int(num_restarts)
         self.selection_metric = selection_metric
         self.print_results = print_results
+        # Depth of the reported/"main" result: best is selected only over the first
+        # ``main_num_restarts`` restarts, while every restart is still evaluated and kept
+        # in ``restart_evaluations`` for the restart ablation. This lets a run train
+        # ``num_restarts`` (= max_restarts) restarts to populate the ablation while the
+        # reported attack (best_delta/best_metrics) reflects the smaller configured depth.
+        # None => select over all ``num_restarts`` restarts (no separate ablation depth).
+        self.main_num_restarts: Optional[int] = (
+            int(main_num_restarts) if main_num_restarts is not None else None
+        )
         
         # Tracking
         self.best_delta: Optional[torch.Tensor] = None
@@ -146,7 +156,11 @@ class RestartManager:
                 f"selection_score={summary['score']:.6f}"
             )
         
-        if score > self.best_score:
+        # Only restarts within the main-result depth are eligible to be selected as the
+        # reported best; later restarts (run for the restart ablation) still get recorded
+        # in restart_evaluations below, but never override the reported attack.
+        selection_limit = self.main_num_restarts if self.main_num_restarts is not None else self.num_restarts
+        if restart_idx < selection_limit and score > self.best_score:
             self.best_score = float(score)
             self.best_delta = delta.detach().clone()
             self.best_history = list(history)

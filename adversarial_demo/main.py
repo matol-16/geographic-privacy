@@ -80,6 +80,9 @@ DEFAULT_IMAGES_PER_SHARD = 100
 DEFAULT_ROBUSTNESS_ATTACK_TYPES = ["dtd"]
 DEFAULT_ROBUSTNESS_JPEG_QUALITY_FACTORS = [10, 20, 30, 40, 50, 60]
 DEFAULT_ROBUSTNESS_GAUSSIAN_BLUR_SIGMAS = [0, 2, 4, 6, 8, 10]
+# Cross-model transfer ablation: model_type config values for the PLONK variants the
+# attacked image is re-evaluated against ("" -> Riemannian flow matching).
+DEFAULT_MODEL_TRANSFER_TYPES = ["", "diffusion", "flow"]
 
 
 # --------------------------------------------------------------------------- #
@@ -187,8 +190,16 @@ def get_device(config: Dict[str, Any]) -> str:
     return device
 
 
-def get_pipeline(config: Dict[str, Any], dataset: str) -> PlonkPipelineTrajectory:
-    """Load and initialize the PLONK pipeline for the given dataset."""
+def get_pipeline_for_model_type(
+    config: Dict[str, Any], dataset: str, model_type: str
+) -> PlonkPipelineTrajectory:
+    """Load the PLONK pipeline for ``dataset`` and an explicit ``model_type``.
+
+    ``model_type`` is the architecture suffix appended to the dataset's pipeline name
+    ("" -> Riemannian flow matching, "diffusion", "flow"). Used both for the main run
+    (the configured ``model_type``) and for the cross-model transfer ablation, which
+    loads the other variants.
+    """
     device = get_device(config)
 
     pipelines = config.get("pipelines", {})
@@ -196,16 +207,61 @@ def get_pipeline(config: Dict[str, Any], dataset: str) -> PlonkPipelineTrajector
         raise ValueError(f"No pipeline configuration for dataset: {dataset}")
 
     model_name = pipelines[dataset]
-    # If a model_type is configured, append it as a suffix to the pipeline name
-    model_type = config.get("model_type", "")
     if model_type:
-        suffix = f"_{model_type}" if model_type != "" else ""  # riemannian FM is just ""
+        suffix = f"_{model_type}"  # riemannian FM is just "" (no suffix)
         if not model_name.endswith(suffix):
             model_name = model_name + suffix
     print(f"Loading pipeline: {model_name}")
-    pipeline = PlonkPipelineTrajectory(model_name).to(device)
+    return PlonkPipelineTrajectory(model_name).to(device)
 
-    return pipeline
+
+def get_pipeline(config: Dict[str, Any], dataset: str) -> PlonkPipelineTrajectory:
+    """Load and initialize the PLONK pipeline for the given dataset (configured model_type)."""
+    return get_pipeline_for_model_type(config, dataset, config.get("model_type", "") or "")
+
+
+def load_transfer_pipelines(
+    config: Dict[str, Any],
+    dataset: str,
+    model_transfer_types: Sequence[str],
+    attack_pipeline,
+) -> Dict[str, Any]:
+    """Load the PLONK variants for the cross-model transfer ablation.
+
+    Returns ``{model_label: pipeline}`` over ``model_transfer_types`` (model_type config
+    values). The attack's own variant is reused (``attack_pipeline``) rather than reloaded,
+    so the attacked model is part of the comparison without doubling its memory. The other
+    variants are loaded once and shared across the run. Loading several PLONK backbones at
+    once raises GPU memory; reduce ``model_transfer_types`` if it does not fit.
+    """
+    from utils.ablations import model_type_label
+
+    attack_model_type = config.get("model_type", "") or ""
+    transfer_pipelines: Dict[str, Any] = {}
+    for model_type in model_transfer_types:
+        mt = model_type or ""
+        label = model_type_label(mt)
+        if label in transfer_pipelines:
+            continue
+        if mt == attack_model_type:
+            transfer_pipelines[label] = attack_pipeline
+        else:
+            transfer_pipelines[label] = get_pipeline_for_model_type(config, dataset, mt)
+    return transfer_pipelines
+
+
+def normalize_model_transfer_types(model_transfer_types: Optional[Sequence[str]]) -> List[str]:
+    """Map CLI/config model_type tokens to canonical suffixes, de-duplicating in order.
+
+    Accepts ``rfm`` / ``riemannian`` as friendly aliases for the suffix-less Riemannian
+    flow-matching variant ("") so users need not pass an empty string on the command line.
+    """
+    normalized: List[str] = []
+    for token in (model_transfer_types or []):
+        mt = "" if str(token).strip().lower() in {"rfm", "riemannian", "riemannian_flow_matching", ""} else str(token)
+        if mt not in normalized:
+            normalized.append(mt)
+    return normalized
 
 
 def get_attack_kwargs(config: Dict[str, Any], dataset: str) -> List[Dict[str, Any]]:
@@ -358,6 +414,31 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
     )
     robustness_num_steps = get_nested_config(config, "robustness", "num_steps", default=None)
 
+    # Cross-model transfer ablation controls (CLI > config > default).
+    from utils.ablations import model_type_label
+    run_model_transfer_ablation = bool(pick_value(
+        args.run_model_transfer_ablation,
+        get_nested_config(config, "plot", "run_model_transfer_ablation", default=None),
+        False,
+    ))
+    model_transfer_types = normalize_model_transfer_types(pick_value(
+        args.model_transfer_types,
+        get_nested_config(config, "model_transfer", "model_types", default=None),
+        DEFAULT_MODEL_TRANSFER_TYPES,
+    ))
+    model_transfer_num_steps = pick_value(
+        args.model_transfer_num_steps,
+        get_nested_config(config, "model_transfer", "num_steps", default=None),
+        None,
+    )
+    # Load the other PLONK variants once and reuse the attack pipeline for its own variant.
+    transfer_pipelines = (
+        load_transfer_pipelines(config, ctx.dataset, model_transfer_types, ctx.pipeline)
+        if run_model_transfer_ablation and trainable_attack_types
+        else {}
+    )
+    attacked_model_label = model_type_label(config.get("model_type", "") or "")
+
     print_run_banner(
         f"Evaluating attacks on {ctx.dataset.upper()} dataset",
         attack_types=ctx.attack_types,
@@ -369,6 +450,8 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
         sampling_steps_ablation=run_sampling_steps_ablation,
         robustness_ablation=run_robustness_ablation,
         robustness_attack_types=robustness_attack_types if run_robustness_ablation else None,
+        model_transfer_ablation=run_model_transfer_ablation,
+        model_transfer_variants=list(transfer_pipelines.keys()) if run_model_transfer_ablation else None,
         geoshield=run_geoshield,
         max_restarts=max_restarts,
     )
@@ -403,6 +486,11 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
             robustness_jpeg_quality_factors=robustness_jpeg_quality_factors,
             robustness_gaussian_blur_sigmas=robustness_gaussian_blur_sigmas,
             robustness_num_steps=robustness_num_steps,
+            run_model_transfer_ablation=run_model_transfer_ablation,
+            model_transfer_types=model_transfer_types,
+            model_transfer_num_steps=model_transfer_num_steps,
+            transfer_pipelines=transfer_pipelines,
+            attacked_model_label=attacked_model_label,
         )
 
     # GeoShield: generate out-of-process, evaluate the pairs, overlay in combined plots.
@@ -560,6 +648,21 @@ def _resolve_ablation_controls(args, config: Dict[str, Any]) -> Dict[str, Any]:
             config, "robustness", "gaussian_blur_sigmas", default=DEFAULT_ROBUSTNESS_GAUSSIAN_BLUR_SIGMAS
         ),
         robustness_num_steps=get_nested_config(config, "robustness", "num_steps", default=None),
+        run_model_transfer_ablation=bool(pick_value(
+            args.run_model_transfer_ablation,
+            get_nested_config(config, "plot", "run_model_transfer_ablation", default=None),
+            False,
+        )),
+        model_transfer_types=pick_value(
+            args.model_transfer_types,
+            get_nested_config(config, "model_transfer", "model_types", default=None),
+            DEFAULT_MODEL_TRANSFER_TYPES,
+        ),
+        model_transfer_num_steps=pick_value(
+            args.model_transfer_num_steps,
+            get_nested_config(config, "model_transfer", "num_steps", default=None),
+            None,
+        ),
         success_rate_thresholds=get_nested_config(
             config, "plot", "attack_success_rate_thresholds", default=DEFAULT_SUCCESS_RATE_THRESHOLDS
         ),
@@ -735,6 +838,15 @@ def cmd_evaluate_dataset_shard(args, config: Dict[str, Any]) -> None:
     attack_kwargs = get_attack_kwargs(config, dataset)
     attack_type_kwargs = get_attack_type_kwargs(config, dataset)
 
+    # Cross-model transfer ablation: load the other PLONK variants once for this shard.
+    run_model_transfer_ablation = bool(ctrls.get("run_model_transfer_ablation"))
+    model_transfer_types = normalize_model_transfer_types(ctrls.get("model_transfer_types"))
+    transfer_pipelines = (
+        load_transfer_pipelines(config, dataset, model_transfer_types, pipeline)
+        if run_model_transfer_ablation
+        else {}
+    )
+
     print_run_banner(
         f"[shard] Evaluating attacks on {dataset.upper()} dataset",
         attack_types=attack_types,
@@ -744,6 +856,8 @@ def cmd_evaluate_dataset_shard(args, config: Dict[str, Any]) -> None:
         parallel_workers=parallel_workers,
         sampling_steps_ablation=ctrls["run_sampling_steps_ablation"],
         robustness_ablation=ctrls["run_robustness_ablation"],
+        model_transfer_ablation=run_model_transfer_ablation,
+        model_transfer_variants=list(transfer_pipelines.keys()) if run_model_transfer_ablation else None,
         max_restarts=ctrls["max_restarts"],
     )
 
@@ -773,6 +887,10 @@ def cmd_evaluate_dataset_shard(args, config: Dict[str, Any]) -> None:
         robustness_jpeg_quality_factors=ctrls["robustness_jpeg_quality_factors"],
         robustness_gaussian_blur_sigmas=ctrls["robustness_gaussian_blur_sigmas"],
         robustness_num_steps=ctrls["robustness_num_steps"],
+        run_model_transfer_ablation=run_model_transfer_ablation,
+        model_transfer_types=model_transfer_types,
+        model_transfer_num_steps=ctrls.get("model_transfer_num_steps"),
+        transfer_pipelines=transfer_pipelines,
         config_dump=config,
     )
 
@@ -803,6 +921,7 @@ def cmd_merge_shards(args, config: Dict[str, Any]) -> None:
         print(f"Note: no '{geoshield_name}' shards found under {shards_root}; excluding it from the merge.")
 
     ctrls = _resolve_ablation_controls(args, config)
+    from utils.ablations import model_type_label
     plot_success_rate = bool(get_nested_config(config, "plot", "plot_success_rate", default=False))
     plot_gps_true = bool(get_nested_config(config, "plot", "gps_true", default=False))
 
@@ -836,6 +955,10 @@ def cmd_merge_shards(args, config: Dict[str, Any]) -> None:
         robustness_jpeg_quality_factors=ctrls["robustness_jpeg_quality_factors"],
         robustness_gaussian_blur_sigmas=ctrls["robustness_gaussian_blur_sigmas"],
         robustness_num_steps=ctrls["robustness_num_steps"],
+        run_model_transfer_ablation=bool(ctrls.get("run_model_transfer_ablation")),
+        model_transfer_types=normalize_model_transfer_types(ctrls.get("model_transfer_types")),
+        model_transfer_num_steps=ctrls.get("model_transfer_num_steps"),
+        attacked_model_label=model_type_label(config.get("model_type", "") or ""),
         config_dump=config,
         shards_dir=shards_dir,
     )
@@ -1388,6 +1511,14 @@ def add_ablation_args(parser: argparse.ArgumentParser) -> None:
                              "(only for --robustness-attack-types; baseline sampling steps)")
     parser.add_argument("--robustness-attack-types", nargs="+",
                         help=f"Attack types the robustness ablation runs for (default: {DEFAULT_ROBUSTNESS_ATTACK_TYPES})")
+    parser.add_argument("--run-model-transfer-ablation", action="store_true", default=None,
+                        help="Also re-evaluate each best perturbation's attacked image against every "
+                             "--model-transfer-types PLONK variant (cross-model transfer)")
+    parser.add_argument("--model-transfer-types", nargs="+",
+                        help="model_type values for the transfer ablation; '' is Riemannian flow matching. "
+                             f"Pass rfm for '' (default: {DEFAULT_MODEL_TRANSFER_TYPES})")
+    parser.add_argument("--model-transfer-num-steps", type=int,
+                        help="Sampling steps for the model-transfer eval (default: each attack's baseline)")
 
 
 def add_precomputed_folder_args(parser: argparse.ArgumentParser) -> None:

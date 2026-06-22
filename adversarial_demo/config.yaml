@@ -113,6 +113,20 @@ robustness:
   gaussian_blur_sigmas: [0, 2, 4, 6, 8, 10]
   num_steps: null
 
+# Cross-model transfer ablation. Each best perturbation is trained against the configured
+# model_type (above) but its attacked image is re-evaluated against every PLONK variant
+# below, to measure how well the attack transfers across the generative backbones (the
+# eval is cheap; training the attack is the bottleneck). Enable via
+# plot.run_model_transfer_ablation. Unlike robustness it runs for every evaluated attack.
+# - model_types: model_type suffixes to compare; "" is Riemannian flow matching (the
+#   attacked variant is reused, not reloaded). "rfm" is accepted as an alias for "".
+# - num_steps: null => use each attack's restart_eval_num_steps, i.e. the SAME number of
+#   sampling steps as the regular/main evaluation (whose displacement is measured by the
+#   restart evaluator at restart_eval_num_steps). Set an int only to override it.
+model_transfer:
+  model_types: ["", "diffusion", "flow"]
+  num_steps: null
+
 # GeoShield integration (yfcc only). GeoShield is generated out-of-process by the
 # separate Geoshield repo and folded into evaluate-dataset as just another attack:
 # list "geoshield" in attack_types (or set enabled: true) and a single evaluate-dataset
@@ -150,3 +164,6 @@ plot:
   # re-evaluate (GeoShield Fig. 6). Scoped to robustness.attack_types (default dtd),
   # so it is a no-op unless one of those attacks is part of the run.
   run_robustness_ablation: true
+  # Opt-in: re-evaluate each best perturbation's attacked image against every PLONK
+  # variant in model_transfer.model_types (cross-model transfer). No retraining; cheap.
+  run_model_transfer_ablation: false

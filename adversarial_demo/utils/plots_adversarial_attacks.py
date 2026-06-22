@@ -13,6 +13,7 @@ from utils.plots import (  # noqa: F401
     plot_gps_trajectories_clean,
     plot_gps_trajectories_on_map,
     plot_localizability_results,
+    plot_model_transfer_success_rate,
     plot_restarts_success,
     plot_results,
     plot_robustness_results,

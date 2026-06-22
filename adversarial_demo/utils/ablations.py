@@ -226,6 +226,139 @@ def build_sampling_steps_json(
 
 
 # --------------------------------------------------------------------------- #
+# Cross-model transfer ablation
+# --------------------------------------------------------------------------- #
+#
+# A perturbation is trained against one PLONK variant (the loaded pipeline -- e.g.
+# Riemannian flow matching) but the attacked image is re-evaluated against every
+# configured variant (diffusion / flow matching / RFM). Because the compute bottleneck
+# is training the attack, evaluating the frozen attacked image against the other
+# variants is cheap, and it measures how well a perturbation transfers across the
+# generative backbones. The variants share a dataset's image encoder (DINOv2 for YFCC,
+# StreetCLIP for OSV), so a single attacked PIL image is comparable across them.
+
+# Human-readable labels for the ``model_type`` config values (the suffix appended to
+# the pipeline name). "" is the Riemannian flow-matching default (no suffix).
+MODEL_TYPE_LABELS = {"": "rfm", "diffusion": "diffusion", "flow": "flow"}
+
+
+def model_type_label(model_type: Optional[str]) -> str:
+    """Stable plot/JSON label for a ``model_type`` config value ("" -> "rfm")."""
+    key = model_type or ""
+    return MODEL_TYPE_LABELS.get(key, key or "rfm")
+
+
+def evaluate_pair_across_models(
+    transfer_pipelines: Dict[str, Any],
+    source_image,
+    perturbed_image,
+    cfg: float = 10.0,
+    batch_size: int = 128,
+    seed: int = 1234,
+    device: str = "cuda",
+    num_steps: Optional[int] = None,
+) -> Dict[str, float]:
+    """Evaluate one clean/perturbed pair against several model variants.
+
+    ``transfer_pipelines`` maps a label (see :func:`model_type_label`) to a loaded PLONK
+    pipeline. Returns ``{label: final_step_displacement_km}``. The perturbed image is
+    taken as-is, so the only thing that varies across calls is the model -- mirroring how
+    the sampling-steps ablation varies only the step count.
+    """
+    displacement_by_model: Dict[str, float] = {}
+    for label, transfer_pipeline in transfer_pipelines.items():
+        eval_result = run_paired_pipeline_with_shared_noise(
+            pipeline=transfer_pipeline,
+            source_image=source_image,
+            perturbed_image=perturbed_image,
+            batch_size=batch_size,
+            cfg=cfg,
+            num_steps=num_steps,
+            seed=seed,
+            device=device,
+        )
+        displacement_by_model[label] = float(eval_result["metrics"]["final_step_displacement"])
+    return displacement_by_model
+
+
+def evaluate_delta_across_models(
+    attack_pipeline,
+    transfer_pipelines: Dict[str, Any],
+    source_image,
+    delta,
+    cfg: float = 10.0,
+    batch_size: int = 128,
+    seed: int = 1234,
+    device: str = "cuda",
+    num_steps: Optional[int] = None,
+) -> Dict[str, float]:
+    """Re-evaluate a single trained perturbation against every model variant.
+
+    The attacked image is reconstructed once with ``attack_pipeline`` (the variant the
+    delta was trained on) and then evaluated against each pipeline in
+    ``transfer_pipelines`` with the shared, paired evaluation used everywhere else.
+    """
+    perturbed_image = add_perturbation_to_image(source_image, delta.to(device), attack_pipeline)
+    return evaluate_pair_across_models(
+        transfer_pipelines=transfer_pipelines,
+        source_image=source_image,
+        perturbed_image=perturbed_image,
+        cfg=cfg,
+        batch_size=batch_size,
+        seed=seed,
+        device=device,
+        num_steps=num_steps,
+    )
+
+
+def build_model_transfer_json(
+    dataset_name: str,
+    attack_types: Sequence[str],
+    attack_budgets: Sequence[float],
+    model_labels: Sequence[str],
+    success_rate_thresholds: Sequence[float],
+    n_images: int,
+    samples: Dict[str, Dict[int, Dict[str, List[float]]]],
+    attacked_model_label: Optional[str] = None,
+    num_steps: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Assemble the cross-model transfer JSON consumed by ``plot_model_transfer_success_rate``.
+
+    ``samples[attack_type][budget_idx][model_label]`` is the list of per-image final-step
+    displacements (km) measured against that model variant. Mirrors
+    ``build_sampling_steps_json`` with the model variant as the swept axis.
+    """
+    model_labels = list(model_labels)
+    json_results: Dict[str, Any] = {
+        "dataset": dataset_name,
+        "attack_types": list(attack_types),
+        "attack_budgets": list(attack_budgets),
+        "model_labels": model_labels,
+        "attacked_model_label": attacked_model_label,
+        "num_steps": int(num_steps) if num_steps is not None else None,
+        "success_rate_thresholds_km": list(success_rate_thresholds),
+        "n_images": int(n_images),
+        "results": {},
+    }
+    for at in attack_types:
+        json_results["results"][at] = {}
+        for budget_idx, budget in enumerate(attack_budgets):
+            bkey = _budget_key(budget)
+            json_results["results"][at][bkey] = {}
+            for label in model_labels:
+                disps = samples[at][budget_idx].get(label, [])
+                success_rates = {
+                    str(thr): float(np.mean([d > thr for d in disps])) if disps else float("nan")
+                    for thr in success_rate_thresholds
+                }
+                json_results["results"][at][bkey][label] = {
+                    "mean_displacement_km": float(np.mean(disps)) if disps else float("nan"),
+                    "success_rates": success_rates,
+                }
+    return json_results
+
+
+# --------------------------------------------------------------------------- #
 # Robustness-to-transformation ablation (JPEG compression / Gaussian blur)
 # --------------------------------------------------------------------------- #
 #

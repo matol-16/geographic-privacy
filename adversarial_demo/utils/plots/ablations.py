@@ -312,6 +312,74 @@ def plot_sampling_steps_success_rate(
     print(f"Plot saved to: {plot_path}")
 
 
+def plot_model_transfer_success_rate(
+    json_results: dict,
+    plot_dir: str,
+) -> None:
+    """Plot cross-model transfer: attack effect against each generative backbone.
+
+    The attacked image is trained against one PLONK variant and re-evaluated against
+    every configured variant (diffusion / flow / RFM). The leftmost subplot shows mean
+    final-step displacement vs. model variant; one subplot per distance threshold follows
+    with the attack success rate. One line per (attack_type, budget); the variant the
+    attack was trained on is annotated in the title. ``json_results`` is the dict produced
+    by ``build_model_transfer_json``.
+    """
+    model_labels = json_results["model_labels"]
+    thresholds = json_results["success_rate_thresholds_km"]
+    attack_types = json_results["attack_types"]
+    attack_budgets = json_results["attack_budgets"]
+    dataset = json_results["dataset"]
+    attacked_model = json_results.get("attacked_model_label")
+    # Per-type budget lists are set when merging results from different commands.
+    budgets_per_type = json_results.get("attack_budgets_per_type", {})
+
+    x = list(range(len(model_labels)))
+    n_cols = 1 + len(thresholds)  # col 0: mean displacement; then one per threshold
+    fig, axes = plt.subplots(1, n_cols, figsize=(6 * n_cols, 5), squeeze=False)
+    colors = plt.cm.tab10.colors
+
+    color_idx = 0
+    for attack_type in attack_types:
+        budgets = budgets_per_type.get(attack_type, attack_budgets)
+        for budget in budgets:
+            bkey = f"budget_{budget:.6f}"
+            label = f"{_display_attack_name(attack_type)} eps={budget:.3f}"
+            color = colors[color_idx % len(colors)]
+            cells = [json_results["results"][attack_type][bkey][m] for m in model_labels]
+            means = [c["mean_displacement_km"] for c in cells]
+            axes[0][0].plot(x, means, marker="o", label=label, color=color)
+            for col_idx, thr in enumerate(thresholds, start=1):
+                rates = [c["success_rates"][str(thr)] for c in cells]
+                axes[0][col_idx].plot(x, rates, marker="o", label=label, color=color)
+            color_idx += 1
+
+    axes[0][0].set_ylabel("Mean displacement (km)")
+    axes[0][0].set_title("Mean displacement")
+    for col_idx, thr in enumerate(thresholds, start=1):
+        axes[0][col_idx].set_title(f"Displacement > {thr} km")
+        axes[0][col_idx].set_ylabel("Attack success rate")
+        axes[0][col_idx].set_ylim(0, 1)
+    for col_idx in range(n_cols):
+        ax = axes[0][col_idx]
+        ax.set_xlabel("Model variant")
+        ax.set_xticks(x)
+        ax.set_xticklabels(model_labels, rotation=30, ha="right")
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.3)
+
+    title = f"Cross-model transfer — {dataset.upper()}"
+    if attacked_model:
+        title += f" (attacked: {attacked_model})"
+    fig.suptitle(title)
+    fig.tight_layout()
+    os.makedirs(plot_dir, exist_ok=True)
+    plot_path = os.path.join(plot_dir, f"{dataset}_model_transfer_success_rate.png")
+    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Plot saved to: {plot_path}")
+
+
 def plot_robustness_results(
     json_results: dict,
     plot_dir: str,
