@@ -29,6 +29,7 @@ Usage:
 """
 
 import argparse
+import copy
 import glob
 import os
 import sys
@@ -357,6 +358,64 @@ def prepare_training_run(args, config: Dict[str, Any], default_n_images: int) ->
     )
 
 
+def _ensure_dict(config: Dict[str, Any], key: str) -> Dict[str, Any]:
+    """Return ``config[key]`` as a dict, replacing a missing/None value with a fresh one."""
+    value = config.get(key)
+    if not isinstance(value, dict):
+        value = {}
+        config[key] = value
+    return value
+
+
+def build_resolved_config_dump(
+    config: Dict[str, Any],
+    ctx: "TrainingRunContext",
+    *,
+    parallel_workers: Any = None,
+    eval_num_steps: Any = None,
+    max_restarts: Any = None,
+    run_sampling_steps_ablation: Any = None,
+    run_robustness_ablation: Any = None,
+    run_model_transfer_ablation: Any = None,
+    robustness_attack_types: Any = None,
+    model_transfer_types: Any = None,
+) -> Dict[str, Any]:
+    """Return a deep copy of ``config`` with the CLI-resolved run parameters written back in.
+
+    ``config`` only ever holds the file (and ``--override``) values; the named CLI flags
+    (``--n-images``, ``--attack-types``, ``--results-dir``, ``--eval-num-steps`` ...) are
+    resolved separately into ``ctx`` and local variables and are never merged back. Dumping
+    ``config`` as the run config therefore misreports the parameters actually used. This
+    rebuilds a dict that reflects the effective run so the saved ``*_run_config.yaml``
+    matches what ran.
+    """
+    dump = copy.deepcopy(config)
+    dump["dataset"] = ctx.dataset
+    dump["attack_types"] = list(ctx.attack_types)
+    dump["n_images_to_eval"] = ctx.n_images
+    dump["results_dir"] = ctx.results_dir
+    dump["plots_dir"] = ctx.plots_dir
+    _ensure_dict(dump, "attack_budgets")[ctx.dataset] = list(ctx.attack_budgets)
+    if parallel_workers is not None:
+        dump["parallel_workers"] = parallel_workers
+    if eval_num_steps is not None:
+        dump["eval_num_steps"] = list(eval_num_steps)
+    if max_restarts is not None:
+        dump["max_restarts"] = max_restarts
+    plot = _ensure_dict(dump, "plot")
+    if run_sampling_steps_ablation is not None:
+        plot["run_sampling_steps_ablation"] = bool(run_sampling_steps_ablation)
+    if run_robustness_ablation is not None:
+        plot["run_robustness_ablation"] = bool(run_robustness_ablation)
+    if run_model_transfer_ablation is not None:
+        plot["run_model_transfer_ablation"] = bool(run_model_transfer_ablation)
+    if robustness_attack_types is not None:
+        _ensure_dict(dump, "robustness")["attack_types"] = list(robustness_attack_types)
+    if model_transfer_types is not None:
+        _ensure_dict(dump, "model_transfer")["model_types"] = list(model_transfer_types)
+    return dump
+
+
 # --------------------------------------------------------------------------- #
 # Commands
 # --------------------------------------------------------------------------- #
@@ -456,6 +515,21 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
         max_restarts=max_restarts,
     )
 
+    # Reflect the CLI-resolved parameters in the saved run config (config.yaml alone would
+    # misreport --n-images / --attack-types / --results-dir / --eval-num-steps ...).
+    resolved_config_dump = build_resolved_config_dump(
+        config,
+        ctx,
+        parallel_workers=parallel_workers,
+        eval_num_steps=eval_num_steps,
+        max_restarts=max_restarts,
+        run_sampling_steps_ablation=run_sampling_steps_ablation,
+        run_robustness_ablation=run_robustness_ablation,
+        run_model_transfer_ablation=run_model_transfer_ablation,
+        robustness_attack_types=robustness_attack_types,
+        model_transfer_types=model_transfer_types,
+    )
+
     if trainable_attack_types:
         evaluate_attack_on_dataset(
             attack_types=trainable_attack_types,
@@ -476,7 +550,7 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
             plot_success_rate=plot_success_rate,
             plot_success_rate_thresholds=success_rate_thresholds,
             plot_gps_true=plot_gps_true,
-            config_dump=config,
+            config_dump=resolved_config_dump,
             max_restarts=max_restarts,
             run_sampling_steps_ablation=run_sampling_steps_ablation,
             eval_num_steps=eval_num_steps,
@@ -497,6 +571,7 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
     if run_geoshield:
         _run_geoshield_step(
             config=config,
+            config_dump=resolved_config_dump,
             ctx=ctx,
             geoshield_cfg=geoshield_cfg,
             geoshield_name=geoshield_name,
@@ -529,6 +604,7 @@ def _run_geoshield_step(
     success_rate_thresholds: List[float],
     plot_gps_true: bool,
     ablation_controls: Optional[Dict[str, Any]] = None,
+    config_dump: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Generate + evaluate GeoShield, then re-plot the combined results (trainable + GeoShield).
 
@@ -571,7 +647,7 @@ def _run_geoshield_step(
         results_dir=ctx.results_dir,
         plots_dir=ctx.plots_dir,
         stored_metrics=get_nested_config(config, "plot", "stored_metrics", default=DEFAULT_STORED_METRICS),
-        run_config=config,
+        run_config=config_dump if config_dump is not None else config,
         gps_by_id=gps_by_filename,
         run_sampling_steps_ablation=run_sampling_steps,
         eval_num_steps=eval_num_steps,

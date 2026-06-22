@@ -38,6 +38,8 @@ python main.py merge-shards \
   --results-dir "${RESULTS_BASE}" \
   --plots-dir "${PLOTS_DIR}" \
   --run-sampling-steps-ablation \
+  --run-robustness-ablation \
+  --run-model-transfer-ablation \
   --eval-num-steps "${EVAL_NUM_STEPS[@]}" \
   --override "attack_budgets.${DATASET}=${BUDGETS_OVERRIDE}"
 

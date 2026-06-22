@@ -61,6 +61,8 @@ srun python main.py evaluate-dataset-shard \
   --results-dir "${RESULTS_BASE}" \
   --parallel-workers "${PARALLEL_WORKERS}" \
   --run-sampling-steps-ablation \
+  --run-robustness-ablation \
+  --run-model-transfer-ablation \
   --eval-num-steps "${EVAL_NUM_STEPS[@]}" \
   --override "attack_budgets.${DATASET}=${BUDGETS_OVERRIDE}"
 
