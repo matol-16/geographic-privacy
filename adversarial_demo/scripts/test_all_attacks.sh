@@ -26,9 +26,9 @@ PROJECT_DIR="$(repo_root)"
 # Edit these values to match the experiment you want to run.
 CONFIG_PATH="${PROJECT_DIR}/config.yaml"
 DATASET="yfcc"
-ATTACK_TYPES=(encoder sampling diffusion_l2 dtd unidef unidef_nofdje ace geoshield)
-N_IMAGES=100
-RESULTS_DIR="${PROJECT_DIR}/results/cluster_eval/test_2006"
+ATTACK_TYPES=(encoder sampling diffusion_l2 dtd unidef ace geoshield)
+N_IMAGES=5
+RESULTS_DIR="${PROJECT_DIR}/results/cluster_eval/test_2206"
 PLOTS_DIR="${RESULTS_DIR}/plots"
 PARALLEL_WORKERS=1
 EVAL_NUM_STEPS=(8 16 32 64 250)            # sampling-steps ablation grid

@@ -34,7 +34,7 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import yaml
 import torch
@@ -416,6 +416,15 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
             plot_success_rate=plot_success_rate,
             success_rate_thresholds=success_rate_thresholds,
             plot_gps_true=plot_gps_true,
+            ablation_controls=dict(
+                run_sampling_steps_ablation=run_sampling_steps_ablation,
+                eval_num_steps=eval_num_steps,
+                run_robustness_ablation=run_robustness_ablation,
+                robustness_attack_types=robustness_attack_types,
+                robustness_jpeg_quality_factors=robustness_jpeg_quality_factors,
+                robustness_gaussian_blur_sigmas=robustness_gaussian_blur_sigmas,
+                robustness_num_steps=robustness_num_steps,
+            ),
         )
 
     print(f"\nEvaluation complete! Results saved to: {ctx.results_dir}")
@@ -431,14 +440,27 @@ def _run_geoshield_step(
     plot_success_rate: bool,
     success_rate_thresholds: List[float],
     plot_gps_true: bool,
+    ablation_controls: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Generate + evaluate GeoShield, then re-plot the combined results (trainable + GeoShield).
 
     GeoShield selects labelled dataset images, so the GPS map returned by the generator
     is threaded into the evaluator to also report the true-position displacement metric
-    (like the trainable attacks). The combined plots honour ``plot.gps_true``.
+    (like the trainable attacks). The combined plots honour ``plot.gps_true``. When the
+    sampling-steps / robustness ablations are enabled, they are recorded for GeoShield's
+    pairs and overlaid onto the trainable ablation plots (matching the multi-GPU merge).
     """
     from utils.geoshield import generate_geoshield_pairs
+    from utils.adversarial_eval import overlay_precomputed_ablations
+
+    ablation_controls = ablation_controls or {}
+    # Robustness is opt-in per attack type (as for the trainable attacks): only for GeoShield
+    # when it is listed in robustness.attack_types. Sampling-steps applies to every attack.
+    run_robustness_geoshield = bool(ablation_controls.get("run_robustness_ablation")) and (
+        geoshield_name in (ablation_controls.get("robustness_attack_types") or [])
+    )
+    run_sampling_steps = bool(ablation_controls.get("run_sampling_steps_ablation"))
+    eval_num_steps = ablation_controls.get("eval_num_steps")
 
     clean_dirs, attacked_dirs, gps_by_filename = generate_geoshield_pairs(
         config=config,
@@ -448,7 +470,7 @@ def _run_geoshield_step(
         seed=ctx.seed,
         geoshield_cfg=geoshield_cfg,
     )
-    run_precomputed_attack_eval(
+    runner = run_precomputed_attack_eval(
         pipeline=ctx.pipeline,
         dataset=ctx.dataset,
         attack_name=geoshield_name,
@@ -463,6 +485,12 @@ def _run_geoshield_step(
         stored_metrics=get_nested_config(config, "plot", "stored_metrics", default=DEFAULT_STORED_METRICS),
         run_config=config,
         gps_by_id=gps_by_filename,
+        run_sampling_steps_ablation=run_sampling_steps,
+        eval_num_steps=eval_num_steps,
+        run_robustness_ablation=run_robustness_geoshield,
+        robustness_jpeg_quality_factors=ablation_controls.get("robustness_jpeg_quality_factors"),
+        robustness_gaussian_blur_sigmas=ablation_controls.get("robustness_gaussian_blur_sigmas"),
+        robustness_num_steps=ablation_controls.get("robustness_num_steps"),
     )
 
     # Overlay GeoShield with the trainable attacks in one combined set of plots.
@@ -485,6 +513,23 @@ def _run_geoshield_step(
             attack_types=combined_attack_types,
             threshold_km=list(success_rate_thresholds),
             gps_true=plot_gps_true,
+        )
+
+    # Overlay GeoShield onto the trainable sampling-steps / robustness ablation plots.
+    if run_sampling_steps or run_robustness_geoshield:
+        overlay_precomputed_ablations(
+            runner=runner,
+            dataset_name=ctx.dataset,
+            attack_budgets=ctx.attack_budgets,
+            results_dir=ctx.results_dir,
+            plots_dir=ctx.plots_dir,
+            success_rate_thresholds=success_rate_thresholds,
+            run_sampling_steps_ablation=run_sampling_steps,
+            eval_num_steps=eval_num_steps,
+            run_robustness_ablation=run_robustness_geoshield,
+            robustness_jpeg_quality_factors=ablation_controls.get("robustness_jpeg_quality_factors"),
+            robustness_gaussian_blur_sigmas=ablation_controls.get("robustness_gaussian_blur_sigmas"),
+            robustness_num_steps=ablation_controls.get("robustness_num_steps"),
         )
 
 
@@ -560,6 +605,7 @@ def _run_geoshield_shard(
     base_results_dir: str,
     attack_budgets: List[float],
     geoshield_name: str,
+    ctrls: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Generate + evaluate GeoShield for one image window, saving a per-shard state file.
 
@@ -567,11 +613,19 @@ def _run_geoshield_shard(
     shard selects the same seeded image window, generates its perturbations into shard-
     isolated clean/attacked dirs (the ``run_tag`` keeps concurrent shards from clobbering
     one another), and evaluates the pairs with the shared precomputed-pair runner. The
-    resulting state file is stitched in by ``merge-shards`` like any other attack.
+    sampling-steps / robustness ablations (when enabled in ``ctrls``) are recorded on the
+    attacked pairs too, so ``merge-shards`` overlays GeoShield in those ablation plots.
+    The resulting state file is stitched in by ``merge-shards`` like any other attack.
     """
     from utils.geoshield import generate_geoshield_pairs
 
     geoshield_cfg = config.get("geoshield", {}) or {}
+    ctrls = ctrls or {}
+    # Robustness is opt-in per attack type (like the trainable path): only run it for
+    # GeoShield when it is listed in robustness.attack_types. Sampling-steps applies to all.
+    run_robustness_geoshield = bool(ctrls.get("run_robustness_ablation")) and (
+        geoshield_name in (ctrls.get("robustness_attack_types") or [])
+    )
     run_tag = f"w{window_start:06d}_{window_end_label:06d}"
     shard_results_dir = os.path.join(base_results_dir, "shards", f"{geoshield_name}__{run_tag}")
 
@@ -611,6 +665,12 @@ def _run_geoshield_shard(
         stored_metrics=get_nested_config(config, "plot", "stored_metrics", default=DEFAULT_STORED_METRICS),
         run_config=config,
         gps_by_id=gps_by_filename,
+        run_sampling_steps_ablation=bool(ctrls.get("run_sampling_steps_ablation")),
+        eval_num_steps=ctrls.get("eval_num_steps"),
+        run_robustness_ablation=run_robustness_geoshield,
+        robustness_jpeg_quality_factors=ctrls.get("robustness_jpeg_quality_factors"),
+        robustness_gaussian_blur_sigmas=ctrls.get("robustness_gaussian_blur_sigmas"),
+        robustness_num_steps=ctrls.get("robustness_num_steps"),
     )
     print(f"\nGeoShield shard complete! Results saved to: {shard_results_dir}")
 
@@ -637,6 +697,7 @@ def cmd_evaluate_dataset_shard(args, config: Dict[str, Any]) -> None:
         return
 
     base_results_dir = pick_value(args.results_dir, config.get("results_dir"), str(DEFAULT_RESULTS_DIR))
+    ctrls = _resolve_ablation_controls(args, config)
 
     # GeoShield is out-of-process: it gets its own shard branch (one attack per shard).
     geoshield_name = get_nested_config(config, "geoshield", "attack_name", default="geoshield")
@@ -657,6 +718,7 @@ def cmd_evaluate_dataset_shard(args, config: Dict[str, Any]) -> None:
             base_results_dir=base_results_dir,
             attack_budgets=attack_budgets,
             geoshield_name=geoshield_name,
+            ctrls=ctrls,
         )
         return
 
@@ -665,7 +727,6 @@ def cmd_evaluate_dataset_shard(args, config: Dict[str, Any]) -> None:
         base_results_dir, "shards", f"{shard_tag}__w{window_start:06d}_{window_end_label:06d}"
     )
 
-    ctrls = _resolve_ablation_controls(args, config)
     parallel_workers = pick_value(args.parallel_workers, config.get("parallel_workers"), 1)
     use_real_gps = pick_value(args.use_real_gps, config.get("use_real_gps"), False)
 
@@ -963,13 +1024,22 @@ def run_precomputed_attack_eval(
     stored_metrics: List[str],
     run_config: Optional[Dict[str, Any]] = None,
     gps_by_id: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    run_sampling_steps_ablation: bool = False,
+    eval_num_steps: Optional[Sequence[int]] = None,
+    run_robustness_ablation: bool = False,
+    robustness_jpeg_quality_factors: Optional[Sequence[int]] = None,
+    robustness_gaussian_blur_sigmas: Optional[Sequence[float]] = None,
+    robustness_num_steps: Optional[int] = None,
+) -> "PrecomputedPairEvaluationRunner":
     """Evaluate precomputed clean/attacked pairs and persist results like any attack.
 
     Shared by ``evaluate-geoshield-vs-diffusion`` and the GeoShield step folded into
-    ``evaluate-dataset``. Returns the per-attack results dict; plotting is left to the
-    caller so it can overlay GeoShield with the other attacks. ``gps_by_id`` (filename ->
-    (lat, lon)) enables the true-position displacement metric when labels are available.
+    ``evaluate-dataset``. Returns the runner (use ``.metrics_collector.get_results()`` for
+    the per-attack results); plotting is left to the caller so it can overlay GeoShield
+    with the other attacks. ``gps_by_id`` (filename -> (lat, lon)) enables the
+    true-position displacement metric when labels are available. The sampling-steps /
+    robustness ablation flags, when set, record those eval-time ablations for the pairs
+    too (the restart ablation does not apply to a single precomputed image).
     """
     precomputed_config = PrecomputedPairEvaluationConfig(
         dataset=dataset,
@@ -984,13 +1054,19 @@ def run_precomputed_attack_eval(
         device=device,
         n_images=n_images,
         gps_by_id=gps_by_id,
+        run_sampling_steps_ablation=run_sampling_steps_ablation,
+        eval_num_steps=list(eval_num_steps) if eval_num_steps else None,
+        run_robustness_ablation=run_robustness_ablation,
+        robustness_jpeg_quality_factors=list(robustness_jpeg_quality_factors) if robustness_jpeg_quality_factors else None,
+        robustness_gaussian_blur_sigmas=list(robustness_gaussian_blur_sigmas) if robustness_gaussian_blur_sigmas else None,
+        robustness_num_steps=robustness_num_steps,
     )
     runner = PrecomputedPairEvaluationRunner(precomputed_config, pipeline)
     if run_config is not None:
         runner.save_run_config(run_config, suffix=precomputed_config.state_suffix)
     run_precomputed_pair_evaluation(runner)
     runner.save_results()
-    return runner.metrics_collector.get_results()
+    return runner
 
 
 def _precomputed_stored_metrics(config: Dict[str, Any]) -> List[str]:
@@ -1078,7 +1154,7 @@ def cmd_evaluate_geoshield_vs_diffusion(args, config: Dict[str, Any]) -> None:
         images_to_evaluate=n_images,
     )
 
-    all_results = run_precomputed_attack_eval(
+    precomputed_runner = run_precomputed_attack_eval(
         pipeline=pipeline,
         dataset=dataset,
         attack_name=attack_name,
@@ -1093,6 +1169,7 @@ def cmd_evaluate_geoshield_vs_diffusion(args, config: Dict[str, Any]) -> None:
         stored_metrics=resolved_stored_metrics,
         run_config=resolved_config,
     )
+    all_results = precomputed_runner.metrics_collector.get_results()
 
     plot_results(
         results_dir=results_dir,

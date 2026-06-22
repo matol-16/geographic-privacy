@@ -119,6 +119,41 @@ def build_restart_ablation_json(
 # --------------------------------------------------------------------------- #
 
 
+def evaluate_pair_at_steps(
+    pipeline,
+    source_image,
+    perturbed_image,
+    eval_num_steps: Sequence[int],
+    cfg: float = 10.0,
+    batch_size: int = 128,
+    seed: int = 1234,
+    device: str = "cuda",
+) -> Dict[int, float]:
+    """Evaluate an already-built clean/perturbed image pair at several step counts.
+
+    Returns ``{num_steps: final_step_displacement_km}``. The perturbed image is taken
+    as-is, so this serves precomputed pairs (e.g. GeoShield, read from disk) where there
+    is no ``delta`` tensor to reconstruct from -- the step count is the only thing that
+    varies across calls, exactly as in the trainable path.
+    """
+    displacement_by_steps: Dict[int, float] = {}
+    for num_steps in eval_num_steps:
+        eval_result = run_paired_pipeline_with_shared_noise(
+            pipeline=pipeline,
+            source_image=source_image,
+            perturbed_image=perturbed_image,
+            batch_size=batch_size,
+            cfg=cfg,
+            num_steps=int(num_steps),
+            seed=seed,
+            device=device,
+        )
+        displacement_by_steps[int(num_steps)] = float(
+            eval_result["metrics"]["final_step_displacement"]
+        )
+    return displacement_by_steps
+
+
 def evaluate_delta_at_steps(
     pipeline,
     source_image,
@@ -136,22 +171,16 @@ def evaluate_delta_at_steps(
     across calls is the number of inference steps.
     """
     perturbed_image = add_perturbation_to_image(source_image, delta.to(device), pipeline)
-    displacement_by_steps: Dict[int, float] = {}
-    for num_steps in eval_num_steps:
-        eval_result = run_paired_pipeline_with_shared_noise(
-            pipeline=pipeline,
-            source_image=source_image,
-            perturbed_image=perturbed_image,
-            batch_size=batch_size,
-            cfg=cfg,
-            num_steps=int(num_steps),
-            seed=seed,
-            device=device,
-        )
-        displacement_by_steps[int(num_steps)] = float(
-            eval_result["metrics"]["final_step_displacement"]
-        )
-    return displacement_by_steps
+    return evaluate_pair_at_steps(
+        pipeline=pipeline,
+        source_image=source_image,
+        perturbed_image=perturbed_image,
+        eval_num_steps=eval_num_steps,
+        cfg=cfg,
+        batch_size=batch_size,
+        seed=seed,
+        device=device,
+    )
 
 
 def build_sampling_steps_json(
@@ -237,10 +266,10 @@ def apply_gaussian_blur(image: Image.Image, sigma: float) -> Image.Image:
     return image.filter(ImageFilter.GaussianBlur(radius=float(sigma)))
 
 
-def evaluate_delta_under_transforms(
+def evaluate_pair_under_transforms(
     pipeline,
     source_image,
-    delta,
+    perturbed_image,
     jpeg_quality_factors: Sequence[int],
     gaussian_blur_sigmas: Sequence[float],
     cfg: float = 10.0,
@@ -250,19 +279,14 @@ def evaluate_delta_under_transforms(
     num_steps: Optional[int] = None,
     true_gps: Optional[Sequence[float]] = None,
 ) -> Dict[str, Dict[float, Dict[str, Optional[float]]]]:
-    """Re-evaluate a single trained perturbation after JPEG / blur degradation.
+    """Re-evaluate an already-built clean/perturbed pair after JPEG / blur degradation.
 
-    The protected image (clean + delta) is JPEG-compressed and Gaussian-blurred at
-    each configured level, then compared against the untransformed clean image with
-    the exact paired, shared-noise evaluation used everywhere else. Sampling steps
-    are held at ``num_steps`` (the baseline) for every transform.
-
-    Each level records two displacements (km), matching the main eval's two metrics:
-    ``"predicted"`` (transformed protected prediction vs the clean prediction) and,
-    when ``true_gps`` is given, ``"true"`` (vs the ground-truth GPS, the GeoShield
-    metric). Returns ``{"jpeg": {quality: {"predicted": .., "true": ..}}, "blur": {...}}``.
+    Like :func:`evaluate_delta_under_transforms` but takes the protected image directly
+    (read from disk), so it serves precomputed pairs such as GeoShield. The protected
+    image is degraded at each level and compared against the untransformed clean image
+    with the same paired, shared-noise evaluation. Returns
+    ``{"jpeg": {quality: {"predicted": .., "true": ..}}, "blur": {...}}``.
     """
-    perturbed_image = add_perturbation_to_image(source_image, delta.to(device), pipeline)
 
     def _displacements(transformed_image) -> Dict[str, Optional[float]]:
         eval_result = run_paired_pipeline_with_shared_noise(
@@ -291,6 +315,47 @@ def evaluate_delta_under_transforms(
             apply_gaussian_blur(perturbed_image, float(sigma))
         )
     return displacements
+
+
+def evaluate_delta_under_transforms(
+    pipeline,
+    source_image,
+    delta,
+    jpeg_quality_factors: Sequence[int],
+    gaussian_blur_sigmas: Sequence[float],
+    cfg: float = 10.0,
+    batch_size: int = 128,
+    seed: int = 1234,
+    device: str = "cuda",
+    num_steps: Optional[int] = None,
+    true_gps: Optional[Sequence[float]] = None,
+) -> Dict[str, Dict[float, Dict[str, Optional[float]]]]:
+    """Re-evaluate a single trained perturbation after JPEG / blur degradation.
+
+    The protected image (clean + delta) is JPEG-compressed and Gaussian-blurred at
+    each configured level, then compared against the untransformed clean image with
+    the exact paired, shared-noise evaluation used everywhere else. Sampling steps
+    are held at ``num_steps`` (the baseline) for every transform.
+
+    Each level records two displacements (km), matching the main eval's two metrics:
+    ``"predicted"`` (transformed protected prediction vs the clean prediction) and,
+    when ``true_gps`` is given, ``"true"`` (vs the ground-truth GPS, the GeoShield
+    metric). Returns ``{"jpeg": {quality: {"predicted": .., "true": ..}}, "blur": {...}}``.
+    """
+    perturbed_image = add_perturbation_to_image(source_image, delta.to(device), pipeline)
+    return evaluate_pair_under_transforms(
+        pipeline=pipeline,
+        source_image=source_image,
+        perturbed_image=perturbed_image,
+        jpeg_quality_factors=jpeg_quality_factors,
+        gaussian_blur_sigmas=gaussian_blur_sigmas,
+        cfg=cfg,
+        batch_size=batch_size,
+        seed=seed,
+        device=device,
+        num_steps=num_steps,
+        true_gps=true_gps,
+    )
 
 
 def pred_true_from_cell(cell: Any) -> tuple[Optional[float], Optional[float]]:

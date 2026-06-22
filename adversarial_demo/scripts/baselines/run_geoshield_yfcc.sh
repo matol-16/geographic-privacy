@@ -10,7 +10,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/common.sh"
+source "${SCRIPT_DIR}/../common.sh"
 source "${SCRIPT_DIR}/geoshield_common.sh"
 PROJECT_DIR="$(repo_root)"
 REPOS_ROOT="$(cd "${PROJECT_DIR}/../.." && pwd)"   # holds both plonk/ and Geoshield/

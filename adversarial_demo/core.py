@@ -102,6 +102,16 @@ class PrecomputedPairEvaluationConfig:
     # computes the true-position displacement metric just like the trainable attacks;
     # left None for arbitrary precomputed folders that have no labels (predicted-only).
     gps_by_id: Optional[Dict[str, Tuple[float, float]]] = None
+    # Ablations the precomputed pairs (e.g. GeoShield) take part in. Both are eval-time
+    # properties of the attacked image, so they apply unchanged to precomputed pairs.
+    # (The restart ablation is intentionally absent: a precomputed attack has a single,
+    # already-generated image, so there is nothing to restart.)
+    run_sampling_steps_ablation: bool = False
+    eval_num_steps: Optional[List[int]] = None
+    run_robustness_ablation: bool = False
+    robustness_jpeg_quality_factors: Optional[List[int]] = None
+    robustness_gaussian_blur_sigmas: Optional[List[float]] = None
+    robustness_num_steps: Optional[int] = None
 
 
 class ImageLoader:
@@ -584,13 +594,23 @@ class BaseEvaluationRunner:
             "robustness_results": mc.robustness_results,
         }
 
+    def _state_file_suffix(self) -> str:
+        """Suffix for the resumable-state filename (``..._eval_state<suffix>.pt``).
+
+        Defaults to ``state_suffix``. Subclasses that may share a ``results_dir`` with
+        another runner (e.g. the precomputed GeoShield runner sitting next to the
+        trainable runner in the single-GPU ``evaluate-dataset``) override this to add the
+        attack name, so the two never overwrite each other's state file.
+        """
+        return self.config.state_suffix
+
     def save_state(self) -> None:
         """Persist the current incremental evaluation state."""
         self.results_manager.save_state(
             self._build_state(),
             self.config.dataset,
             self.config.seed,
-            suffix=self.config.state_suffix,
+            suffix=self._state_file_suffix(),
         )
 
     def _load_state_if_available(self) -> None:
@@ -598,7 +618,7 @@ class BaseEvaluationRunner:
         state = self.results_manager.load_state(
             self.config.dataset,
             self.config.seed,
-            suffix=self.config.state_suffix,
+            suffix=self._state_file_suffix(),
         )
         if state is None:
             return
@@ -645,7 +665,7 @@ class BaseEvaluationRunner:
         )
         print(
             f"Resumed {self.state_kind} state from "
-            f"{self.results_manager.get_state_path(self.config.dataset, self.config.seed, self.config.state_suffix)}"
+            f"{self.results_manager.get_state_path(self.config.dataset, self.config.seed, self._state_file_suffix())}"
         )
 
     def _is_state_compatible(self, saved_signature: Any) -> bool:
@@ -1118,6 +1138,12 @@ class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
 
     # ---- State hooks ------------------------------------------------------- #
 
+    def _state_file_suffix(self) -> str:
+        # Include the attack name so a precomputed run (e.g. GeoShield) never overwrites
+        # the trainable run's ``..._eval_state.pt`` when they share a results_dir (the
+        # single-GPU evaluate-dataset case).
+        return f"_{self.config.attack_name}{self.config.state_suffix}"
+
     def _build_state_signature(self) -> Dict[str, Any]:
         return {
             "dataset": self.config.dataset,
@@ -1133,6 +1159,12 @@ class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
             "num_steps": self.config.num_steps,
             "n_images": self.config.n_images,
             "state_suffix": self.config.state_suffix,
+            "run_sampling_steps_ablation": self.config.run_sampling_steps_ablation,
+            "eval_num_steps": list(self.config.eval_num_steps) if self.config.eval_num_steps else None,
+            "run_robustness_ablation": self.config.run_robustness_ablation,
+            "robustness_jpeg_quality_factors": list(self.config.robustness_jpeg_quality_factors) if self.config.robustness_jpeg_quality_factors else None,
+            "robustness_gaussian_blur_sigmas": list(self.config.robustness_gaussian_blur_sigmas) if self.config.robustness_gaussian_blur_sigmas else None,
+            "robustness_num_steps": self.config.robustness_num_steps,
         }
 
     def _signature_match_keys(self) -> List[str]:
@@ -1146,6 +1178,12 @@ class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
             "cfg",
             "num_steps",
             "state_suffix",
+            "run_sampling_steps_ablation",
+            "eval_num_steps",
+            "run_robustness_ablation",
+            "robustness_jpeg_quality_factors",
+            "robustness_gaussian_blur_sigmas",
+            "robustness_num_steps",
         ]
 
     def _budget_identity_from_signature(self, signature: Dict[str, Any], budget_idx: int) -> Any:
@@ -1392,6 +1430,50 @@ def run_precomputed_pair_evaluation(runner: PrecomputedPairEvaluationRunner) -> 
             image_idx,
             attack_result,
         )
+
+        # Eval-time ablations on the already-attacked image (same helpers as the
+        # trainable path, but fed the perturbed image directly instead of a delta). Both
+        # use a constant eval seed so the shared clean/perturbed noise stays comparable
+        # across step counts / transforms, matching the trainable ablations.
+        cfg = runner.config
+        if cfg.run_sampling_steps_ablation and cfg.eval_num_steps:
+            from utils.ablations import evaluate_pair_at_steps
+            steps_samples = evaluate_pair_at_steps(
+                pipeline=runner.pipeline,
+                source_image=clean_image,
+                perturbed_image=attacked_image,
+                eval_num_steps=cfg.eval_num_steps,
+                cfg=cfg.cfg,
+                batch_size=cfg.batch_size,
+                seed=int(cfg.seed),
+                device=cfg.device,
+            )
+            runner.metrics_collector.record_sampling_steps(
+                attack_type, budget_idx, image_idx, steps_samples
+            )
+
+        if cfg.run_robustness_ablation and (
+            cfg.robustness_jpeg_quality_factors or cfg.robustness_gaussian_blur_sigmas
+        ):
+            from utils.ablations import evaluate_pair_under_transforms
+            true_gps = runner.source_gps[image_idx] if runner.source_gps is not None else None
+            robustness_samples = evaluate_pair_under_transforms(
+                pipeline=runner.pipeline,
+                source_image=clean_image,
+                perturbed_image=attacked_image,
+                jpeg_quality_factors=cfg.robustness_jpeg_quality_factors or [],
+                gaussian_blur_sigmas=cfg.robustness_gaussian_blur_sigmas or [],
+                cfg=cfg.cfg,
+                batch_size=cfg.batch_size,
+                seed=int(cfg.seed),
+                device=cfg.device,
+                num_steps=cfg.robustness_num_steps if cfg.robustness_num_steps is not None else cfg.num_steps,
+                true_gps=true_gps,
+            )
+            runner.metrics_collector.record_robustness(
+                attack_type, budget_idx, image_idx, robustness_samples
+            )
+
         runner.save_state()
         pbar.set_postfix(
             attack=attack_type,
