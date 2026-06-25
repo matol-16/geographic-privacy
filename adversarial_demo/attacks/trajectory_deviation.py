@@ -6,6 +6,9 @@ import torch
 import numpy as np
 from typing import Any, Dict, List, Optional
 
+from torch.func import jvp as _func_jvp, vmap as _func_vmap
+from plonk.utils.manifolds import geodesic as _sphere_geodesic
+
 from attacks.attacks_core import AttackBase
 from utils.adversarial_utils import (
     conditional_preprocessing,
@@ -751,4 +754,148 @@ class UniDef(DiffusionAttack):
         config["cdd_reference"] = self.cdd_reference
         config["project_to_manifold"] = self.project_to_manifold
         config["attack_mode"] = "untargeted"
+        return config
+
+
+############################################################################################
+# TrainingLossAttack: maximize the model's own training loss
+############################################################################################
+
+
+class TrainingLossAttack(DiffusionAttack):
+    """Maximize the model's training loss w.r.t. the conditioning image.
+
+    Objective: max_delta E_{t, noise}[||network(x_t, emb(I+delta), gamma) - v_true||^2]
+
+    where the forward process and true target v_true adapt to the model parameterization:
+
+    - **diffusion (DDPM)**: x_t = sqrt(gamma)*x0 + sqrt(1-gamma)*n,  v_true = n
+    - **flow matching**:    x_t = gamma*x0 + (1-gamma)*n,            v_true = x0 - n
+    - **Riemannian FM**:    x_t = geodesic(x0_sphere, x0_data, gamma), v_true = d(geodesic)/d(gamma)
+
+    Unlike the other DiffusionAttack variants (which compare the perturbed network output
+    against the *clean model's* prediction), this attack uses the true training target, so
+    it directly maximises the loss that the model was trained to minimise.
+    """
+
+    def __init__(
+        self,
+        pipeline,
+        source_image: Image.Image,
+        n_steps: int = 400,
+        train_batch_size: int = 64,
+        lr: float = 2e-2,
+        eps_max: float = 1.0,
+        anchor_samples: int = 256,
+        clean_num_steps: int = 200,
+        reconstruction_loss_weight: float = 0.0,
+        delta_init: float = 1e-4,
+        num_restarts: int = 1,
+        restart_selection_metric: str = "final_step_displacement",
+        device: str = "cuda",
+        x0_bank: Optional[torch.Tensor] = None,
+    ):
+        super().__init__(
+            pipeline=pipeline,
+            source_image=source_image,
+            n_steps=n_steps,
+            train_batch_size=train_batch_size,
+            lr=lr,
+            eps_max=eps_max,
+            anchor_samples=anchor_samples,
+            clean_num_steps=clean_num_steps,
+            target_pure_noise=False,
+            dot_product_loss="l2",  # not used; run_step is fully overridden
+            reconstruction_loss_weight=reconstruction_loss_weight,
+            delta_init=delta_init,
+            num_restarts=num_restarts,
+            restart_selection_metric=restart_selection_metric,
+            device=device,
+            x0_bank=x0_bank,
+        )
+        self.model_kind = detect_model_kind(pipeline)
+        self.manifold = getattr(pipeline, "manifold", None) if self.model_kind == "rfm" else None
+
+    def run_step(
+        self,
+        delta: torch.Tensor,
+        step: int,
+        optimizer: torch.optim.Optimizer,
+    ) -> float:
+        """One sign-SGD step maximizing the model's training loss."""
+        optimizer.zero_grad(set_to_none=True)
+
+        idx = torch.randint(0, self.x0_bank.shape[0], (self.train_batch_size,), device=self.device)
+        x0 = self.x0_bank[idx]
+        n = torch.randn_like(x0)
+        t = torch.rand(self.train_batch_size, device=self.device)
+        gamma = self.pipeline.scheduler(t)
+
+        if self.model_kind == "diffusion":
+            # DDPM forward process; network predicts noise n
+            x_t = torch.sqrt(gamma).unsqueeze(-1) * x0 + torch.sqrt(1.0 - gamma).unsqueeze(-1) * n
+            v_true = n
+
+        elif self.model_kind == "flow":
+            # Linear flow matching forward process; network predicts velocity (x0 - n)
+            x_t = gamma.unsqueeze(-1) * x0 + (1.0 - gamma).unsqueeze(-1) * n
+            v_true = x0 - n
+
+        else:  # "rfm"
+            # Riemannian flow matching: geodesic from a random sphere point to the data point.
+            # x0_bank holds data (GPS as Cartesian sphere points) = x1 in training notation;
+            # x0_sphere is the noise end (uniform random on sphere) = x0 in training notation.
+            x0_sphere = self.manifold.random_base(self.train_batch_size, x0.shape[-1]).to(
+                device=self.device, dtype=x0.dtype
+            )
+            gamma_exp = gamma.unsqueeze(-1)  # (B, 1) — vmap maps over batch dimension
+
+            def _cond_u(x0_s, x1, g):
+                path = _sphere_geodesic(self.manifold, x0_s, x1)
+                x_t_i, u_t_i = _func_jvp(path, (g,), (torch.ones_like(g),))
+                return x_t_i.squeeze(-2), u_t_i.squeeze(-2)
+
+            x_t_batch, v_true_batch = _func_vmap(_cond_u)(x0_sphere, x0, gamma_exp)
+            x_t = x_t_batch.reshape(self.train_batch_size, -1)
+            v_true = v_true_batch.reshape(self.train_batch_size, -1)
+
+        # Perturbed embedding (gradient tracked through the encoder)
+        perturbed_source = self.source_tensor + delta
+        emb_perturbed = compute_embedding(
+            perturbed_source,
+            self.train_batch_size,
+            self.pipeline,
+            device=self.device,
+            track_grad=True,
+        )
+
+        pred = self.pipeline.model({"y": x_t, "emb": emb_perturbed, "gamma": gamma})
+
+        # Maximize ||pred - v_true||^2 by minimizing the negated MSE
+        if self.model_kind == "rfm":
+            diff = pred - v_true
+            loss = -(self.manifold.inner(x_t, diff, diff).mean() / x_t.shape[-1])
+        else:
+            loss = -torch.nn.functional.mse_loss(pred, v_true)
+
+        if self.reconstruction_loss_weight > 0:
+            loss = loss + self.reconstruction_loss_weight * torch.nn.functional.l1_loss(
+                perturbed_source, self.source_tensor
+            )
+
+        loss.backward()
+
+        with torch.no_grad():
+            delta.grad = torch.sign(delta.grad)
+            optimizer.step()
+            delta.data = torch.clamp(delta.data, -self.eps_max, self.eps_max)
+            delta.grad.zero_()
+
+        return float(loss.item())
+
+    def get_config(self) -> Dict[str, Any]:
+        config = super().get_config()
+        config["model_kind"] = self.model_kind
+        config.pop("target_pure_noise", None)
+        config.pop("dot_product_loss", None)
         return config

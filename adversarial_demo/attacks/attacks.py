@@ -10,7 +10,7 @@ from PIL import Image
 
 from utils.adversarial_utils import resolve_torch_device
 from attacks.encoder_attacks import EncoderAttack
-from attacks.trajectory_deviation import DiffusionAttack, ACE, UniDef
+from attacks.trajectory_deviation import DiffusionAttack, ACE, UniDef, TrainingLossAttack
 from attacks.diffusion_attack_salman import SamplingAttack
 
 
@@ -160,6 +160,7 @@ def run_attack(
 		"uni_def": "unidef",
 		"cdd": "unidef",
 		"unidef_nofdje": "unidef_nofdje",
+		"training_loss": "training_loss",
 	}
 	normalized_type = aliases.get(str(attack_type).lower())
 	if normalized_type is None:
@@ -224,6 +225,12 @@ def run_attack(
 			source_image=source_image,
 			pipeline=pipeline,
 			attack_type_label="unidef_nofdje",
+			**kwargs
+		)
+	if normalized_type == "training_loss":
+		return _run_training_loss_attack(
+			source_image=source_image,
+			pipeline=pipeline,
 			**kwargs
 		)
 	raise ValueError(f"Unhandled normalized attack type: {normalized_type}")
@@ -522,6 +529,74 @@ def _run_unidef_attack(
 	return _run_restartable_attack(
 		attack=attack,
 		attack_type=attack_type_label,
+		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
+		show_progress=show_progress,
+		early_stopping_patience=early_stopping_patience,
+		restart_eval_batch_size=restart_eval_batch_size,
+		restart_eval_cfg=restart_eval_cfg,
+		restart_eval_num_steps=restart_eval_num_steps,
+		restart_eval_seed=restart_eval_seed,
+		num_restart_workers=num_restart_workers,
+		main_num_restarts=main_num_restarts,
+	)
+
+
+def _run_training_loss_attack(
+	source_image: Image.Image,
+	pipeline,
+	n_steps: int = 400,
+	train_batch_size: int = 64,
+	lr: float = 2e-2,
+	eps_max: float = 1.0,
+	anchor_samples: int = 256,
+	clean_num_steps: int = 200,
+	reconstruction_loss_weight: float = 0.0,
+	delta_init: float = 1e-4,
+	num_restarts: int = 1,
+	restart_selection_metric: str = "final_step_displacement",
+	restart_eval_batch_size: int = 256,
+	restart_eval_cfg: float = 10.0,
+	restart_eval_num_steps: Optional[int] = None,
+	main_num_restarts: Optional[int] = None,
+	restart_eval_seed: int = 1234,
+	print_restart_results: bool = True,
+	show_progress: bool = True,
+	device: str = "cuda",
+	early_stopping_patience: int = 0,
+	num_restart_workers: int = 1,
+	**kwargs,
+) -> Dict[str, Any]:
+	"""Run the training-loss attack: maximize the model's own training loss."""
+	x0_bank = _build_shared_x0_bank(
+		pipeline,
+		source_image,
+		anchor_samples=anchor_samples,
+		clean_num_steps=clean_num_steps,
+		device=device,
+		show_progress=show_progress,
+	)
+
+	attack = TrainingLossAttack(
+		pipeline=pipeline,
+		source_image=source_image,
+		n_steps=n_steps,
+		train_batch_size=train_batch_size,
+		lr=lr,
+		eps_max=eps_max,
+		anchor_samples=anchor_samples,
+		clean_num_steps=clean_num_steps,
+		reconstruction_loss_weight=reconstruction_loss_weight,
+		delta_init=delta_init,
+		num_restarts=num_restarts,
+		restart_selection_metric=restart_selection_metric,
+		device=device,
+		x0_bank=x0_bank,
+	)
+	attack.restart_manager.print_results = print_restart_results
+
+	return _run_restartable_attack(
+		attack=attack,
+		attack_type="training_loss",
 		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
 		show_progress=show_progress,
 		early_stopping_patience=early_stopping_patience,

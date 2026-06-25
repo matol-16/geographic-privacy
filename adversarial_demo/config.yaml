@@ -109,7 +109,7 @@ eval_num_steps: [8, 16, 32, 64, 128, 250]
 # - num_steps: null => reuse each attack's restart_eval_num_steps (the baseline).
 robustness:
   attack_types: [geoshield, dtd, encoder, sampling]
-  jpeg_quality_factors: [20, 40, 60, 80]
+  jpeg_quality_factors: [20, 40, 60, 80, 100]
   gaussian_blur_sigmas: [0, 2, 4, 6, 8, 10]
   num_steps: null
 
