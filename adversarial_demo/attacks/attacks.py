@@ -474,8 +474,6 @@ def _run_unidef_attack(
 	fd: float = 0.01,
 	fdje_direction: str = "embedding",
 	fdje_num_samples: int = 1,
-	cdd_reference: str = "auto",  # "auto" | "noise" | "clean_velocity"
-	project_to_manifold: Optional[bool] = None,  # None => auto from model kind
 	delta_init: float = 1e-4,
 	num_restarts: int = 1,
 	restart_selection_metric: str = "final_step_displacement",
@@ -516,8 +514,6 @@ def _run_unidef_attack(
 		fd=fd,
 		fdje_direction=fdje_direction,
 		fdje_num_samples=fdje_num_samples,
-		cdd_reference=cdd_reference,
-		project_to_manifold=project_to_manifold,
 		delta_init=delta_init,
 		num_restarts=num_restarts,
 		restart_selection_metric=restart_selection_metric,

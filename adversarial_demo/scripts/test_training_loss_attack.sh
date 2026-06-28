@@ -18,14 +18,14 @@ PROJECT_DIR="$(repo_root)"
 
 CONFIG_PATH="${PROJECT_DIR}/config.yaml"
 DATASET="yfcc"
-ATTACK_TYPES=(training_loss)
+ATTACK_TYPES=(training_loss unidef)
 N_IMAGES=200
-RESULTS_DIR="${PROJECT_DIR}/results/test_training_loss"
+RESULTS_DIR="${PROJECT_DIR}/results/test/test_training_loss"
 PLOTS_DIR="${RESULTS_DIR}/plots"
 PARALLEL_WORKERS=1
 EVAL_NUM_STEPS=(8 16 32 64 250)
 
-ATTACK_BUDGETS=(0.0314 0.0628)
+ATTACK_BUDGETS=(0.0314 )
 BUDGETS="[$(IFS=,; echo "${ATTACK_BUDGETS[*]}")]"
 
 export MPLBACKEND=Agg

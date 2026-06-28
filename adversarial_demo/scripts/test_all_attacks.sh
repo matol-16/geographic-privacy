@@ -28,7 +28,7 @@ CONFIG_PATH="${PROJECT_DIR}/config.yaml"
 DATASET="yfcc"
 # ATTACK_TYPES=(encoder sampling diffusion_l2 dtd unidef ace geoshield)
 ATTACK_TYPES=(geoshield encoder dtd)
-N_IMAGES=5
+N_IMAGES=20
 RESULTS_DIR="${PROJECT_DIR}/results/cluster_eval/test_2206_v3"
 PLOTS_DIR="${RESULTS_DIR}/plots"
 PARALLEL_WORKERS=1
@@ -36,7 +36,7 @@ EVAL_NUM_STEPS=(8 16 32 64 250)            # sampling-steps ablation grid
 
 # Attack budgets are the single source of truth; GeoShield's epsilon is derived as
 # round(budget * 255) (0.0314 -> 8/255) unless overridden in config.geoshield.epsilons.
-ATTACK_BUDGETS=( 0.0314 )
+ATTACK_BUDGETS=( 0.0314 0.0628)
 BUDGETS="[$(IFS=,; echo "${ATTACK_BUDGETS[*]}")]"   # "[0.0314]" override string
 
 export MPLBACKEND=Agg                  # headless plotting
