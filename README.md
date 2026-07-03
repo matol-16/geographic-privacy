@@ -158,6 +158,43 @@ for the full workflow (restartable shards, partial-failure recovery, OSV-5M subs
 sharding). The underlying commands — `python main.py evaluate-dataset-shard ...` then
 `python main.py merge-shards ...` — can also be run by hand.
 
+## Paper-ready plots
+
+Every ablation plot — robustness to JPEG/blur, cross-model transferability, and
+sampling-steps — is saved both as a high-dpi PNG (300 dpi) and a vector PDF, ready to
+drop straight into the paper. This is implemented in
+[`adversarial_demo/utils/plots/ablations.py`](adversarial_demo/utils/plots/ablations.py)
+(re-exported, as before, through `utils/plots_adversarial_attacks.py`).
+
+These plots are produced automatically as part of `evaluate-robustness`,
+`evaluate-sampling-steps`, and `merge-shards` (cluster workflow). There is also an
+attack-displacement-variance box plot (see below) that can be regenerated standalone,
+purely from already-computed results, with:
+
+```bash
+cd adversarial_demo
+python main.py plot dtd-variance \
+    --dataset yfcc \
+    --results-dir <results_dir> \
+    --plots-dir <plots_dir> \
+    --attack-types encoder sampling diffusion_l2 dtd ace geoshield training_loss unidef
+```
+
+(`plot success-rate` and `plot results` work the same way for the main displacement /
+success-rate figures — see `python main.py plot --help`.)
+
+### Attack displacement variance ("DTD" spread)
+
+`plot_attack_dtd_variance` complements the mean-displacement plots by showing how
+*consistent* each attack is rather than just how strong it is on average: for every
+`(attack type, budget)` pair it draws a box plot (median, IQR, whiskers) of the
+per-image final-step displacement in km — the paper's core geolocation-deviation
+metric, referred to as "DTD" — across the whole evaluated image set. A tall box means
+the attack works very well on some images and barely at all on others; a short box
+means the effect is uniform. The underlying mean/median/std/variance per attack and
+budget are also dumped to `<dataset>_attack_dtd_variance.json` next to the figure, so
+the numbers can be reused without re-plotting.
+
 ## Code structure
 
 As mentioned above, all the new code in is *adversarial_demo*. 

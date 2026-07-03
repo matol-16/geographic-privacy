@@ -178,6 +178,20 @@ def _select_displacement_metric(gps_true: bool) -> str:
     return "final_step_displacement_true" if gps_true else "final_step_displacement_predicted"
 
 
+def select_closest_budget(attack_budgets, target_eps: float) -> float:
+    """Return the value in ``attack_budgets`` closest to ``target_eps``.
+
+    Used by the ablation plots (robustness, model-transfer, sampling-steps,
+    DTD-variance) to pin every panel to a single attack budget instead of
+    drawing one line/box per budget.
+    """
+    arr = np.asarray(attack_budgets, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        raise ValueError("attack_budgets is empty")
+    idx = int(np.argmin(np.abs(arr - target_eps)))
+    return float(arr[idx])
+
+
 def _display_attack_name(attack_name: str) -> str:
     normalized = str(attack_name).lower()
     # DTD = Diffusion Trajectory Deviation (raw cosine-similarity objective).
@@ -188,7 +202,7 @@ def _display_attack_name(attack_name: str) -> str:
     if normalized in ("sampling", "diffusion_salman", "salman"):
         return "Sampling"
     if normalized == "diffusion_l2":
-        return "Diffusion L2"
+        return "L2"
     if normalized == "ace":
         return "ACE"
     if normalized == "unidef":
@@ -199,6 +213,8 @@ def _display_attack_name(attack_name: str) -> str:
         return "Encoder"
     if normalized == "geoshield":
         return "GeoShield"
+    if normalized == "training_loss":
+        return "AdvDM"
     return str(attack_name).replace("_", " ").title()
 
 

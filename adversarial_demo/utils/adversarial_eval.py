@@ -367,7 +367,7 @@ def evaluate_attack_on_dataset(
     dataset_roots: Optional[Dict[str, str]] = None,
     plot_success_rate: bool = False,
     plot_success_rate_thresholds: Optional[list[float]] = None,
-    plot_gps_true: bool = False,
+    plot_gps_true: bool = True,
     config_dump: Optional[Dict[str, Any]] = None,
     max_restarts: Optional[int] = None,
     run_sampling_steps_ablation: bool = False,
@@ -764,7 +764,7 @@ def merge_shards(
     dataset_roots: Optional[Dict[str, str]] = None,
     plot_success_rate: bool = False,
     success_rate_thresholds: Optional[Sequence[float]] = None,
-    plot_gps_true: bool = False,
+    plot_gps_true: bool = True,
     run_sampling_steps_ablation: bool = False,
     eval_num_steps: Optional[Sequence[int]] = None,
     run_robustness_ablation: bool = False,
@@ -1009,79 +1009,314 @@ def _cell_value(src_by_attack, attack_type, budget_idx, local_idx):
     return src_budget[local_idx]
 
 
-def evaluate_localizability(
-    attack_types,
+# --------------------------------------------------------------------------- #
+# Localizability: a two-stage pipeline decoupled from the attack evaluation.
+#
+# The localizability of an image (how confidently the RFM model can place it) is a
+# property of the *clean* image alone, independent of any attack. On a full-dataset
+# cluster run the attacks are evaluated separately (evaluate-dataset-shard / merge),
+# so we precompute the localizability scores once, key them by image id, and store
+# them. Stage 2 ("plot") then joins those scores to whatever attack results exist on
+# disk by image id and produces the localizability-vs-attack-strength figure, without
+# re-running any attack.
+#
+#   Stage 1 (compute):  compute_localizability_scores()  -> per-window shard files
+#                       merge_localizability_scores()     -> {dataset}_localizability.pt
+#   Stage 2 (plot):     plot_localizability_vs_attacks()  -> joins with attack results
+# --------------------------------------------------------------------------- #
+
+DEFAULT_LOCALIZABILITY_MC_SAMPLES = 256
+LOCALIZABILITY_SHARDS_SUBDIR = "localizability_shards"
+
+
+def _localizability_shard_path(results_dir: str, dataset_name: str, window_start: int, window_end: int) -> str:
+    """Per-window shard file holding the localizability scores for one image window."""
+    shards_dir = os.path.join(results_dir, LOCALIZABILITY_SHARDS_SUBDIR)
+    return os.path.join(shards_dir, f"{dataset_name}_loc__w{window_start:06d}_{window_end:06d}.pt")
+
+
+def _localizability_path(results_dir: str, dataset_name: str) -> str:
+    """Merged, full-dataset localizability file (id -> score), the input to the plot stage."""
+    return os.path.join(results_dir, f"{dataset_name}_localizability.pt")
+
+
+def compute_localizability_scores(
     pipeline,
-    dataset_name,
+    dataset_name: str,
     seed: int = 0,
     n_images_to_eval: int = 100,
-    plot_dir: Optional[str] = "/plots",
-    results_dir: Optional[str] = "/results",
-    attack_budgets: list[float] = [2/255, 15/255, 50/255],
-    attack_kwargs: list[Dict[str, Any]] = [{}],
+    results_dir: str = "./results",
     dataset_roots: Optional[Dict[str, str]] = None,
+    window_start: int = 0,
+    window_end: Optional[int] = None,
+    num_monte_carlo_samples: int = DEFAULT_LOCALIZABILITY_MC_SAMPLES,
     config_dump: Optional[Dict[str, Any]] = None,
-    attack_type_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
-):
-    """Evaluate how attack strength varies with the localizability of the source image.
+    save_every: int = 25,
+) -> Dict[str, Any]:
+    """Stage 1: compute the RFM localizability of each (clean) image in a seeded window.
 
-    Localizability is computed on the clean image; attack strength is final-step
-    displacement. Images can be bucketed into low/med/high localizability and the
-    average attack strength compared per bucket, attack budget, and attack type.
+    ``n_images_to_eval`` is the size of the full seeded pool; ``window_start`` /
+    ``window_end`` select the contiguous slice to compute here (the whole pool by
+    default), matching the windowing used by the sharded attack evaluation so the ids
+    line up. Scores are written to a per-window shard file under
+    ``<results_dir>/localizability_shards/`` and are resumable: an interrupted shard
+    re-loads the ids it already finished and only computes the rest. ``merge_localizability_scores``
+    later stitches every shard into ``<dataset>_localizability.pt`` for the plot stage.
     """
-    from core import EvaluationConfig, EvaluationRunner, sequential_evaluate_attacks, ImageLoader
+    from core import ImageLoader
 
     seed_everything(seed)
-
     dataset_roots = dataset_roots or {}
 
-    print(f"Loading {n_images_to_eval} images from {dataset_name} dataset...")
-    source_images, source_gps, source_image_ids = ImageLoader.load_images(
+    print(f"Loading window [{window_start}:{window_end}] of the seeded {dataset_name} "
+          f"pool (size {n_images_to_eval})...")
+    source_images, _source_gps, source_image_ids = ImageLoader.load_images(
         dataset=dataset_name,
         n_images=n_images_to_eval,
         seed=seed,
         dataset_roots=dataset_roots,
+        window_start=window_start,
+        window_end=window_end,
     )
+    resolved_window_end = window_end if window_end is not None else n_images_to_eval
 
-    attack_kwargs = expand_per_budget_kwargs(attack_kwargs, len(attack_budgets))
+    shard_path = _localizability_shard_path(results_dir, dataset_name, window_start, resolved_window_end)
+    os.makedirs(os.path.dirname(shard_path), exist_ok=True)
 
-    print("Computing localizability scores...")
-    localizability = torch.zeros(len(source_images))
+    # Resume: keep any scores already computed for this exact window/seed/MC-sample config.
+    scores_by_id: Dict[str, float] = {}
+    if os.path.exists(shard_path):
+        prev = torch.load(shard_path, map_location="cpu")
+        if (prev.get("seed") == seed
+                and prev.get("num_monte_carlo_samples") == num_monte_carlo_samples
+                and prev.get("total_images") == n_images_to_eval):
+            scores_by_id = dict(prev.get("scores_by_id", {}))
+            print(f"Resuming from {shard_path}: {len(scores_by_id)} scores already computed.")
+
+    def _save_shard() -> Dict[str, Any]:
+        ids = [i for i in source_image_ids if i in scores_by_id]
+        loc = torch.tensor([scores_by_id[i] for i in ids], dtype=torch.float32)
+        payload = {
+            "image_ids": ids,
+            "localizability": loc,
+            "scores_by_id": scores_by_id,
+            "window_start": window_start,
+            "window_end": resolved_window_end,
+            "total_images": n_images_to_eval,
+            "seed": seed,
+            "num_monte_carlo_samples": num_monte_carlo_samples,
+            "dataset": dataset_name,
+        }
+        tmp = f"{shard_path}.tmp"
+        torch.save(payload, tmp)
+        os.replace(tmp, shard_path)
+        return payload
+
+    todo = [(i, img) for i, (img, iid) in enumerate(zip(source_images, source_image_ids))
+            if iid not in scores_by_id]
     pbar = tqdm_module.tqdm(total=len(source_images), desc="Computing localizability")
-    for i, img in enumerate(source_images):
-        localizability[i] = pipeline.compute_localizability(img, number_monte_carlo_samples=256).item()
+    pbar.update(len(source_images) - len(todo))
+    for done, (i, img) in enumerate(todo, start=1):
+        with torch.inference_mode():
+            score = pipeline.compute_localizability(
+                img, number_monte_carlo_samples=num_monte_carlo_samples
+            ).item()
+        scores_by_id[source_image_ids[i]] = score
         pbar.update(1)
+        if done % save_every == 0:
+            _save_shard()
     pbar.close()
 
-    results_dir = results_dir or "/results"
-    plot_dir = plot_dir or "/plots"
-    config = EvaluationConfig(
-        dataset=dataset_name,
-        seed=seed,
-        attack_types=attack_types,
-        attack_budgets=attack_budgets,
-        attack_kwargs=attack_kwargs,
-        n_images=n_images_to_eval,
-        results_dir=results_dir,
-        plots_dir=plot_dir,
-        stored_metrics=["final_step_displacement_predicted"],
-        parallel_workers=1,  # Use sequential for localizability
-        use_cuda_streams=False,
-        dataset_roots=dataset_roots,
-        state_suffix="_localizability",
-        attack_type_kwargs=attack_type_kwargs or {},
-    )
+    payload = _save_shard()
+    print(f"Saved {len(scores_by_id)} localizability scores to: {shard_path}")
+    return payload
 
-    runner = EvaluationRunner(config, pipeline)
-    if config_dump is not None:
-        runner.save_run_config(config_dump, suffix="_localizability")
-    sequential_evaluate_attacks(runner)
 
-    results = {
-        "attack_results": runner.metrics_collector.get_results(),
-        "localizability": localizability,
+def merge_localizability_scores(
+    dataset_name: str,
+    results_dir: str = "./results",
+    shards_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Stitch every localizability shard into the full-dataset ``<dataset>_localizability.pt``.
+
+    Reads each per-window shard, unions the ``scores_by_id`` maps (later shards win on
+    a clash, which only happens for overlapping windows of an identical score), and
+    writes the merged file the plot stage consumes. The merged ``image_ids`` are sorted
+    for a stable on-disk ordering; the plot stage re-aligns by id to each attack's order.
+    """
+    shards_dir = shards_dir or os.path.join(results_dir, LOCALIZABILITY_SHARDS_SUBDIR)
+    shard_files = sorted(glob.glob(os.path.join(shards_dir, f"{dataset_name}_loc__w*.pt")))
+    if not shard_files:
+        raise FileNotFoundError(
+            f"No localizability shards found under {shards_dir} for dataset '{dataset_name}'. "
+            f"Run the compute stage first."
+        )
+
+    scores_by_id: Dict[str, float] = {}
+    seeds, totals = set(), set()
+    for path in shard_files:
+        shard = torch.load(path, map_location="cpu")
+        scores_by_id.update(shard.get("scores_by_id", {}))
+        if shard.get("seed") is not None:
+            seeds.add(shard["seed"])
+        if shard.get("total_images") is not None:
+            totals.add(shard["total_images"])
+
+    if len(seeds) > 1:
+        print(f"Warning: merging localizability shards with differing seeds {sorted(seeds)}.")
+
+    ids = sorted(scores_by_id.keys())
+    loc = torch.tensor([scores_by_id[i] for i in ids], dtype=torch.float32)
+    payload = {
+        "image_ids": ids,
+        "localizability": loc,
+        "scores_by_id": scores_by_id,
+        "seed": next(iter(seeds)) if len(seeds) == 1 else sorted(seeds),
+        "total_images": next(iter(totals)) if len(totals) == 1 else sorted(totals),
+        "dataset": dataset_name,
+        "n_shards": len(shard_files),
     }
-    runner.results_manager.save_metrics(results, dataset_name, suffix="_localizability")
+    out_path = _localizability_path(results_dir, dataset_name)
+    torch.save(payload, out_path)
+    print(f"Merged {len(shard_files)} shards -> {len(ids)} localizability scores at: {out_path}")
+    return payload
+
+
+def _load_localizability_scores(dataset_name: str, results_dir: str) -> Dict[str, float]:
+    """Return the merged ``id -> localizability`` map, merging shards on the fly if needed."""
+    merged_path = _localizability_path(results_dir, dataset_name)
+    if os.path.exists(merged_path):
+        return dict(torch.load(merged_path, map_location="cpu")["scores_by_id"])
+    # Fall back to merging shards (e.g. plot run directly after compute, no merge step).
+    return dict(merge_localizability_scores(dataset_name, results_dir)["scores_by_id"])
+
+
+def _reindex_attack_result(attack_result: Dict[str, Any], id_to_col: Dict[str, int], canonical_ids: List[str]) -> Dict[str, Any]:
+    """Reorder an attack result's per-image tensors onto ``canonical_ids`` (by image id).
+
+    Attack results store metric tensors with an image axis aligned to their own
+    ``image_ids``. The plot reads ``res["attack_results"][attack]`` and indexes the image
+    axis directly, so we slice each per-image tensor to the shared, ordered id list.
+    """
+    cols = [id_to_col[i] for i in canonical_ids]
+    n_images = len(id_to_col)
+    out: Dict[str, Any] = {}
+    for key, value in attack_result.items():
+        if torch.is_tensor(value) and value.ndim >= 1 and value.shape[-1] == n_images:
+            out[key] = value.detach().cpu()[..., cols]
+        elif key in ("image_ids", "image_indices"):
+            continue  # rewritten below
+        else:
+            out[key] = value
+    out["image_ids"] = list(canonical_ids)
+    out["image_indices"] = list(range(len(canonical_ids)))
+    return out
+
+
+def build_localizability_dataset_result(
+    dataset_name: str,
+    attack_types: Sequence[str],
+    results_dir: str,
+    attack_suffix: str = "",
+) -> Dict[str, Any]:
+    """Join precomputed localizability with on-disk attack results for one dataset.
+
+    Loads ``<dataset>_localizability.pt`` (merging shards if absent) and each
+    ``<dataset>_<attack>_results{suffix}.pt``, then restricts to the image ids common to
+    the localizability scores and every requested attack, preserving the first attack's
+    ordering. Returns ``{"attack_results": {attack: ...}, "localizability": tensor,
+    "image_ids": [...]}`` in the shape ``plot_localizability_results`` expects.
+    """
+    from core import ResultsManager
+
+    loc_by_id = _load_localizability_scores(dataset_name, results_dir)
+    manager = ResultsManager(results_dir, results_dir)
+
+    loaded: Dict[str, Dict[str, Any]] = {}
+    for attack in attack_types:
+        try:
+            loaded[attack] = manager.load_results(dataset_name, attack, suffix=attack_suffix)
+        except FileNotFoundError:
+            print(f"Warning: no results for attack '{attack}' on '{dataset_name}'; skipping it.")
+    if not loaded:
+        raise FileNotFoundError(
+            f"No attack results found for {dataset_name} in {results_dir} "
+            f"(looked for {list(attack_types)})."
+        )
+
+    # Canonical ordering: the first available attack's ids, kept only where every attack
+    # and the localizability scores all have the image.
+    first_attack = next(iter(loaded))
+    base_ids = list(loaded[first_attack]["image_ids"])
+    common = set(loc_by_id)
+    for res in loaded.values():
+        common &= set(res["image_ids"])
+    canonical_ids = [i for i in base_ids if i in common]
+    if not canonical_ids:
+        raise ValueError(
+            f"No image ids shared between the localizability scores and the attack "
+            f"results for '{dataset_name}'. Were they computed with the same seed/pool?"
+        )
+    dropped = len(base_ids) - len(canonical_ids)
+    if dropped:
+        print(f"[{dataset_name}] {len(canonical_ids)} images shared across localizability + "
+              f"{len(loaded)} attacks ({dropped} dropped for missing scores/results).")
+
+    attack_results: Dict[str, Any] = {}
+    for attack, res in loaded.items():
+        id_to_col = {iid: col for col, iid in enumerate(res["image_ids"])}
+        attack_results[attack] = _reindex_attack_result(res, id_to_col, canonical_ids)
+
+    localizability = torch.tensor([loc_by_id[i] for i in canonical_ids], dtype=torch.float32)
+    return {
+        "attack_results": attack_results,
+        "localizability": localizability,
+        "image_ids": canonical_ids,
+    }
+
+
+def plot_localizability_vs_attacks(
+    datasets: Sequence[str],
+    attack_types: Sequence[str],
+    attack_budgets: Sequence[float],
+    results_dir: str,
+    plot_dir: str,
+    plot_budgets: Optional[Sequence[float]] = None,
+    attack_suffix: str = "",
+) -> None:
+    """Stage 2: join precomputed localizability with attack results and plot per budget.
+
+    For each dataset that has both a localizability file and attack results on disk,
+    builds the joined result and feeds the (one or two) datasets to
+    ``plot_localizability_results`` (rows = datasets, columns = attacks). One figure is
+    produced per budget in ``plot_budgets`` (default: every budget in ``attack_budgets``).
+    """
+    from utils.plots_adversarial_attacks import plot_localizability_results
+
+    all_datasets_results: Dict[str, Any] = {}
+    for dataset_name in datasets:
+        try:
+            all_datasets_results[dataset_name] = build_localizability_dataset_result(
+                dataset_name, attack_types, results_dir, attack_suffix=attack_suffix
+            )
+        except FileNotFoundError as exc:
+            print(f"Skipping '{dataset_name}': {exc}")
+    if not all_datasets_results:
+        raise FileNotFoundError(
+            "No dataset had both localizability scores and attack results; nothing to plot."
+        )
+
+    budgets_to_plot = list(plot_budgets) if plot_budgets else list(attack_budgets)
+    os.makedirs(plot_dir, exist_ok=True)
+    for budget in budgets_to_plot:
+        print(f"Plotting localizability vs attack strength at budget {budget:.4f} "
+              f"({round(budget * 255)}/255)...")
+        plot_localizability_results(
+            attack_budgets=budget,
+            plot_dir=plot_dir,
+            all_datasets_results=all_datasets_results,
+            results_attack_budgets=list(attack_budgets),
+        )
 
 
 # --------------------------------------------------------------------------- #

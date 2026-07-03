@@ -23,6 +23,20 @@ from utils.plots.common import (
     _summarize_samples,
     save_plot_json,
 )
+from utils.plots.style import apply_paper_style, attack_color
+
+apply_paper_style()
+
+_FIGURE_DPI = 300
+
+
+def _savefig(fig, plot_dir: str, filename_stem: str) -> None:
+    """Save ``fig`` as both PNG (high-dpi raster) and PDF (vector, paper quality)."""
+    os.makedirs(plot_dir, exist_ok=True)
+    for ext in ("png", "pdf"):
+        path = os.path.join(plot_dir, f"{filename_stem}.{ext}")
+        fig.savefig(path, dpi=_FIGURE_DPI, bbox_inches="tight")
+        print(f"Plot saved to: {path}")
 
 
 def plot_results(
@@ -35,7 +49,7 @@ def plot_results(
     all_results=None,
     results=None,
     stored_metrics=None,
-    gps_true: bool = False,
+    gps_true: bool = True,
 ):
     # Support both old single-attack and new multi-attack signatures
     if attack_types is None:
@@ -49,7 +63,7 @@ def plot_results(
             all_results = _load_attack_results(results_dir, dataset_name, attack_types)
 
     for metric in stored_metrics:
-        plt.figure(figsize=(10, 8))
+        fig, ax = plt.subplots(figsize=(9, 7))
         plotted_any = False
         json_payload: dict[str, Any] = {
             "dataset": dataset_name,
@@ -82,44 +96,41 @@ def plot_results(
             }
 
             attack_name = _display_attack_name(at)
-            plt.plot(attack_budgets, mean_metric, linestyle='--', alpha=1.0, linewidth=3.0, label=f"{attack_name} mean")
-            # plt.plot(attack_budgets, median_metric, label=f"{at} median")
-            plt.fill_between(attack_budgets, q25_metric, q75_metric, alpha=0.3, label=f"{at} IQR (25-75%)")
+            color = attack_color(at)
+            ax.plot(attack_budgets, mean_metric, linestyle='--', alpha=1.0, linewidth=3.0,
+                    color=color, label=attack_name)
+            # Shaded IQR band shares the attack's color but isn't a separate legend entry.
+            ax.fill_between(attack_budgets, q25_metric, q75_metric, alpha=0.25, color=color)
             plotted_any = True
         if not plotted_any:
-            plt.close()
+            plt.close(fig)
             continue
 
-        plt.xlabel("Attack budget (out of 255)")
-        # plt.ylabel("Final step displacement (km)")
+        ax.set_xlabel("Attack budget (out of 255)")
 
-        # add note about log scale on y axis + quantiles
+        # x and y axis on log scale (quantiles shown as a shaded IQR band)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
 
-        # x and y axis should be log scale
-        plt.xscale("log")
-        plt.yscale("log")
-
-        ax = plt.gca()
         tick_labels = [f"{eps*255:.0f}" for eps in attack_budgets]
         ax.xaxis.set_major_locator(FixedLocator(attack_budgets))
         ax.xaxis.set_major_formatter(FixedFormatter(tick_labels))
         ax.xaxis.set_minor_locator(NullLocator())
         # replace y ticks with nice values (1km, 10km, 100km, 1000km, 10000km)
-        plt.yticks([1000, 2500, 5000, 10000], ["1,000 km", "2500 km", "5,000 km", "10,000 km"], rotation=90, va='center')  # Rotate y-tick labels for better readability
+        ax.set_yticks([1000, 2500, 5000, 10000])
+        ax.set_yticklabels(["1,000 km", "2,500 km", "5,000 km", "10,000 km"])
 
-        # add grid
-        plt.grid(which="both", linestyle="--", linewidth=0.5, alpha=0.7)
+        ax.grid(which="both", linestyle="--", linewidth=0.5, alpha=0.7)
 
-        plt.title(f"{dataset_name} dataset")
-        plt.legend(fontsize="x-large", markerscale=2)
+        # Legend anchored just outside the axes so it never overlaps the curves.
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0., frameon=False)
         if plot_dir is not None:
-            os.makedirs(plot_dir, exist_ok=True)
             suffix = '_'.join(attack_types)
-            plt.savefig(os.path.join(plot_dir, f"{dataset_name}_{suffix}_{metric}.png"))
+            _savefig(fig, plot_dir, f"{dataset_name}_{suffix}_{metric}")
             save_plot_json(plot_dir, f"{dataset_name}_{suffix}_{metric}", json_payload)
         else:
             plt.show()
-        plt.close()
+        plt.close(fig)
 
 
 def plot_attack_success_rate(
@@ -132,7 +143,7 @@ def plot_attack_success_rate(
     attack_type=None,
     all_results=None,
     results=None,
-    gps_true: bool = False,
+    gps_true: bool = True,
 ):
     """
     Takes same input as plot_results, but plots attack success rate instead of metrics. Attack success is defined as the fraction of samples for which the final step displacement is above a certain threshold (e.g. 100km), which indicates a successful attack that significantly changes the predicted location.
@@ -166,16 +177,7 @@ def plot_attack_success_rate(
         rgb = np.clip(rgb * factor, 0.0, 1.0)
         return (rgb[0], rgb[1], rgb[2], 1.0)
 
-    plt.figure(figsize=(10, 8))
-    # Use fixed qualitative colors so the first two attacks are clearly distinct (blue, red).
-    attack_palette = [
-        '#9467bd',  # purple
-        '#ff7f0e',  # orange
-        '#d62728',  # red
-        '#2ca02c',  # green
-        '#9467bd',  # purple
-        '#8c564b',  # brown
-    ]
+    fig, ax = plt.subplots(figsize=(9, 7))
 
     metric_name = _select_displacement_metric(gps_true)
     json_payload: dict[str, Any] = {
@@ -186,8 +188,8 @@ def plot_attack_success_rate(
         "attacks": {},
     }
 
-    for attack_index, (at, res) in enumerate(all_results.items()):
-        base_color = attack_palette[attack_index % len(attack_palette)]
+    for at, res in all_results.items():
+        base_color = attack_color(at)
         budget_samples = _get_metric_samples_by_budget(res, metric_name)
         if budget_samples is None:
             continue
@@ -224,7 +226,7 @@ def plot_attack_success_rate(
         if success_curves.shape[0] > 1:
             low_curve = np.min(success_curves, axis=0)
             high_curve = np.max(success_curves, axis=0)
-            plt.fill_between(
+            ax.fill_between(
                 attack_budgets,
                 low_curve,
                 high_curve,
@@ -246,7 +248,7 @@ def plot_attack_success_rate(
 
             attack_name = _display_attack_name(at)
 
-            plt.plot(
+            ax.plot(
                 attack_budgets,
                 success_curves[threshold_index],
                 color=line_color,
@@ -256,27 +258,21 @@ def plot_attack_success_rate(
                 label=f"{attack_name} > {t:.0f} km",
             )
 
-    plt.xlabel("Attack budget out of 255 (log scale))")
-    # if len(thresholds) == 1:
-    #     plt.ylabel(f"Attack Success Rate (disp > {thresholds[0]:.0f} km)")
-    # else:
-    #     plt.ylabel("Attack Success Rate")
-    plt.title(f"Attack Success Rate on {dataset_name} dataset")
-    plt.ylim(0.4, 1.0)
-    plt.grid(alpha=0.25, linestyle='--', linewidth=0.6)
-    plt.legend(ncol=2, fontsize='x-large')
-    plt.xscale("log")
-    ax = plt.gca()
+    ax.set_xlabel("Attack budget out of 255 (log scale)")
+    ax.set_ylim(0.4, 1.0)
+    ax.grid(alpha=0.25, linestyle='--', linewidth=0.6)
+    # Legend anchored just outside the axes so it never overlaps the curves.
+    ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0., ncol=1, frameon=False)
+    ax.set_xscale("log")
     tick_labels = [f"{eps*255:.0f}" for eps in attack_budgets]
     ax.xaxis.set_major_locator(FixedLocator(attack_budgets))
     ax.xaxis.set_major_formatter(FixedFormatter(tick_labels))
     ax.xaxis.set_minor_locator(NullLocator())
 
     if plot_dir is not None:
-        os.makedirs(plot_dir, exist_ok=True)
         suffix = '_'.join(attack_types)
-        plt.savefig(os.path.join(plot_dir, f"{dataset_name}_{suffix}_attack_success_rate.png"))
+        _savefig(fig, plot_dir, f"{dataset_name}_{suffix}_attack_success_rate")
         save_plot_json(plot_dir, f"{dataset_name}_{suffix}_attack_success_rate", json_payload)
     else:
         plt.show()
-    plt.close()
+    plt.close(fig)

@@ -8,10 +8,13 @@ every public name so existing imports such as
 """
 
 from utils.plots import (  # noqa: F401
+    plot_attack_dtd_variance,
     plot_attack_success_rate,
+    plot_clean_vs_attacked_displacement,
     plot_gps_samples_on_map,
     plot_gps_trajectories_clean,
     plot_gps_trajectories_on_map,
+    plot_loss_vs_fsd,
     plot_localizability_results,
     plot_model_transfer_success_rate,
     plot_restarts_success,

@@ -33,6 +33,9 @@ from utils.plots.results import (
     plot_results,
 )
 from utils.plots.ablations import (
+    plot_attack_dtd_variance,
+    plot_clean_vs_attacked_displacement,
+    plot_loss_vs_fsd,
     plot_localizability_results,
     plot_model_transfer_success_rate,
     plot_restarts_success,
@@ -53,5 +56,8 @@ __all__ = [
     "plot_model_transfer_success_rate",
     "plot_localizability_results",
     "plot_transferability_results",
+    "plot_attack_dtd_variance",
+    "plot_loss_vs_fsd",
+    "plot_clean_vs_attacked_displacement",
     "save_plot_json",
 ]

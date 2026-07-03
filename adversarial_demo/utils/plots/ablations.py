@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -10,7 +11,52 @@ import torch
 from matplotlib import colormaps
 from matplotlib.patches import Patch
 
-from utils.plots.common import _display_attack_name, _get_metric_tensor
+from utils.adversarial_metrics import trajectory_displacement
+from utils.plots.common import (
+    _display_attack_name,
+    _get_metric_samples_by_budget,
+    _get_metric_tensor,
+    _load_attack_results,
+    _select_displacement_metric,
+    save_plot_json,
+    select_closest_budget,
+)
+from utils.plots.style import apply_paper_style, attack_color
+
+apply_paper_style()
+
+# Paper-ready figures: high-dpi raster + vector PDF side by side, saved together.
+_FIGURE_DPI = 300
+# The ablation figures (robustness, model-transfer, sampling-steps, DTD-variance)
+# fix the attack budget to this value by default so each panel shows one line/box
+# per attack instead of one per (attack, budget) pair.
+DEFAULT_ABLATION_EPS = 0.0314
+
+
+def _savefig(fig, plot_dir: str, filename_stem: str) -> None:
+    """Save ``fig`` as both PNG (high-dpi raster) and PDF (vector, paper quality)."""
+    os.makedirs(plot_dir, exist_ok=True)
+    for ext in ("png", "pdf"):
+        path = os.path.join(plot_dir, f"{filename_stem}.{ext}")
+        fig.savefig(path, dpi=_FIGURE_DPI, bbox_inches="tight")
+        print(f"Plot saved to: {path}")
+
+
+def _finalize_figure(fig, handles=None, labels=None, ncol=None) -> None:
+    """Place one legend shared by every subplot, anchored above the axes.
+
+    Centralising the legend (instead of repeating it per panel) guarantees it never
+    lands on top of plotted data -- the standard layout for multi-panel ablation
+    figures in CV papers. Titles are omitted here: captions are written in LaTeX.
+    """
+    handles = handles or []
+    labels = labels or []
+    fig_height_in = fig.get_size_inches()[1]
+    if handles:
+        ncol = ncol or min(len(labels), 4)
+        legend_y = 1.0 + 0.14 / fig_height_in
+        fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, legend_y),
+                   ncol=ncol, frameon=False)
 
 
 def plot_transferability_results(results_dir, attack_budgets, plot_dir, dataset_name, metric, results=None):
@@ -29,7 +75,6 @@ def plot_transferability_results(results_dir, attack_budgets, plot_dir, dataset_
     plt.boxplot(data_to_plot, showfliers=False)
     plt.xticks(range(1, len(attack_labels) + 1), attack_labels, rotation=45, ha='right')
     plt.ylabel(metric)
-    plt.title(f"Attack transferability evaluation on {dataset_name} dataset")
     plt.tight_layout()
 
     if plot_dir is not None:
@@ -117,11 +162,13 @@ def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, 
             patch.set_edgecolor(colors[i])
             patch.set_alpha(0.5)
         attack_name = _display_attack_name(attack)
-        ax.set_title(f"{attack_name} attack")
+        ax.set_title(f"{attack_name}")
         # ax.set_xlabel(f"Budget = {selected_budget * 255:.0f}/255")
         ax.set_xticks(np.arange(3))
         ax.set_xticklabels(bucket_names)
         ax.grid(axis='y', linestyle='--', linewidth=0.5, alpha=0.7)
+        #crop y axis at 10^-1
+        ax.set_ylim(bottom=10**-1)
         if row_label is not None:
             ax.set_ylabel(f"{row_label}")
         return np.concatenate([v for v in data if len(v) > 0]) if any(len(v) > 0 for v in data) else np.array([])
@@ -137,7 +184,7 @@ def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, 
     all_values = []
     for r, ds in enumerate(dataset_names):
         res = all_datasets_results[ds]
-        ds_name = "YFCC4K" if ds == "yfcc" else "OSV-5M"
+        ds_name = "FSD (YFCC4K)" if ds == "yfcc" else "FSD (OSV-5M)"
 
         for c, attack in enumerate(attacks):
             ax = axes[r, c]
@@ -148,22 +195,17 @@ def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, 
     if flat.size > 0 and np.nanmax(flat) >= y_tick_values[0]:
         for r in range(n_rows):
             axes[r, 0].set_yticks(y_tick_values)
-            axes[r, 0].set_yticklabels(y_tick_labels, rotation=90, va='center')
+            axes[r, 0].set_yticklabels(y_tick_labels)
             axes[r, 0].set_yscale('log')
     legend_handles = [
         Patch(facecolor=colors[i], edgecolor=colors[i], alpha=0.5, label=f"{bucket_names[i]} localizability")
         for i in range(3)
     ]
     fig.legend(handles=legend_handles, loc='upper center', ncol=3, frameon=False, bbox_to_anchor=(0.52, 1.04))
-    # fig.suptitle(f"Attack strength vs localizability — budget = {selected_budget * 255:.0f}/255", y=1.05)
     fig.tight_layout()
 
     if plot_dir is not None:
-        os.makedirs(plot_dir, exist_ok=True)
-        plt.savefig(
-            os.path.join(plot_dir, f"localizability_budget_{selected_budget * 255:.0f}.png"),
-            bbox_inches='tight',
-        )
+        _savefig(fig, plot_dir, f"localizability_budget_{selected_budget * 255:.0f}")
     else:
         plt.show()
     plt.close(fig)
@@ -189,7 +231,6 @@ def plot_restarts_success(
     dataset = json_results["dataset"]
     max_restarts = json_results["max_restarts"]
     n_images = json_results["n_images"]
-    image_ids = json_results.get("image_ids", [str(i) for i in range(n_images)])
     colors = plt.cm.tab10.colors
 
     os.makedirs(plot_dir, exist_ok=True)
@@ -209,13 +250,11 @@ def plot_restarts_success(
                 disps = json_results["results"][attack_type][bkey][ikey]["restart_displacements"]
                 best_k = json_results["results"][attack_type][bkey][ikey]["best_after_k"]
                 xs = list(range(1, len(disps) + 1))
-                ax.scatter(xs, disps, color=color, alpha=0.4, s=30, zorder=2)
+                # ax.scatter(xs, disps, color=color, alpha=0.4, s=30, zorder=2)
                 ax.plot(range(1, len(best_k) + 1), best_k, color=color, label=label, linewidth=2, zorder=3)
                 color_idx += 1
         ax.set_xlabel("Number of restarts")
-        ax.set_ylabel("Displacement (km)")
-        img_label = image_ids[img_idx] if img_idx < len(image_ids) else str(img_idx)
-        ax.set_title(f"Best displacement vs. restarts — {dataset.upper()} — image {img_label}")
+        ax.set_ylabel("FSD (km)")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
@@ -245,7 +284,6 @@ def plot_restarts_success(
                 color_idx += 1
         ax.set_xlabel("Number of restarts")
         ax.set_ylabel("Displacement (km)")
-        ax.set_title(f"Best displacement vs. restarts — {dataset.upper()} — {n_images} images (mean ± std)")
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
@@ -258,11 +296,14 @@ def plot_restarts_success(
 def plot_sampling_steps_success_rate(
     json_results: dict,
     plot_dir: str,
+    eps: float = DEFAULT_ABLATION_EPS,
 ) -> None:
     """
     Plot attack success rate vs. number of sampling steps.
 
-    One subplot per distance threshold; one line per (attack_type, budget) pair.
+    One subplot per distance threshold; one line per attack, all pinned to the
+    single attack budget closest to ``eps`` (default 8/255) so each panel isn't
+    cluttered with one line per (attack, budget) pair.
     json_results is the dict returned by evaluate_sampling_steps().
     """
     thresholds = json_results["success_rate_thresholds_km"]
@@ -275,57 +316,54 @@ def plot_sampling_steps_success_rate(
     budgets_per_type = json_results.get("attack_budgets_per_type", {})
 
     n_thresholds = len(thresholds)
-    fig, axes = plt.subplots(1, n_thresholds, figsize=(6 * n_thresholds, 5), squeeze=False)
-    colors = plt.cm.tab10.colors
+    fig, axes = plt.subplots(1, n_thresholds, figsize=(5.5 * n_thresholds, 4.5), squeeze=False)
 
-    color_idx = 0
+    legend_handles, legend_labels = [], []
     for attack_type in attack_types:
-        budgets = budgets_per_type.get(attack_type, attack_budgets)
-        for budget in budgets:
-            bkey = f"budget_{budget:.6f}"
-            label = f"{attack_type} eps={budget:.3f}"
-            color = colors[color_idx % len(colors)]
-            for ax_idx, thr in enumerate(thresholds):
-                ax = axes[0][ax_idx]
-                rates = [
-                    json_results["results"][attack_type][bkey][str(ns)]["success_rates"][str(thr)]
-                    for ns in eval_num_steps
-                ]
-                ax.plot(eval_num_steps, rates, marker="o", label=label, color=color)
-            color_idx += 1
+        budget = select_closest_budget(budgets_per_type.get(attack_type, attack_budgets), eps)
+        bkey = f"budget_{budget:.6f}"
+        color = attack_color(attack_type)
+        line = None
+        for ax_idx, thr in enumerate(thresholds):
+            ax = axes[0][ax_idx]
+            rates = [
+                json_results["results"][attack_type][bkey][str(ns)]["success_rates"][str(thr)]
+                for ns in eval_num_steps
+            ]
+            line, = ax.plot(eval_num_steps, rates, marker="o", color=color)
+        legend_handles.append(line)
+        legend_labels.append(_display_attack_name(attack_type))
 
     for ax_idx, thr in enumerate(thresholds):
         ax = axes[0][ax_idx]
         ax.set_xlabel("Sampling steps")
         ax.set_ylabel("Attack success rate")
         ax.set_title(f"Displacement > {thr} km")
-        ax.legend(fontsize=7)
-        ax.set_ylim(0, 1)
+        ax.set_ylim(0.3, 1)
         ax.grid(True, alpha=0.3)
 
-    fig.suptitle(f"Attack success vs. sampling steps — {dataset.upper()}")
+    _finalize_figure(fig, legend_handles, legend_labels)
     fig.tight_layout()
-    os.makedirs(plot_dir, exist_ok=True)
-    plot_path = os.path.join(plot_dir, f"{dataset}_sampling_steps_success_rate.png")
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    _savefig(fig, plot_dir, f"{dataset}_sampling_steps_success_rate")
     plt.close(fig)
-    print(f"Plot saved to: {plot_path}")
 
 
 def plot_model_transfer_success_rate(
     json_results: dict,
     plot_dir: str,
+    eps: float = DEFAULT_ABLATION_EPS,
 ) -> None:
-    """Plot cross-model transfer: attack effect against each generative backbone.
+    """Plot cross-model transfer: attack success rate against each generative backbone.
 
     The attacked image is trained against one PLONK variant and re-evaluated against
-    every configured variant (diffusion / flow / RFM). The leftmost subplot shows mean
-    final-step displacement vs. model variant; one subplot per distance threshold follows
-    with the attack success rate. One line per (attack_type, budget); the variant the
-    attack was trained on is annotated in the title. ``json_results`` is the dict produced
-    by ``build_model_transfer_json``.
+    every configured variant (diffusion / flow / RFM). One subplot per distance
+    threshold; one line per attack, all pinned to the single attack budget closest to
+    ``eps`` (default 8/255). The variant the attack was trained on is annotated in the
+    title. ``json_results`` is the dict produced by ``build_model_transfer_json``.
     """
     model_labels = json_results["model_labels"]
+    #models labels in capital letters:
+    model_labels_capital = [m.upper() for m in model_labels]
     thresholds = json_results["success_rate_thresholds_km"]
     attack_types = json_results["attack_types"]
     attack_budgets = json_results["attack_budgets"]
@@ -335,62 +373,50 @@ def plot_model_transfer_success_rate(
     budgets_per_type = json_results.get("attack_budgets_per_type", {})
 
     x = list(range(len(model_labels)))
-    n_cols = 1 + len(thresholds)  # col 0: mean displacement; then one per threshold
-    fig, axes = plt.subplots(1, n_cols, figsize=(6 * n_cols, 5), squeeze=False)
-    colors = plt.cm.tab10.colors
+    n_cols = len(thresholds)
+    fig, axes = plt.subplots(1, n_cols, figsize=(5.5 * n_cols, 4.5), squeeze=False)
 
-    color_idx = 0
+    legend_handles, legend_labels = [], []
     for attack_type in attack_types:
-        budgets = budgets_per_type.get(attack_type, attack_budgets)
-        for budget in budgets:
-            bkey = f"budget_{budget:.6f}"
-            label = f"{_display_attack_name(attack_type)} eps={budget:.3f}"
-            color = colors[color_idx % len(colors)]
-            cells = [json_results["results"][attack_type][bkey][m] for m in model_labels]
-            means = [c["mean_displacement_km"] for c in cells]
-            axes[0][0].plot(x, means, marker="o", label=label, color=color)
-            for col_idx, thr in enumerate(thresholds, start=1):
-                rates = [c["success_rates"][str(thr)] for c in cells]
-                axes[0][col_idx].plot(x, rates, marker="o", label=label, color=color)
-            color_idx += 1
+        budget = select_closest_budget(budgets_per_type.get(attack_type, attack_budgets), eps)
+        bkey = f"budget_{budget:.6f}"
+        color = attack_color(attack_type)
+        cells = [json_results["results"][attack_type][bkey][m] for m in model_labels]
+        line = None
+        for col_idx, thr in enumerate(thresholds):
+            rates = [c["success_rates"][str(thr)] for c in cells]
+            line, = axes[0][col_idx].plot(x, rates, marker="o", color=color)
+        legend_handles.append(line)
+        legend_labels.append(_display_attack_name(attack_type))
+    axes[0][0].set_ylabel("Attack success rate")
 
-    axes[0][0].set_ylabel("Mean displacement (km)")
-    axes[0][0].set_title("Mean displacement")
-    for col_idx, thr in enumerate(thresholds, start=1):
+    for col_idx, thr in enumerate(thresholds):
         axes[0][col_idx].set_title(f"Displacement > {thr} km")
-        axes[0][col_idx].set_ylabel("Attack success rate")
         axes[0][col_idx].set_ylim(0, 1)
     for col_idx in range(n_cols):
         ax = axes[0][col_idx]
-        ax.set_xlabel("Model variant")
         ax.set_xticks(x)
-        ax.set_xticklabels(model_labels, rotation=30, ha="right")
-        ax.legend(fontsize=7)
+        ax.set_xticklabels(model_labels_capital, rotation=30, ha="right")
         ax.grid(True, alpha=0.3)
 
-    title = f"Cross-model transfer — {dataset.upper()}"
-    if attacked_model:
-        title += f" (attacked: {attacked_model})"
-    fig.suptitle(title)
+    _finalize_figure(fig, legend_handles, legend_labels)
     fig.tight_layout()
-    os.makedirs(plot_dir, exist_ok=True)
-    plot_path = os.path.join(plot_dir, f"{dataset}_model_transfer_success_rate.png")
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    _savefig(fig, plot_dir, f"{dataset}_model_transfer_success_rate")
     plt.close(fig)
-    print(f"Plot saved to: {plot_path}")
 
 
 def plot_robustness_results(
     json_results: dict,
     plot_dir: str,
+    eps: float = DEFAULT_ABLATION_EPS,
 ) -> None:
     """Plot attack robustness to JPEG compression and Gaussian blur (GeoShield Fig. 6).
 
-    Two columns (JPEG quality factor | Gaussian blur sigma). The top row shows mean
-    final-step displacement vs. transform strength; one row per distance threshold
-    follows with the attack success rate. One coloured line per (attack_type, budget),
-    with the displacement-from-clean-prediction metric drawn solid ("predicted") and
-    the displacement-from-ground-truth metric dashed ("true", the GeoShield metric).
+    Two columns (JPEG quality factor | Gaussian blur sigma), one row per distance
+    threshold, showing attack success rate only. One coloured line per attack, all
+    pinned to the single attack budget closest to ``eps`` (default 8/255); the
+    displacement-from-clean-prediction metric is drawn solid ("predicted") and the
+    displacement-from-ground-truth metric dashed ("true", the GeoShield metric).
     ``json_results`` is the dict produced by ``build_robustness_json``.
     """
     from matplotlib.lines import Line2D
@@ -398,82 +424,410 @@ def plot_robustness_results(
     attack_types = json_results["attack_types"]
     attack_budgets = json_results["attack_budgets"]
     dataset = json_results["dataset"]
-    thresholds = json_results["success_rate_thresholds_km"]
+    thresholds = [t for t in json_results["success_rate_thresholds_km"] if float(t) == 2500.0]
     num_steps = json_results.get("num_steps")
-    metrics = json_results.get("metrics", ["predicted", "true"])
-    metric_styles = {"predicted": "-", "true": "--"}
+    metrics = json_results.get("metrics", ["true"])
+    metric_styles = {"true": "-"}
+    budget = select_closest_budget(attack_budgets, eps)
+    bkey = f"budget_{budget:.6f}"
 
     # (x-axis label, JSON sub-dict key)
     transforms = [
         ("JPEG quality factor", "jpeg"),
         ("Gaussian blur σ", "blur"),
     ]
-    colors = plt.cm.tab10.colors
 
-    n_rows = 1 + len(thresholds)  # row 0: mean displacement; then one per threshold
-    fig, axes = plt.subplots(n_rows, 2, figsize=(7 * 2, 4 * n_rows), squeeze=False)
+    n_rows = len(thresholds)
+    fig, axes = plt.subplots(n_rows, 2, figsize=(6.5 * 2, 4 * n_rows), squeeze=False)
 
     def _sorted_levels(level_dict: dict):
         items = sorted(level_dict.items(), key=lambda kv: float(kv[0]))
         return [float(k) for k, _ in items], [v for _, v in items]
 
     drawn_metrics: set = set()
+    legend_handles, legend_labels = [], []
     for col_idx, (xlabel, json_key) in enumerate(transforms):
-        color_idx = 0
         for attack_type in attack_types:
-            for budget in attack_budgets:
-                bkey = f"budget_{budget:.6f}"
-                level_dict = json_results["results"][attack_type][bkey][json_key]
-                if not level_dict:
-                    continue
-                xs, entries = _sorted_levels(level_dict)
-                color = colors[color_idx % len(colors)]
-                label = f"{_display_attack_name(attack_type)} eps={budget:.3f}"
-                for metric in metrics:
-                    style = metric_styles.get(metric, "-")
-                    means = [entry[metric]["mean_displacement_km"] for entry in entries]
-                    if all(np.isnan(m) for m in means):
-                        continue  # e.g. "true" unavailable when the dataset has no GPS
-                    drawn_metrics.add(metric)
-                    # Only the predicted (solid) line carries the colour legend label.
-                    line_label = label if metric == "predicted" else None
-                    axes[0][col_idx].plot(xs, means, marker="o", linestyle=style, label=line_label, color=color)
-                    for row_offset, thr in enumerate(thresholds, start=1):
-                        rates = [entry[metric]["success_rates"][str(thr)] for entry in entries]
-                        axes[row_offset][col_idx].plot(xs, rates, marker="o", linestyle=style, color=color)
-                color_idx += 1
+            level_dict = json_results["results"][attack_type][bkey][json_key]
+            if not level_dict:
+                continue
+            xs, entries = _sorted_levels(level_dict)
+            color = attack_color(attack_type)
+            line = None
+            for metric in metrics:
+                style = metric_styles.get(metric, "-")
+                any_finite = any(
+                    not np.isnan(entry[metric]["success_rates"][str(thr)])
+                    for entry in entries for thr in thresholds
+                )
+                if not any_finite:
+                    continue  # e.g. "true" unavailable when the dataset has no GPS
+                drawn_metrics.add(metric)
+                for row_idx, thr in enumerate(thresholds):
+                    rates = [entry[metric]["success_rates"][str(thr)] for entry in entries]
+                    line, = axes[row_idx][col_idx].plot(xs, rates, marker="o", linestyle=style, color=color)
+            if col_idx == 0 and line is not None:
+                legend_handles.append(line)
+                legend_labels.append(_display_attack_name(attack_type))
 
-        axes[0][col_idx].set_xlabel(xlabel)
-        axes[0][col_idx].set_ylabel("Mean displacement (km)")
-        axes[0][col_idx].set_title("Mean displacement")
-        axes[0][col_idx].grid(True, alpha=0.3)
-        axes[0][col_idx].legend(fontsize=7)
-        for row_offset, thr in enumerate(thresholds, start=1):
-            ax = axes[row_offset][col_idx]
+        for row_idx, thr in enumerate(thresholds):
+            ax = axes[row_idx][col_idx]
             ax.set_xlabel(xlabel)
             ax.set_ylabel("Attack success rate")
-            ax.set_title(f"Displacement > {thr} km")
-            ax.set_ylim(0, 1)
+            if len(thresholds) > 1:
+                ax.set_title(f"Displacement > {thr} km")
+            ax.set_ylim(0.3, 1)
             ax.grid(True, alpha=0.3)
+            if json_key == "jpeg":
+                # Lower quality factor = more compression; invert so both columns
+                # read left-to-right as "less" -> "more" transform strength.
+                ax.invert_xaxis()
 
-    # Linestyle legend (predicted vs true) on the top-left axis, kept alongside the
-    # colour/attack legend by re-adding the latter as a separate artist.
+    # Linestyle legend (predicted vs true) alongside the attack-colour legend, both
+    # centered above the whole figure so neither can land on top of plotted data.
     style_handles = [
         Line2D([0], [0], color="black", linestyle=metric_styles.get(m, "-"),
                label={"predicted": "predicted (vs clean)", "true": "true (vs GT)"}.get(m, m))
         for m in metrics if m in drawn_metrics
     ]
-    if style_handles:
-        color_legend = axes[0][0].get_legend()
-        axes[0][0].legend(handles=style_handles, fontsize=7, loc="lower left")
-        if color_legend is not None:
-            axes[0][0].add_artist(color_legend)
+    style_labels = [h.get_label() for h in style_handles]
 
-    steps_note = f" (eval steps = {num_steps})" if num_steps is not None else ""
-    fig.suptitle(f"Robustness to JPEG / blur — {dataset.upper()}{steps_note}")
+    # _finalize_figure(fig, legend_handles + style_handles, legend_labels + style_labels)
+    _finalize_figure(fig, legend_handles, legend_labels + style_labels)
     fig.tight_layout()
-    os.makedirs(plot_dir, exist_ok=True)
-    plot_path = os.path.join(plot_dir, f"{dataset}_robustness_results.png")
-    fig.savefig(plot_path, dpi=150, bbox_inches="tight")
+    _savefig(fig, plot_dir, f"{dataset}_robustness_results")
     plt.close(fig)
-    print(f"Plot saved to: {plot_path}")
+
+
+def plot_attack_dtd_variance(
+    results_dir=None,
+    attack_budgets=None,
+    plot_dir=None,
+    dataset_name=None,
+    attack_types=None,
+    all_results=None,
+    gps_true: bool = True,
+    eps: float = DEFAULT_ABLATION_EPS,
+):
+    """Box plot of each attack's spread in final-step displacement ("DTD") across images.
+
+    Where the other plots show *mean* attack strength, this one shows how *consistent*
+    each attack is: for every attack, at the single budget closest to ``eps`` (default
+    8/255), the per-image final-step displacement metric (km) — the core
+    geolocation-deviation quantity used throughout this evaluation, which we refer to
+    as "DTD" following the paper's naming — is summarized as a box (median, IQR,
+    whiskers) plus mean/std/variance in the JSON sidecar. Attacks with a tall box move
+    some images far and others barely at all; attacks with a short box are uniformly
+    (in)effective.
+
+    Args:
+        results_dir/attack_budgets/dataset_name/attack_types: same as ``plot_results``.
+        all_results: optional pre-loaded ``{attack_type: results_dict}`` to skip disk I/O.
+        gps_true: use the true-GPS displacement metric instead of the vs-clean-prediction one.
+        eps: attack budget to plot (the closest available budget is used).
+    """
+    if all_results is None:
+        all_results = _load_attack_results(results_dir, dataset_name, attack_types)
+
+    metric_name = _select_displacement_metric(gps_true)
+    budget = select_closest_budget(attack_budgets, eps)
+    budget_idx = int(np.argmin(np.abs(np.asarray(attack_budgets, dtype=np.float64) - budget)))
+
+    box_data: list[np.ndarray] = []
+    box_colors: list[Any] = []
+    tick_labels: list[str] = []
+    json_payload: dict[str, Any] = {
+        "dataset": dataset_name,
+        "metric": metric_name,
+        "budget": float(budget),
+        "attacks": {},
+    }
+
+    for attack_type in attack_types:
+        res = all_results.get(attack_type)
+        if res is None:
+            continue
+        budget_samples = _get_metric_samples_by_budget(res, metric_name)
+        if budget_samples is None:
+            continue
+
+        samples = budget_samples[budget_idx] if budget_idx < len(budget_samples) else np.array([])
+        samples = np.asarray(samples, dtype=np.float64)
+        samples = samples[np.isfinite(samples)]
+        box_data.append(samples)
+        box_colors.append(attack_color(attack_type))
+        tick_labels.append(_display_attack_name(attack_type))
+        json_payload["attacks"][attack_type] = {
+            "mean_km": float(np.mean(samples)) if samples.size else None,
+            "std_km": float(np.std(samples)) if samples.size else None,
+            "variance_km2": float(np.var(samples)) if samples.size else None,
+            "median_km": float(np.median(samples)) if samples.size else None,
+            "n_samples": int(samples.size),
+        }
+
+    if not box_data:
+        raise ValueError("No attack results available to plot DTD variance for.")
+
+    fig, ax = plt.subplots(figsize=(max(8.0, 1.3 * len(tick_labels)), 5.5))
+    bp = ax.boxplot(
+        box_data,
+        positions=list(range(len(box_data))),
+        widths=0.6,
+        showfliers=False,
+        patch_artist=True,
+        medianprops=dict(color="black", linewidth=1.5),
+    )
+    for patch, color in zip(bp["boxes"], box_colors):
+        patch.set_facecolor(color)
+        patch.set_edgecolor(color)
+        patch.set_alpha(0.65)
+
+    ax.set_xticks(range(len(tick_labels)))
+    ax.set_xticklabels(tick_labels, rotation=30, ha="right")
+    ax.set_ylabel("Final-step displacement — \"DTD\" (km)")
+    ax.grid(True, axis="y", alpha=0.3)
+
+    fig.tight_layout()
+    _savefig(fig, plot_dir, f"{dataset_name}_attack_dtd_variance")
+    plt.close(fig)
+
+    save_plot_json(plot_dir, f"{dataset_name}_attack_dtd_variance", json_payload)
+
+
+def plot_loss_vs_fsd(
+    results_dir=None,
+    attack_budgets=None,
+    plot_dir=None,
+    dataset_name=None,
+    attack_types=("dtd", "training_loss", "sampling"),
+    all_results=None,
+    gps_true: bool = True,
+    eps: float = DEFAULT_ABLATION_EPS,
+):
+    """Scatter each attack's optimization loss against its achieved FSD, per image.
+
+    Relates how well an attack drove down its own training objective to how much
+    geolocation displacement that actually bought. Only meaningful for loss-based
+    attacks (dtd, training_loss/"AdvDM", sampling) — their loss functions are on
+    incompatible scales/units (cosine similarity, MSE-in-velocity-space, negative
+    km respectively), so each attack gets its own panel (shared FSD y-axis, free
+    x-axis) rather than one shared scatter; overlaying raw loss values across
+    attacks would be comparing unrelated units.
+
+    Args:
+        results_dir/attack_budgets/dataset_name/attack_types: same as ``plot_results``.
+        all_results: optional pre-loaded ``{attack_type: results_dict}`` to skip disk I/O.
+        gps_true: use the true-GPS displacement metric instead of the vs-clean-prediction one.
+        eps: attack budget to plot (the closest available budget is used).
+    """
+    if all_results is None:
+        all_results = _load_attack_results(results_dir, dataset_name, attack_types)
+
+    metric_name = _select_displacement_metric(gps_true)
+    budget = select_closest_budget(attack_budgets, eps)
+    budget_idx = int(np.argmin(np.abs(np.asarray(attack_budgets, dtype=np.float64) - budget)))
+
+    panels: list[tuple[str, np.ndarray, np.ndarray]] = []
+    json_payload: dict[str, Any] = {
+        "dataset": dataset_name,
+        "metric": metric_name,
+        "budget": float(budget),
+        "attacks": {},
+    }
+
+    for attack_type in attack_types:
+        res = all_results.get(attack_type)
+        if res is None:
+            continue
+        loss_samples = _get_metric_samples_by_budget(res, "final_loss")
+        fsd_samples = _get_metric_samples_by_budget(res, metric_name)
+        if loss_samples is None or fsd_samples is None:
+            continue
+
+        loss = np.asarray(loss_samples[budget_idx], dtype=np.float64) if budget_idx < len(loss_samples) else np.array([])
+        fsd = np.asarray(fsd_samples[budget_idx], dtype=np.float64) if budget_idx < len(fsd_samples) else np.array([])
+        n = min(loss.size, fsd.size)
+        loss, fsd = loss[:n], fsd[:n]
+        valid = np.isfinite(loss) & np.isfinite(fsd)
+        loss, fsd = loss[valid], fsd[valid]
+        if loss.size == 0:
+            continue
+
+        pearson_r = float(np.corrcoef(loss, fsd)[0, 1]) if loss.size > 1 else None
+        json_payload["attacks"][attack_type] = {
+            "loss": loss.tolist(),
+            "fsd_km": fsd.tolist(),
+            "pearson_r": pearson_r,
+            "n_samples": int(loss.size),
+        }
+        panels.append((attack_type, loss, fsd))
+
+    if not panels:
+        raise ValueError(
+            "No paired (loss, FSD) samples available — this requires results saved with "
+            "the 'final_loss' field, which older runs may not have (re-run evaluate-dataset "
+            "to backfill)."
+        )
+
+    fig, axes = plt.subplots(1, len(panels), figsize=(6.0 * len(panels), 5.5), squeeze=False)
+    axes = axes[0]
+
+    for ax, (attack_type, loss, fsd) in zip(axes, panels):
+        color = attack_color(attack_type)
+        ax.scatter(loss, fsd, s=14, color=color, alpha=0.5, edgecolors="none")
+        ax.set_xlabel("Final training loss")
+        ax.set_yscale("log")
+        r = json_payload["attacks"][attack_type]["pearson_r"]
+        r_label = f"r = {r:.2f}" if r is not None else "r = n/a"
+        ax.set_title(f"{_display_attack_name(attack_type)} ({r_label})")
+        ax.grid(True, which="both", alpha=0.3)
+
+    axes[0].set_ylabel("Final-step displacement (km, log scale)")
+
+    fig.tight_layout()
+    _savefig(fig, plot_dir, f"{dataset_name}_loss_vs_fsd")
+    plt.close(fig)
+
+    save_plot_json(plot_dir, f"{dataset_name}_loss_vs_fsd", json_payload)
+
+
+def _get_clean_vs_attacked_true_samples(res, budget_idx):
+    """Per-image (clean-prediction, perturbed-prediction) displacement to true GPS.
+
+    The clean-vs-true distance isn't stored as a top-level tensor (only the
+    perturbed-vs-true one is); it's recovered here from the raw ``gps_source``/
+    ``true_gps`` coordinates kept in ``restart_results`` (averaged over restarts,
+    since the clean prediction can vary slightly across restarts due to sampling
+    stochasticity). All restart pairs across all images are batched into a single
+    vectorized haversine call rather than one Python-level call per restart, since a
+    full-dataset run can have tens of thousands of (image, restart) pairs per attack.
+    Returns ``None`` if the results don't have restart-level data.
+    """
+    attacked_samples = _get_metric_samples_by_budget(res, "final_step_displacement_true")
+    restart_results = res.get("restart_results")
+    if attacked_samples is None or restart_results is None or budget_idx >= len(restart_results):
+        return None
+
+    attacked = np.asarray(attacked_samples[budget_idx], dtype=np.float64)
+
+    budget_restarts = restart_results[budget_idx]
+    image_idx_list = []
+    gps_source_list = []
+    true_gps_list = []
+    for img_idx, image_results in enumerate(budget_restarts):
+        for restart_result in (image_results or []):
+            gps_source = restart_result.get("gps_source")
+            true_gps = restart_result.get("true_gps")
+            if gps_source is None or true_gps is None:
+                continue
+            image_idx_list.append(img_idx)
+            gps_source_list.append(gps_source.detach().cpu().float().reshape(2))
+            true_gps_list.append(torch.as_tensor(true_gps, dtype=torch.float32).detach().cpu().reshape(2))
+
+    n_images = len(budget_restarts)
+    baseline_sum = np.zeros(n_images, dtype=np.float64)
+    baseline_count = np.zeros(n_images, dtype=np.int64)
+
+    if gps_source_list:
+        gps_source_batch = torch.stack(gps_source_list).unsqueeze(0)  # (1, N, 2)
+        true_gps_batch = torch.stack(true_gps_list).unsqueeze(0)  # (1, N, 2)
+        dists = trajectory_displacement(true_gps_batch, gps_source_batch)[0].numpy()  # (N,)
+        image_idx_arr = np.asarray(image_idx_list)
+        np.add.at(baseline_sum, image_idx_arr, dists)
+        np.add.at(baseline_count, image_idx_arr, 1)
+
+    with np.errstate(invalid="ignore"):
+        baseline = np.where(baseline_count > 0, baseline_sum / np.maximum(baseline_count, 1), np.nan)
+
+    n = min(baseline.size, attacked.size)
+    return baseline[:n], attacked[:n]
+
+
+def plot_clean_vs_attacked_displacement(
+    results_dir=None,
+    attack_budgets=None,
+    plot_dir=None,
+    dataset_name=None,
+    attack_types=None,
+    all_results=None,
+    eps: float = DEFAULT_ABLATION_EPS,
+):
+    """Scatter clean-prediction-vs-truth displacement against perturbed-vs-truth displacement.
+
+    Both axes are the same haversine distance to the ground-truth GPS (km), so unlike
+    ``plot_loss_vs_fsd`` this doesn't need per-attack facets: one shared log-log panel,
+    one colour per attack, with a y=x reference line marking "attack had no effect"
+    (points above it were pushed further from the truth than the clean prediction
+    already was).
+
+    Args:
+        results_dir/attack_budgets/dataset_name/attack_types: same as ``plot_results``.
+        all_results: optional pre-loaded ``{attack_type: results_dict}`` to skip disk I/O.
+        eps: attack budget to plot (the closest available budget is used).
+    """
+    if all_results is None:
+        all_results = _load_attack_results(results_dir, dataset_name, attack_types)
+
+    budget = select_closest_budget(attack_budgets, eps)
+    budget_idx = int(np.argmin(np.abs(np.asarray(attack_budgets, dtype=np.float64) - budget)))
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    json_payload: dict[str, Any] = {
+        "dataset": dataset_name,
+        "budget": float(budget),
+        "attacks": {},
+    }
+
+    all_vals = []
+    for attack_type in attack_types:
+        res = all_results.get(attack_type)
+        if res is None:
+            continue
+        pairs = _get_clean_vs_attacked_true_samples(res, budget_idx)
+        if pairs is None:
+            continue
+        baseline, attacked = pairs
+        valid = np.isfinite(baseline) & np.isfinite(attacked)
+        baseline, attacked = baseline[valid], attacked[valid]
+        if baseline.size == 0:
+            continue
+
+        color = attack_color(attack_type)
+        ax.scatter(baseline, attacked, s=14, color=color, alpha=0.5, edgecolors="none",
+                   label=_display_attack_name(attack_type))
+
+        pearson_r = float(np.corrcoef(baseline, attacked)[0, 1]) if baseline.size > 1 else None
+        json_payload["attacks"][attack_type] = {
+            "clean_vs_true_km": baseline.tolist(),
+            "attacked_vs_true_km": attacked.tolist(),
+            "pearson_r": pearson_r,
+            "n_samples": int(baseline.size),
+        }
+        all_vals.append(baseline)
+        all_vals.append(attacked)
+
+    if not all_vals:
+        raise ValueError(
+            "No paired (clean, attacked) true-GPS displacement samples available — this "
+            "requires results saved with restart-level 'gps_source'/'true_gps' data."
+        )
+
+    combined = np.concatenate(all_vals)
+    positive = combined[combined > 0]
+    lo = float(positive.min()) if positive.size else 1.0
+    hi = float(combined.max())
+    ax.plot([lo, hi], [lo, hi], linestyle="--", color="black", linewidth=1, alpha=0.6,
+            label="y = x (no attack effect)")
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("Clean prediction FSD to true GPS (km)")
+    ax.set_ylabel("Perturbed prediction FSD to true GPS (km)")
+    ax.grid(True, which="both", alpha=0.3)
+    ax.legend(loc="lower right", frameon=True, framealpha=0.85)
+
+    fig.tight_layout()
+    _savefig(fig, plot_dir, f"{dataset_name}_clean_vs_attacked_displacement")
+    plt.close(fig)
+
+    save_plot_json(plot_dir, f"{dataset_name}_clean_vs_attacked_displacement", json_payload)

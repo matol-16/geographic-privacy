@@ -34,7 +34,10 @@ The adversarial demo code has been refactored to reduce duplication and provide 
 - **`utils/adversarial_eval.py`** - Evaluation entry points (thin orchestration)
   - `evaluate_attack_on_dataset()` - main results **plus** the restart ablation
     (always) and the sampling-steps ablation (opt-in), from one training pass
-  - `evaluate_localizability()`, `evaluate_restarts()`, `evaluate_sampling_steps()`,
+  - `compute_localizability_scores()` / `merge_localizability_scores()` /
+    `plot_localizability_vs_attacks()` - the two-stage localizability pipeline
+    (precompute + store scores by image id, then join to attack results and plot)
+  - `evaluate_restarts()`, `evaluate_sampling_steps()`,
     `evaluate_sampling_steps_precomputed()`, `merge_sampling_steps_results()`
 - **`utils/datasets.py`** - YFCC4k / OSV-5M retrieval (split out so `core.py` no
   longer needs `adversarial_eval.py`, removing a circular import)
@@ -73,11 +76,28 @@ python main.py evaluate-dataset --dataset osv \
   --override parallel_workers=4
 ```
 
-### Evaluate localizability
+### Evaluate localizability (two decoupled stages)
+
+Localizability is a property of the clean image, independent of any attack, so it is
+precomputed + stored once and later joined to the (separately produced) attack results
+by image id. This lets a full-dataset cluster run reuse one set of scores.
 
 ```bash
-python main.py evaluate-localizability --dataset yfcc
+# Stage 1 — precompute + store per-image localizability scores (id -> score).
+# Optionally shard by image window across cluster jobs (see scripts/cluster/localizability/).
+python main.py evaluate-localizability --stage compute --dataset yfcc --n-images 4000
+python main.py evaluate-localizability --stage merge   --dataset yfcc   # stitch window shards
+
+# Stage 2 — join the stored scores with the attack results and plot (per budget).
+python main.py evaluate-localizability --stage plot --dataset yfcc \
+  --attack-types dtd encoder unidef ace --results-dir <dir> --plots-dir <dir>/plots
+# Stack both datasets as rows in one figure (paper layout):
+python main.py evaluate-localizability --stage plot --datasets yfcc osv \
+  --attack-types dtd encoder --results-dir <dir> --plots-dir <dir>/plots
 ```
+
+Run the precompute on a single local GPU with `scripts/run_localizability.sh` (defaults to
+all of YFCC4k; `./run_localizability.sh osv` for a seeded 4000-image OSV-5M subset).
 
 ### Plot results
 
@@ -281,7 +301,10 @@ Results are saved to the configured `results_dir` (default `./results/`):
 - `{dataset}_restarts_results.json` - restart ablation data
 - `{dataset}_sampling_steps_results.json` - sampling-steps ablation data
 - `{dataset}_robustness_results.json` - robustness (JPEG/blur) ablation data
-- `{dataset}_metrics_localizability.pt` - localizability evaluation results
+- `localizability_shards/{dataset}_loc__w<start>_<end>.pt` - per-window localizability
+  scores (compute stage; resumable)
+- `{dataset}_localizability.pt` - merged full-dataset localizability scores (id -> score),
+  the input to the localizability plot stage
 
 Plots are saved to `plots_dir` (default `./plots/`). Every result/success-rate plot
 now writes a JSON sidecar next to the PNG with the plotted numbers:

@@ -11,7 +11,11 @@ Commands:
     multi-node dataset evaluation. Used by the SLURM array in scripts/cluster/.
   - merge-shards: Stitch all per-shard outputs back into the full-dataset results,
     ablation JSONs, and plots (the artifacts evaluate-dataset would have produced).
-  - evaluate-localizability: Evaluate attack effectiveness by image localizability
+  - evaluate-localizability: Attack effectiveness by image localizability, in two stages:
+    --stage compute precomputes + stores per-image localizability scores (optionally one
+    image window per cluster job), --stage merge stitches the window shards, and
+    --stage plot joins the scores with the separately-produced attack results by image id
+    and renders the localizability-vs-attack-strength figure.
   - evaluate-geoshield-vs-diffusion: Evaluate precomputed clean/attacked pairs (the
     standalone GeoShield path; the integrated path above is usually preferred)
   - evaluate-restarts / evaluate-sampling-steps / evaluate-robustness: standalone ablations
@@ -24,13 +28,15 @@ Usage:
   python main.py evaluate-dataset --dataset yfcc --run-sampling-steps-ablation
   python main.py evaluate-dataset --dataset yfcc --attack-types dtd --run-robustness-ablation
   python main.py evaluate-dataset --dataset yfcc --attack-types dtd encoder geoshield
-  python main.py evaluate-localizability --dataset osv
+  python main.py evaluate-localizability --stage compute --dataset osv
+  python main.py evaluate-localizability --stage plot --dataset yfcc --attack-types dtd encoder
   python main.py plot success-rate --dataset yfcc
 """
 
 import argparse
 import copy
 import glob
+import json
 import os
 import sys
 from dataclasses import dataclass
@@ -44,7 +50,10 @@ from utils.pipe_trajectory import PlonkPipelineTrajectory
 from utils.adversarial_eval import (
     evaluate_attack_on_dataset,
     evaluate_attack_shard,
-    evaluate_localizability,
+    compute_localizability_scores,
+    merge_localizability_scores,
+    plot_localizability_vs_attacks,
+    DEFAULT_LOCALIZABILITY_MC_SAMPLES,
     evaluate_restarts,
     evaluate_robustness,
     evaluate_sampling_steps,
@@ -56,8 +65,12 @@ from utils.adversarial_utils import seed_everything, expand_to_budget_count
 from utils.plots_adversarial_attacks import (
     plot_results,
     plot_attack_success_rate,
+    plot_attack_dtd_variance,
+    plot_clean_vs_attacked_displacement,
+    plot_loss_vs_fsd,
     plot_restarts_success,
     plot_robustness_results,
+    plot_model_transfer_success_rate,
     plot_sampling_steps_success_rate,
 )
 from core import (
@@ -439,7 +452,7 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
     trainable_attack_types = [at for at in ctx.attack_types if at != geoshield_name]
 
     parallel_workers = pick_value(args.parallel_workers, config.get("parallel_workers"), 1)
-    plot_gps_true = bool(get_nested_config(config, "plot", "gps_true", default=False))
+    plot_gps_true = bool(get_nested_config(config, "plot", "gps_true", default=True))
     plot_success_rate = bool(get_nested_config(config, "plot", "plot_success_rate", default=False))
     success_rate_thresholds = get_nested_config(
         config, "plot", "attack_success_rate_thresholds", default=DEFAULT_SUCCESS_RATE_THRESHOLDS
@@ -773,6 +786,32 @@ def _resolve_shard_window(args, total_images: int, config: Dict[str, Any]) -> tu
     return window_start, window_end
 
 
+def _resolve_localizability_window(args, total_images: int, config: Dict[str, Any]) -> tuple[int, Optional[int]]:
+    """Resolve the localizability compute window from the CLI args.
+
+    Like ``_resolve_shard_window`` but optional: with no windowing flags the whole pool
+    ``[0:total_images]`` is computed in one job. Otherwise an explicit
+    ``--window-start``/``--window-end`` or ``--image-shard-index`` (+ ``--images-per-shard``)
+    selects a contiguous slice of the seeded ordering for a cluster array task.
+    """
+    if args.window_start is not None or args.window_end is not None:
+        window_start = int(args.window_start or 0)
+        window_end = None if args.window_end is None else int(args.window_end)
+    elif args.image_shard_index is not None:
+        images_per_shard = int(pick_value(
+            args.images_per_shard, config.get("images_per_shard"), DEFAULT_IMAGES_PER_SHARD
+        ))
+        window_start = int(args.image_shard_index) * images_per_shard
+        window_end = window_start + images_per_shard
+    else:
+        window_start, window_end = 0, None  # whole pool in one job
+
+    window_start = min(window_start, total_images)
+    if window_end is not None:
+        window_end = min(window_end, total_images)
+    return window_start, window_end
+
+
 def _run_geoshield_shard(
     config: Dict[str, Any],
     dataset: str,
@@ -999,7 +1038,7 @@ def cmd_merge_shards(args, config: Dict[str, Any]) -> None:
     ctrls = _resolve_ablation_controls(args, config)
     from utils.ablations import model_type_label
     plot_success_rate = bool(get_nested_config(config, "plot", "plot_success_rate", default=False))
-    plot_gps_true = bool(get_nested_config(config, "plot", "gps_true", default=False))
+    plot_gps_true = bool(get_nested_config(config, "plot", "gps_true", default=True))
 
     print_run_banner(
         f"Merging shard results on {dataset.upper()} dataset",
@@ -1042,36 +1081,114 @@ def cmd_merge_shards(args, config: Dict[str, Any]) -> None:
     print(f"\nMerge complete! Results in {results_dir}, plots in {plots_dir}.")
 
 
+def _load_run_attack_budgets(dataset: str, results_dir: str) -> Optional[List[float]]:
+    """Return the attack budgets saved with the dataset's results, or None if absent.
+
+    The per-attack result tensors are indexed ``[budget, image]``; using the budgets the
+    run actually used keeps the localizability plot's budget axis aligned even if the
+    current ``config.yaml`` lists different budgets.
+    """
+    from core import ResultsManager
+
+    try:
+        args = ResultsManager(results_dir, results_dir).load_attack_args(dataset)
+    except FileNotFoundError:
+        return None
+    budgets = args.get("attack_budgets")
+    return list(budgets) if budgets else None
+
+
 def cmd_evaluate_localizability(args, config: Dict[str, Any]) -> None:
-    """Evaluate attack effectiveness by image localizability."""
-    ctx = prepare_training_run(args, config, default_n_images=100)
+    """Evaluate how attack strength varies with image localizability, in two decoupled stages.
+
+    Localizability is a property of the clean image, independent of any attack, so it is
+    computed and stored once (``--stage compute``, optionally sharded across cluster jobs
+    by image window) and then joined to the separately-produced attack results at plot
+    time (``--stage plot``). ``--stage merge`` stitches the per-window compute shards into
+    the full-dataset ``<dataset>_localizability.pt`` (the plot stage does this implicitly
+    if the merged file is missing).
+    """
+    stage = getattr(args, "stage", "compute") or "compute"
+    dataset = pick_value(args.dataset, config.get("dataset"), "yfcc")
+    results_dir = pick_value(args.results_dir, config.get("results_dir"), str(DEFAULT_RESULTS_DIR))
+    plots_dir = pick_value(args.plots_dir, config.get("plots_dir"), str(DEFAULT_PLOTS_DIR))
+    seed = int(config.get("seed", 0))
+
+    if stage == "merge":
+        print_run_banner(
+            f"Merging localizability shards on {dataset.upper()} dataset",
+            results_directory=results_dir,
+        )
+        merge_localizability_scores(dataset_name=dataset, results_dir=results_dir)
+        print(f"\nMerge complete! Localizability scores in: {results_dir}")
+        return
+
+    if stage == "plot":
+        attack_types = pick_value(args.attack_types, config.get("attack_types"), DEFAULT_ATTACK_TYPES)
+        # Prefer the budgets actually used by the attack run (saved alongside the results)
+        # so the budget axis of the result tensors lines up; fall back to config otherwise.
+        attack_budgets = _load_run_attack_budgets(dataset, results_dir) or get_attack_budgets(config, dataset)
+        # Combine multiple datasets into one figure (rows) when asked (e.g. yfcc + osv).
+        datasets = args.datasets if getattr(args, "datasets", None) else [dataset]
+        plot_budgets = args.plot_budgets if getattr(args, "plot_budgets", None) else None
+
+        print_run_banner(
+            "Plotting localizability vs attack strength",
+            datasets=datasets,
+            attack_types=attack_types,
+            attack_budgets=attack_budgets,
+            plot_budgets=plot_budgets if plot_budgets else "(all budgets)",
+            results_directory=results_dir,
+            plots_directory=plots_dir,
+        )
+        plot_localizability_vs_attacks(
+            datasets=datasets,
+            attack_types=attack_types,
+            attack_budgets=attack_budgets,
+            results_dir=results_dir,
+            plot_dir=plots_dir,
+            plot_budgets=plot_budgets,
+        )
+        print(f"\nPlots saved to: {plots_dir}")
+        return
+
+    # stage == "compute"
+    n_images = pick_value(args.n_images, config.get("total_images"), config.get("n_images_to_eval", 100))
+    n_images = int(n_images)
+    window_start, window_end = _resolve_localizability_window(args, n_images, config)
+    window_end_label = window_end if window_end is not None else n_images
+    if window_start >= window_end_label:
+        print(f"Localizability window [{window_start}:{window_end_label}] is empty "
+              f"(pool size {n_images}); nothing to do.")
+        return
+    num_mc_samples = int(pick_value(
+        args.num_mc_samples,
+        get_nested_config(config, "localizability", "num_monte_carlo_samples", default=None),
+        DEFAULT_LOCALIZABILITY_MC_SAMPLES,
+    ))
+
+    seed_everything(seed)
+    pipeline = get_pipeline(config, dataset)
 
     print_run_banner(
-        f"Evaluating localizability on {ctx.dataset.upper()} dataset",
-        attack_types=ctx.attack_types,
-        attack_budgets=ctx.attack_budgets,
-        images_to_evaluate=ctx.n_images,
-        results_directory=ctx.results_dir,
-        plots_directory=ctx.plots_dir,
+        f"Computing localizability on {dataset.upper()} dataset",
+        image_window=f"[{window_start}:{window_end_label}] of {n_images}",
+        monte_carlo_samples=num_mc_samples,
+        results_directory=results_dir,
     )
-
-    evaluate_localizability(
-        attack_types=ctx.attack_types,
-        pipeline=ctx.pipeline,
-        dataset_name=ctx.dataset,
-        seed=ctx.seed,
-        n_images_to_eval=ctx.n_images,
-        plot_dir=ctx.plots_dir,
-        results_dir=ctx.results_dir,
-        attack_budgets=ctx.attack_budgets,
-        attack_kwargs=ctx.attack_kwargs,
+    compute_localizability_scores(
+        pipeline=pipeline,
+        dataset_name=dataset,
+        seed=seed,
+        n_images_to_eval=n_images,
+        results_dir=results_dir,
         dataset_roots=config.get("data_dirs", {}),
+        window_start=window_start,
+        window_end=window_end,
+        num_monte_carlo_samples=num_mc_samples,
         config_dump=config,
-        attack_type_kwargs=ctx.attack_type_kwargs,
     )
-
-    print(f"\nEvaluation complete! Results saved to: {ctx.results_dir}")
-    print(f"Plots saved to: {ctx.plots_dir}")
+    print(f"\nLocalizability scores saved under: {results_dir}/localizability_shards")
 
 
 def cmd_evaluate_restarts(args, config: Dict[str, Any]) -> None:
@@ -1311,7 +1428,7 @@ def cmd_evaluate_geoshield_vs_diffusion(args, config: Dict[str, Any]) -> None:
     seed_everything(seed)
     pipeline = get_pipeline(config, dataset)
 
-    plot_gps_true = bool(get_nested_config(config, "plot", "gps_true", default=False))
+    plot_gps_true = bool(get_nested_config(config, "plot", "gps_true", default=True))
     if plot_gps_true:
         print("Warning: plot.gps_true is enabled, but precomputed folder evaluation does not have ground-truth GPS labels. Using predicted displacement plots instead.")
         plot_gps_true = False
@@ -1472,7 +1589,7 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
     )
 
     attack_types = pick_value(args.attack_types, config.get("attack_types"), DEFAULT_ATTACK_TYPES)
-    gps_true = bool(get_nested_config(config, "plot", "gps_true", default=False))
+    gps_true = bool(get_nested_config(config, "plot", "gps_true", default=True))
     plot_success_rate = bool(get_nested_config(config, "plot", "plot_success_rate", default=False))
     success_rate_thresholds = get_nested_config(
         config, "plot", "attack_success_rate_thresholds", default=DEFAULT_SUCCESS_RATE_THRESHOLDS
@@ -1514,15 +1631,86 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
             threshold_km=success_rate_thresholds,
         )
 
+    elif plot_type == "dtd-variance":
+        attack_budgets = get_attack_budgets(config, dataset)
+        print(f"Plotting attack displacement variance (\"DTD\") for attacks: {attack_types}")
+        plot_attack_dtd_variance(
+            results_dir=results_dir,
+            attack_budgets=attack_budgets,
+            plot_dir=plots_dir,
+            dataset_name=dataset,
+            attack_types=attack_types,
+            gps_true=gps_true,
+        )
+
+    elif plot_type == "loss-vs-fsd":
+        attack_budgets = get_attack_budgets(config, dataset)
+        loss_attack_types = [at for at in attack_types if at in ("dtd", "training_loss", "sampling")] or ["dtd", "training_loss", "sampling"]
+        print(f"Plotting training loss vs. achieved FSD for attacks: {loss_attack_types}")
+        plot_loss_vs_fsd(
+            results_dir=results_dir,
+            attack_budgets=attack_budgets,
+            plot_dir=plots_dir,
+            dataset_name=dataset,
+            attack_types=loss_attack_types,
+            gps_true=gps_true,
+        )
+
+    elif plot_type == "clean-vs-attacked-displacement":
+        attack_budgets = get_attack_budgets(config, dataset)
+        print(f"Plotting clean-vs-attacked true-GPS displacement for attacks: {attack_types}")
+        plot_clean_vs_attacked_displacement(
+            results_dir=results_dir,
+            attack_budgets=attack_budgets,
+            plot_dir=plots_dir,
+            dataset_name=dataset,
+            attack_types=attack_types,
+        )
+
     elif plot_type == "sampling-steps":
-        results_files = pick_value(args.results_files, config.get("results_files"), None)
-        if not results_files:
-            raise ValueError(
-                "plot sampling-steps requires --results-files (one or more JSON result file paths)"
-            )
+        default_results_file = os.path.join(results_dir, f"{dataset}_sampling_steps_results.json")
+        results_files = pick_value(args.results_files, config.get("results_files"), [default_results_file])
         print(f"Merging {len(results_files)} result file(s) for joint sampling-steps plot")
         merged = merge_sampling_steps_results(results_files)
         plot_sampling_steps_success_rate(json_results=merged, plot_dir=plots_dir)
+
+    elif plot_type == "robustness":
+        results_file = pick_value(
+            args.results_files[0] if args.results_files else None,
+            config.get("results_file"),
+            os.path.join(results_dir, f"{dataset}_robustness_results.json"),
+        )
+        print(f"Plotting robustness (JPEG/blur) results from: {results_file}")
+        with open(results_file) as f:
+            json_results = json.load(f)
+        plot_robustness_results(json_results=json_results, plot_dir=plots_dir)
+
+    elif plot_type == "restarts":
+        results_file = pick_value(
+            args.results_files[0] if args.results_files else None,
+            config.get("results_file"),
+            os.path.join(results_dir, f"{dataset}_restarts_results.json"),
+        )
+        print(f"Plotting restart-success ablation from: {results_file}")
+        with open(results_file) as f:
+            json_results = json.load(f)
+        # Full-dataset runs (e.g. the restart ablation folded into evaluate-dataset)
+        # have one image per per-image figure -- skip those and keep only the
+        # mean-+-std summary plot. Standalone single/few-image ablations still get
+        # their per-image figures.
+        per_image = json_results.get("n_images", 1) == 1
+        plot_restarts_success(json_results=json_results, plot_dir=plots_dir, per_image=per_image)
+
+    elif plot_type == "model-transfer":
+        results_file = pick_value(
+            args.results_files[0] if args.results_files else None,
+            config.get("results_file"),
+            os.path.join(results_dir, f"{dataset}_model_transfer_results.json"),
+        )
+        print(f"Plotting cross-model transfer results from: {results_file}")
+        with open(results_file) as f:
+            json_results = json.load(f)
+        plot_model_transfer_success_rate(json_results=json_results, plot_dir=plots_dir)
 
     else:
         raise ValueError(f"Unknown plot type: {plot_type}")
@@ -1709,11 +1897,30 @@ Examples:
                            help="Directory holding the per-shard subdirectories (default: <results-dir>/shards)")
     add_ablation_args(merge_cmd)
 
-    # evaluate-localizability
+    # evaluate-localizability (two stages: compute scores, then plot vs attack results)
     eval_local = subparsers.add_parser("evaluate-localizability",
                                        help="Evaluate attack effectiveness by image localizability",
                                        parents=[global_parser])
-    add_common_eval_args(eval_local)
+    add_common_eval_args(eval_local,
+                         n_images_help="Size of the seeded image pool to score (default: total_images / n_images_to_eval)")
+    eval_local.add_argument("--stage", choices=["compute", "merge", "plot"], default="compute",
+                            help="compute: score images (optionally one window); merge: stitch "
+                                 "window shards; plot: join with attack results and plot (default: compute)")
+    # Sharding controls for the compute stage (mirror evaluate-dataset-shard).
+    eval_local.add_argument("--images-per-shard", type=int,
+                            help=f"Images per compute window (default: {DEFAULT_IMAGES_PER_SHARD})")
+    eval_local.add_argument("--image-shard-index", type=int,
+                            help="0-based window index; window = [k*images_per_shard, (k+1)*images_per_shard)")
+    eval_local.add_argument("--window-start", type=int, help="Explicit window start (overrides --image-shard-index)")
+    eval_local.add_argument("--window-end", type=int, help="Explicit window end (exclusive)")
+    eval_local.add_argument("--num-mc-samples", type=int,
+                            help=f"Monte-Carlo samples for the localizability estimate "
+                                 f"(default: {DEFAULT_LOCALIZABILITY_MC_SAMPLES})")
+    # Plot stage controls.
+    eval_local.add_argument("--datasets", nargs="+", choices=["yfcc", "osv"],
+                            help="Datasets to stack as rows in the plot (default: just --dataset)")
+    eval_local.add_argument("--plot-budgets", nargs="+", type=float,
+                            help="Budgets to render one figure each for (default: every configured budget)")
 
     # evaluate-restarts
     eval_restarts = subparsers.add_parser("evaluate-restarts",
@@ -1759,7 +1966,10 @@ Examples:
 
     # plot
     plot_cmd = subparsers.add_parser("plot", help="Plot saved results", parents=[global_parser])
-    plot_cmd.add_argument("plot_type", nargs="?", choices=["results", "success-rate", "sampling-steps"],
+    plot_cmd.add_argument("plot_type", nargs="?",
+                          choices=["results", "success-rate", "sampling-steps", "dtd-variance",
+                                   "loss-vs-fsd", "clean-vs-attacked-displacement", "restarts",
+                                   "robustness", "model-transfer"],
                           help="Type of plot to generate")
     plot_cmd.add_argument("--dataset", choices=["yfcc", "osv"], help="Dataset to plot")
     plot_cmd.add_argument("--attack-types", nargs="+", help="Attack types to plot (for 'results' plot type)")

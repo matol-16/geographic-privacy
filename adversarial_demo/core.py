@@ -340,6 +340,13 @@ class MetricsCollector:
             }
             for attack_type in attack_types
         }
+        # Best-restart training loss (attack-type-specific units/scale) per image,
+        # used by the loss-vs-FSD ablation to relate optimization progress to
+        # geolocation impact for loss-based attacks (dtd, training_loss, sampling).
+        self.loss_results = {
+            attack_type: torch.full((len(attack_budgets), n_images), float("nan"))
+            for attack_type in attack_types
+        }
         self.restart_results: Dict[str, List[List[Optional[List[Dict[str, Any]]]]]] = {
             attack_type: [[None for _ in range(n_images)] for _ in attack_budgets]
             for attack_type in attack_types
@@ -455,6 +462,10 @@ class MetricsCollector:
         if isinstance(best_restart, int) and 0 <= best_restart < len(restart_results):
             best_restart_result = restart_results[best_restart]
 
+        final_loss = attack_result.get("final_loss")
+        if final_loss is not None:
+            self.loss_results[attack_type][budget_index, image_index] = float(final_loss)
+
         location_result: Dict[str, Any] = {
             "best_restart": int(best_restart) if isinstance(best_restart, int) else None,
             "true_gps": torch.tensor(true_gps, dtype=torch.float32) if true_gps is not None else None,
@@ -538,6 +549,7 @@ class MetricsCollector:
             }
             attack_results["image_indices"] = list(range(self.n_images))
             attack_results["image_ids"] = self.source_image_ids
+            attack_results["final_loss"] = self.loss_results[attack_type]
             attack_results["restart_results"] = self.restart_results[attack_type]
             attack_results["location_results"] = self.location_results[attack_type]
             combined_results[attack_type] = attack_results

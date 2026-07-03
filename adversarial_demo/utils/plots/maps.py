@@ -78,13 +78,7 @@ def plot_gps_samples_on_map(gps_coords_source, gps_coords_target, gps_coords_per
     gl.top_labels = False
     gl.right_labels = False
 
-    # Add title and legend
-    title = 'Geolocation Samples (Global View)' if perturb_budget is None else f'Geolocation Samples (Budget: {perturb_budget:.3f})'
-
-    if cfg is not None:
-        title += f", CFG: {cfg}"
-
-    plt.title(title, fontsize=16, color='black', pad=20)
+    # Add legend
     plt.legend(loc='upper left', fontsize='large', frameon=True, facecolor='white', edgecolor='black')
 
     plt.tight_layout()
@@ -229,15 +223,7 @@ def plot_gps_trajectories_on_map(
         gl.top_labels = False
         gl.right_labels = False
 
-        # Add title and legend
-        title = 'Geolocation Trajectories (Global View)' if perturb_budget is None else f'Geolocation Trajectories (Budget: {perturb_budget:.3f})'
-
-        if cfg is not None:
-            title += f", CFG: {cfg}"
-        if n_plot < batch_size:
-            title += f" (showing {n_plot}/{batch_size})"
-
-        map_ax.set_title(title, fontsize=13, color='black', pad=12)
+        # Add legend
         map_ax.legend(loc='upper left', fontsize='small', frameon=True, facecolor='white', edgecolor='black')
 
     if show_displacement:
@@ -257,7 +243,6 @@ def plot_gps_trajectories_on_map(
         disp_ax.plot(steps, mean_disp, color='black', linewidth=1.2, linestyle='--', alpha=0.8, label='Mean displacement')
         disp_ax.plot(steps, median_disp, color='crimson', linewidth=1.8, label='Median displacement')
         disp_ax.fill_between(steps, q25_disp, q75_disp, color='crimson', alpha=0.2, label='IQR (25-75%)')
-        disp_ax.set_title('Perturbation effect over steps', fontsize=12)
         disp_ax.set_xlabel('Step')
         disp_ax.set_ylabel(f'Displacement {metric}')
         disp_ax.grid(alpha=0.3)

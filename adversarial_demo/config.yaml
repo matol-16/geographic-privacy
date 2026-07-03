@@ -152,7 +152,7 @@ localizability:
 
 # Plotting options
 plot:
-  gps_true: false
+  gps_true: true
   plot_success_rate: true
   attack_success_rate_thresholds: [200, 750, 2500] # Distance thresholds in km
   stored_metrics: ["final_step_displacement_predicted", "final_step_displacement_true"]
