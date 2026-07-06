@@ -73,6 +73,17 @@ from utils.plots_adversarial_attacks import (
     plot_model_transfer_success_rate,
     plot_sampling_steps_success_rate,
 )
+from utils.plots_tikz import (
+    plot_results_tikz,
+    plot_attack_success_rate_tikz,
+    plot_attack_dtd_variance_tikz,
+    plot_clean_vs_attacked_displacement_tikz,
+    plot_loss_vs_fsd_tikz,
+    plot_robustness_results_tikz,
+    plot_model_transfer_success_rate_tikz,
+    plot_sampling_steps_success_rate_tikz,
+    plot_localizability_vs_attacks_tikz,
+)
 from core import (
     PrecomputedPairEvaluationConfig,
     PrecomputedPairEvaluationRunner,
@@ -1140,15 +1151,26 @@ def cmd_evaluate_localizability(args, config: Dict[str, Any]) -> None:
             plot_budgets=plot_budgets if plot_budgets else "(all budgets)",
             results_directory=results_dir,
             plots_directory=plots_dir,
+            tikz=bool(getattr(args, "tikz", False)),
         )
-        plot_localizability_vs_attacks(
-            datasets=datasets,
-            attack_types=attack_types,
-            attack_budgets=attack_budgets,
-            results_dir=results_dir,
-            plot_dir=plots_dir,
-            plot_budgets=plot_budgets,
-        )
+        if getattr(args, "tikz", False):
+            plot_localizability_vs_attacks_tikz(
+                datasets=datasets,
+                attack_types=attack_types,
+                attack_budgets=attack_budgets,
+                results_dir=results_dir,
+                plot_dir=plots_dir,
+                plot_budgets=plot_budgets,
+            )
+        else:
+            plot_localizability_vs_attacks(
+                datasets=datasets,
+                attack_types=attack_types,
+                attack_budgets=attack_budgets,
+                results_dir=results_dir,
+                plot_dir=plots_dir,
+                plot_budgets=plot_budgets,
+            )
         print(f"\nPlots saved to: {plots_dir}")
         return
 
@@ -1594,11 +1616,13 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
     success_rate_thresholds = get_nested_config(
         config, "plot", "attack_success_rate_thresholds", default=DEFAULT_SUCCESS_RATE_THRESHOLDS
     )
+    tikz = bool(getattr(args, "tikz", False))
 
     if plot_type == "results":
         attack_budgets = get_attack_budgets(config, dataset)
         print(f"Plotting results for attacks: {attack_types}")
-        plot_results(
+        results_fn = plot_results_tikz if tikz else plot_results
+        results_fn(
             results_dir=results_dir,
             attack_budgets=attack_budgets,
             plot_dir=plots_dir,
@@ -1608,7 +1632,8 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
             stored_metrics=get_nested_config(config, "plot", "stored_metrics", default=DEFAULT_STORED_METRICS),
         )
         if plot_success_rate:
-            plot_attack_success_rate(
+            success_rate_fn = plot_attack_success_rate_tikz if tikz else plot_attack_success_rate
+            success_rate_fn(
                 results_dir=results_dir,
                 attack_budgets=attack_budgets,
                 plot_dir=plots_dir,
@@ -1621,7 +1646,8 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
     elif plot_type == "success-rate":
         attack_budgets = get_attack_budgets(config, dataset)
         print(f"Plotting attack success rates with distance thresholds: {success_rate_thresholds} km")
-        plot_attack_success_rate(
+        success_rate_fn = plot_attack_success_rate_tikz if tikz else plot_attack_success_rate
+        success_rate_fn(
             results_dir=results_dir,
             attack_budgets=attack_budgets,
             plot_dir=plots_dir,
@@ -1634,7 +1660,8 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
     elif plot_type == "dtd-variance":
         attack_budgets = get_attack_budgets(config, dataset)
         print(f"Plotting attack displacement variance (\"DTD\") for attacks: {attack_types}")
-        plot_attack_dtd_variance(
+        dtd_variance_fn = plot_attack_dtd_variance_tikz if tikz else plot_attack_dtd_variance
+        dtd_variance_fn(
             results_dir=results_dir,
             attack_budgets=attack_budgets,
             plot_dir=plots_dir,
@@ -1647,7 +1674,8 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         attack_budgets = get_attack_budgets(config, dataset)
         loss_attack_types = [at for at in attack_types if at in ("dtd", "training_loss", "sampling")] or ["dtd", "training_loss", "sampling"]
         print(f"Plotting training loss vs. achieved FSD for attacks: {loss_attack_types}")
-        plot_loss_vs_fsd(
+        loss_vs_fsd_fn = plot_loss_vs_fsd_tikz if tikz else plot_loss_vs_fsd
+        loss_vs_fsd_fn(
             results_dir=results_dir,
             attack_budgets=attack_budgets,
             plot_dir=plots_dir,
@@ -1659,7 +1687,8 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
     elif plot_type == "clean-vs-attacked-displacement":
         attack_budgets = get_attack_budgets(config, dataset)
         print(f"Plotting clean-vs-attacked true-GPS displacement for attacks: {attack_types}")
-        plot_clean_vs_attacked_displacement(
+        clean_vs_attacked_fn = plot_clean_vs_attacked_displacement_tikz if tikz else plot_clean_vs_attacked_displacement
+        clean_vs_attacked_fn(
             results_dir=results_dir,
             attack_budgets=attack_budgets,
             plot_dir=plots_dir,
@@ -1672,7 +1701,8 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         results_files = pick_value(args.results_files, config.get("results_files"), [default_results_file])
         print(f"Merging {len(results_files)} result file(s) for joint sampling-steps plot")
         merged = merge_sampling_steps_results(results_files)
-        plot_sampling_steps_success_rate(json_results=merged, plot_dir=plots_dir)
+        sampling_steps_fn = plot_sampling_steps_success_rate_tikz if tikz else plot_sampling_steps_success_rate
+        sampling_steps_fn(json_results=merged, plot_dir=plots_dir)
 
     elif plot_type == "robustness":
         results_file = pick_value(
@@ -1683,9 +1713,12 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         print(f"Plotting robustness (JPEG/blur) results from: {results_file}")
         with open(results_file) as f:
             json_results = json.load(f)
-        plot_robustness_results(json_results=json_results, plot_dir=plots_dir)
+        robustness_fn = plot_robustness_results_tikz if tikz else plot_robustness_results
+        robustness_fn(json_results=json_results, plot_dir=plots_dir)
 
     elif plot_type == "restarts":
+        if tikz:
+            raise ValueError("--tikz is not supported for plot_type 'restarts' (not part of the TikZ backend).")
         results_file = pick_value(
             args.results_files[0] if args.results_files else None,
             config.get("results_file"),
@@ -1710,7 +1743,8 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         print(f"Plotting cross-model transfer results from: {results_file}")
         with open(results_file) as f:
             json_results = json.load(f)
-        plot_model_transfer_success_rate(json_results=json_results, plot_dir=plots_dir)
+        model_transfer_fn = plot_model_transfer_success_rate_tikz if tikz else plot_model_transfer_success_rate
+        model_transfer_fn(json_results=json_results, plot_dir=plots_dir)
 
     else:
         raise ValueError(f"Unknown plot type: {plot_type}")
@@ -1921,6 +1955,9 @@ Examples:
                             help="Datasets to stack as rows in the plot (default: just --dataset)")
     eval_local.add_argument("--plot-budgets", nargs="+", type=float,
                             help="Budgets to render one figure each for (default: every configured budget)")
+    eval_local.add_argument("--tikz", action="store_true",
+                            help="Emit standalone pgfplots .tex (+ best-effort compiled PDF/PNG preview) "
+                                 "instead of a matplotlib figure, for --stage plot")
 
     # evaluate-restarts
     eval_restarts = subparsers.add_parser("evaluate-restarts",
@@ -1976,6 +2013,10 @@ Examples:
     plot_cmd.add_argument("--results-dir", help="Directory containing saved results")
     plot_cmd.add_argument("--plots-dir", help="Directory to save plots")
     plot_cmd.add_argument("--results-files", nargs="+", help="JSON result files to merge for 'sampling-steps' plot type")
+    plot_cmd.add_argument("--tikz", action="store_true",
+                          help="Emit standalone pgfplots .tex (+ best-effort compiled PDF/PNG preview) "
+                               "under <plots-dir>/tikz/ instead of a matplotlib figure "
+                               "(not supported for plot_type 'restarts')")
 
     # list-configs
     subparsers.add_parser("list-configs", help="List available configuration parameters", parents=[global_parser])
