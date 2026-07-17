@@ -56,6 +56,14 @@ from utils.plots_tikz.common import (
 
 _BUCKET_NAMES = ["Low", "Medium", "High"]
 
+# Shared per-panel geometry for the single-row "success rate vs. X, one panel
+# per threshold" groupplots (sampling-steps, model-transfer, robustness): same
+# width/height/sep everywhere so fonts, markers, and line widths land at the
+# same visual scale across those figures instead of each picking its own.
+SUCCESS_RATE_PANEL_W = 7.0
+SUCCESS_RATE_PANEL_H = 5.5
+SUCCESS_RATE_H_SEP = 1.6
+
 
 # --------------------------------------------------------------------------- #
 # Main results: displacement + success rate vs. budget
@@ -776,7 +784,13 @@ def plot_sampling_steps_success_rate_tikz(
                 entry += f"\n\\addlegendentry{{{tex_escape(_display_attack_name(attack_type))}}}"
             panels[ax_idx].append(entry)
 
-    panel_w, panel_h, h_sep = 6.5, 5.2, 1.6
+    # Panel size/sep shared with plot_model_transfer_success_rate_tikz and
+    # plot_robustness_results_tikz -- all three are single-row groupplots of
+    # success-rate-vs-something, so keeping their per-panel geometry identical
+    # (rather than each picking its own numbers) is what makes fonts, markers,
+    # and line widths read at the same visual scale when the figures sit next
+    # to each other in the paper.
+    panel_w, panel_h, h_sep = SUCCESS_RATE_PANEL_W, SUCCESS_RATE_PANEL_H, SUCCESS_RATE_H_SEP
     legend_x = groupplot_legend_center_x(len(thresholds), panel_w, h_sep)
 
     # eval_num_steps roughly doubles each step (e.g. 8/16/32/64) then jumps to
@@ -888,7 +902,8 @@ def plot_model_transfer_success_rate_tikz(
             panels[col_idx].append(entry)
 
     xcoords = ",".join(xcoords_labels)
-    panel_w, panel_h, h_sep, enlarge = 9.5, 6, 0.7, 0.12
+    panel_w, panel_h, h_sep = SUCCESS_RATE_PANEL_W, SUCCESS_RATE_PANEL_H, SUCCESS_RATE_H_SEP
+    enlarge = 0.12
     legend_x = groupplot_legend_center_x(len(thresholds), panel_w, h_sep)
     # Bar width is an absolute pt size, so it must fit within one category's
     # actual on-canvas slot (panel width minus the enlarge margins, divided
@@ -929,16 +944,18 @@ def plot_robustness_results_tikz(
     plot_dir: str,
     eps: float = DEFAULT_ABLATION_EPS,
 ) -> dict:
-    """TikZ twin of ``utils.plots.ablations.plot_robustness_results`` -- all
-    distance thresholds (not just 2500km), and a JPEG quality=100 point synthesized
-    from the Gaussian-blur-sigma=0 level (quality=100 / sigma=0 are both "no
-    transform applied", so they share the same success rate -- the robustness
-    sweep just never evaluated quality=100 explicitly under the JPEG branch).
+    """TikZ twin of ``utils.plots.ablations.plot_robustness_results`` -- only
+    the 200km and 2500km distance thresholds, laid out as a single row, and a
+    JPEG quality=100 point synthesized from the Gaussian-blur-sigma=0 level
+    (quality=100 / sigma=0 are both "no transform applied", so they share the
+    same success rate -- the robustness sweep just never evaluated
+    quality=100 explicitly under the JPEG branch).
     """
     attack_types = attacks_dtd_last(json_results["attack_types"])
     attack_budgets = json_results["attack_budgets"]
     dataset = json_results["dataset"]
-    thresholds = json_results["success_rate_thresholds_km"]
+    _HEADLINE_THRESHOLDS = [200, 2500]
+    thresholds = [t for t in _HEADLINE_THRESHOLDS if t in json_results["success_rate_thresholds_km"]]
     # Success rate against the *true* GPS (not the clean prediction) -- the
     # primary metric used everywhere else in this evaluation. The JSON may
     # also carry a "predicted" metric, but it renders with identical styling
@@ -949,7 +966,7 @@ def plot_robustness_results_tikz(
     bkey = f"budget_{budget:.6f}"
 
     transforms = [("JPEG quality factor", "jpeg"), ("Gaussian blur $\\sigma$", "blur")]
-    n_rows = len(thresholds)
+    n_cols = len(thresholds) * len(transforms)
 
     def _sorted_levels(level_dict: dict):
         items = sorted(level_dict.items(), key=lambda kv: float(kv[0]))
@@ -979,7 +996,7 @@ def plot_robustness_results_tikz(
             line_width = attack_line_width(attack_type, base_pt=1.4)
             for row_idx, thr in enumerate(thresholds):
                 rates = [entry[metric]["success_rates"][str(thr)] for entry in entries]
-                key = (row_idx, col_idx)
+                key = (col_idx, row_idx)
                 lines = cell_blocks.setdefault(key, [])
                 is_legend_line = (col_idx == 0 and row_idx == 0)
                 forget = "" if is_legend_line else ", forget plot"
@@ -991,40 +1008,184 @@ def plot_robustness_results_tikz(
                     line += f"\n\\addlegendentry{{{tex_escape(_display_attack_name(attack_type))}}}"
                 lines.append(line)
 
-    panel_w, panel_h, h_sep, v_sep = 7, 5.5, 1.8, 1.8
-    legend_x = groupplot_legend_center_x(2, panel_w, h_sep)
+    panel_w, panel_h, h_sep = SUCCESS_RATE_PANEL_W, SUCCESS_RATE_PANEL_H, SUCCESS_RATE_H_SEP
+    v_sep = h_sep
+    # The single shared legend spans the *entire* row (every panel), so it's
+    # centered relative to the very first axis.
+    legend_x = groupplot_legend_center_x(n_cols, panel_w, h_sep)
+
+    group_axes = []
+    for col_idx, (xlabel, json_key) in enumerate(transforms):
+        for thr_idx, thr in enumerate(thresholds):
+            opts = [
+                "ymin=0.3", "ymax=1", "grid=major", "grid style={gray!25}",
+                f"title={{Displacement > {thr} km}}",
+            ]
+            # Every panel sits on the same row, so every panel gets its own
+            # transform-type xlabel (no bottom-row-only special case needed).
+            opts.append(f"xlabel={{{xlabel}}}")
+            if col_idx == 0 and thr_idx == 0:
+                opts.append("ylabel={Attack success rate}")
+            if json_key == "jpeg":
+                opts.append("x dir=reverse")
+            if col_idx == 0 and thr_idx == 0:
+                opts.append(f"legend style={{at={{({legend_x:.4g},1.35)}}, anchor=south, "
+                            f"legend columns=-1, draw=none, font=\\large}}")
+                opts.append(SINGLE_MARK_LEGEND_IMAGE)
+            blocks = cell_blocks.get((col_idx, thr_idx), [])
+            group_axes.append(f"\\nextgroupplot[{', '.join(opts)}]\n" + "\n".join(blocks))
+
+    body = (
+        f"\\begin{{groupplot}}[group style={{group size={n_cols} by 1, "
+        f"horizontal sep={h_sep}cm, vertical sep={v_sep}cm}}, width={panel_w}cm, height={panel_h}cm]\n"
+        + "\n".join(group_axes) + "\n\\end{groupplot}"
+    )
+    return render_tikz(body, plot_dir, f"{dataset}_robustness_results", color_definitions(colors))
+
+
+def plot_robustness_and_sampling_steps_tikz(
+    robustness_json: dict,
+    sampling_steps_json: dict,
+    plot_dir: str,
+    eps: float = DEFAULT_ABLATION_EPS,
+) -> dict:
+    """Combined robustness figure: rows are the 200km/2500km success-rate
+    thresholds, columns are the three robustness axes -- Gaussian blur, JPEG
+    compression, and sampling steps. The blur/jpeg columns only cover the
+    attacks common to both ablations (geoshield/dtd/encoder/sampling), since
+    L2 and AdvDM never got a robustness sweep (see
+    plot_robustness_results_tikz's docstring) -- but they *did* get a
+    sampling-steps sweep, so they still appear in that column and in the
+    shared legend (registered there via a legend-only ``\\addlegendimage``,
+    since they have no line in the panel the legend is physically attached
+    to). Panel geometry matches the other single-row success-rate groupplots
+    (SUCCESS_RATE_PANEL_W/H/H_SEP) so this figure sits at the same visual
+    scale as those.
+    """
+    _HEADLINE_THRESHOLDS = [200, 2500]
+    thresholds = [t for t in _HEADLINE_THRESHOLDS if t in robustness_json["success_rate_thresholds_km"]]
+    metric = "true"
+    dataset = robustness_json["dataset"]
+
+    common_attack_types = [a for a in robustness_json["attack_types"] if a in sampling_steps_json["attack_types"]]
+    # L2 (diffusion_l2) / AdvDM (training_loss): sampling-steps-only attacks,
+    # requested in addition to the common set even though they can't appear
+    # in the blur/jpeg columns.
+    extra_attack_types = [
+        a for a in ("diffusion_l2", "training_loss")
+        if a in sampling_steps_json["attack_types"] and a not in common_attack_types
+    ]
+    attack_types = attacks_dtd_last(common_attack_types + extra_attack_types)
+    common_set = set(common_attack_types)
+
+    rob_budget = select_closest_budget(robustness_json["attack_budgets"], eps)
+    rob_bkey = f"budget_{rob_budget:.6f}"
+    steps_budgets_per_type = sampling_steps_json.get("attack_budgets_per_type", {})
+    steps_attack_budgets = sampling_steps_json["attack_budgets"]
+    eval_num_steps = sampling_steps_json["eval_num_steps"]
+
+    # (xlabel, json_key) -- json_key is None for the sampling-steps column,
+    # which reads from a different results file than the blur/jpeg columns.
+    transforms = [
+        ("Gaussian blur $\\sigma$", "blur"),
+        ("JPEG quality factor", "jpeg"),
+        ("Sampling steps", None),
+    ]
+    n_cols = len(transforms)
+    n_rows = len(thresholds)
+
+    def _sorted_levels(level_dict):
+        items = sorted(level_dict.items(), key=lambda kv: float(kv[0]))
+        return [float(k) for k, _ in items], [v for _, v in items]
+
+    colors: dict[str, str] = {}
+    cell_blocks: dict[tuple[int, int], list[str]] = {}
+
+    for attack_type in attack_types:
+        color_name, hexcode = attack_pgf_color(attack_type)
+        colors[color_name] = hexcode
+        marker, mark_size = attack_marker(attack_type), attack_mark_size(attack_type, base_pt=2.8)
+        line_width = attack_line_width(attack_type, base_pt=1.4)
+        has_robustness_data = attack_type in common_set
+
+        def _add_line(col_idx: int, row_idx: int, xs, rates, want_legend: bool) -> None:
+            key = (col_idx, row_idx)
+            lines = cell_blocks.setdefault(key, [])
+            forget = "" if want_legend else ", forget plot"
+            line = (f"\\addplot[{color_name}, solid, line width={line_width}, "
+                    f"mark={marker}, mark size={mark_size}, "
+                    f"mark options={{line width=1.1pt}}{forget}] "
+                    f"{coordinates(xs, rates)};")
+            if want_legend:
+                line += f"\n\\addlegendentry{{{tex_escape(_display_attack_name(attack_type))}}}"
+            lines.append(line)
+
+        if has_robustness_data:
+            for col_idx, (_, json_key) in enumerate(transforms[:2]):
+                level_dict = robustness_json["results"][attack_type][rob_bkey][json_key]
+                if not level_dict:
+                    continue
+                if json_key == "jpeg" and "100" not in level_dict:
+                    blur_dict = robustness_json["results"][attack_type][rob_bkey].get("blur", {})
+                    if "0" in blur_dict:
+                        level_dict = {**level_dict, "100": blur_dict["0"]}
+                xs, entries = _sorted_levels(level_dict)
+                for row_idx, thr in enumerate(thresholds):
+                    rates = [entry[metric]["success_rates"][str(thr)] for entry in entries]
+                    _add_line(col_idx, row_idx, xs, rates, want_legend=(col_idx == 0 and row_idx == 0))
+        else:
+            # No blur/jpeg data -- register the legend entry directly on the
+            # (0, 0) axis (where the shared legend lives) without a real plot.
+            legend_only = (f"\\addlegendimage{{{color_name}, solid, line width={line_width}, "
+                           f"mark={marker}, mark size={mark_size}, mark options={{line width=1.1pt}}}}\n"
+                           f"\\addlegendentry{{{tex_escape(_display_attack_name(attack_type))}}}")
+            cell_blocks.setdefault((0, 0), []).append(legend_only)
+
+        budget = select_closest_budget(steps_budgets_per_type.get(attack_type, steps_attack_budgets), eps)
+        bkey = f"budget_{budget:.6f}"
+        for row_idx, thr in enumerate(thresholds):
+            rates = [
+                sampling_steps_json["results"][attack_type][bkey][str(ns)]["success_rates"][str(thr)]
+                for ns in eval_num_steps
+            ]
+            _add_line(2, row_idx, eval_num_steps, rates, want_legend=False)
+
+    panel_w, panel_h, h_sep = SUCCESS_RATE_PANEL_W, SUCCESS_RATE_PANEL_H, SUCCESS_RATE_H_SEP
+    # Wider than h_sep: each row-to-row gap has to fit the bottom row's xlabel
+    # *and* the next row's title stacked in it, unlike the purely-horizontal
+    # single-row figures where h_sep only ever separates two plot frames.
+    v_sep = 2.2
+    legend_x = groupplot_legend_center_x(n_cols, panel_w, h_sep)
+    xtick_str = ",".join(str(s) for s in eval_num_steps)
 
     group_axes = []
     for row_idx, thr in enumerate(thresholds):
         for col_idx, (xlabel, json_key) in enumerate(transforms):
             opts = [
                 "ymin=0.3", "ymax=1", "grid=major", "grid style={gray!25}",
+                f"title={{Displacement > {thr} km}}",
             ]
-            # xlabel names the *column* (transform type) -- once per column
-            # (bottom row only), not repeated identically down every row.
-            if row_idx == n_rows - 1:
-                opts.append(f"xlabel={{{xlabel}}}")
             if col_idx == 0:
                 opts.append("ylabel={Attack success rate}")
-            # Threshold title names the *row* -- once per row (drawn as
-            # col 0's title), but re-centered over both columns (via the same
-            # fractional-x trick used for the legend) so it visibly spans the
-            # whole row instead of sitting left-aligned over just column 0.
-            if len(thresholds) > 1 and col_idx == 0:
-                opts.append(f"title={{Displacement > {thr} km}}")
-                opts.append(f"title style={{at={{({legend_x:.4g},1)}}, anchor=south}}")
+            # The x-axis quantity, on the other hand, does need to appear on
+            # every panel: each row is a separate axis, so a bottom-row-only
+            # xlabel would leave the top row's columns unlabeled.
+            opts.append(f"xlabel={{{xlabel}}}")
             if json_key == "jpeg":
                 opts.append("x dir=reverse")
+            elif json_key is None:
+                opts += ["xmode=log", "log basis x=2", "log ticks with fixed point",
+                         "xminorticks=false", f"xtick={{{xtick_str}}}"]
             if row_idx == 0 and col_idx == 0:
                 opts.append(f"legend style={{at={{({legend_x:.4g},1.35)}}, anchor=south, "
                             f"legend columns=-1, draw=none, font=\\large}}")
                 opts.append(SINGLE_MARK_LEGEND_IMAGE)
-            blocks = cell_blocks.get((row_idx, col_idx), [])
+            blocks = cell_blocks.get((col_idx, row_idx), [])
             group_axes.append(f"\\nextgroupplot[{', '.join(opts)}]\n" + "\n".join(blocks))
 
     body = (
-        f"\\begin{{groupplot}}[group style={{group size=2 by {n_rows}, "
+        f"\\begin{{groupplot}}[group style={{group size={n_cols} by {n_rows}, "
         f"horizontal sep={h_sep}cm, vertical sep={v_sep}cm}}, width={panel_w}cm, height={panel_h}cm]\n"
         + "\n".join(group_axes) + "\n\\end{groupplot}"
     )
-    return render_tikz(body, plot_dir, f"{dataset}_robustness_results", color_definitions(colors))
+    return render_tikz(body, plot_dir, f"{dataset}_robustness_and_sampling_steps", color_definitions(colors))

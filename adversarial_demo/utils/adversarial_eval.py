@@ -30,6 +30,7 @@ from utils.datasets import (  # noqa: F401
     retrieve_osv_images,
 )
 from utils.ablations import (
+    build_cfg_json,
     build_model_transfer_json,
     build_restart_ablation_json,
     build_robustness_json,
@@ -48,6 +49,7 @@ from utils.adversarial_utils import (
 )
 from utils.plots_adversarial_attacks import (
     plot_attack_success_rate,
+    plot_cfg_success_rate,
     plot_model_transfer_success_rate,
     plot_restarts_success,
     plot_results,
@@ -148,6 +150,53 @@ def build_and_save_sampling_steps_ablation(
         samples,
     )
     _save_json(json_results, results_dir, out_filename or f"{dataset_name}_sampling_steps_results.json")
+    return json_results
+
+
+def build_and_save_cfg_ablation(
+    runner,
+    dataset_name: str,
+    attack_types: Sequence[str],
+    attack_budgets: Sequence[float],
+    eval_cfgs: Sequence[float],
+    success_rate_thresholds: Sequence[float],
+    results_dir: str,
+    num_steps: Optional[int] = None,
+    out_filename: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Aggregate the per-image guidance-scale (cfg) samples collected during the run.
+
+    Mirrors ``build_and_save_sampling_steps_ablation`` with the guidance scale as the
+    swept axis. Saved to ``out_filename`` (default ``<dataset>_cfg_results.json``). A
+    caller overlaying a precomputed attack (e.g. GeoShield) passes an attack-specific
+    name so it does not clobber the trainable JSON before merging.
+    """
+    mc = runner.metrics_collector
+    eval_cfgs = [float(c) for c in eval_cfgs]
+    samples = {
+        at: {bi: {c: [] for c in eval_cfgs} for bi in range(len(attack_budgets))}
+        for at in attack_types
+    }
+    for at in attack_types:
+        for bi in range(len(attack_budgets)):
+            for ii in range(mc.n_images):
+                record = mc.cfg_results[at][bi][ii]
+                if not record:
+                    continue
+                for c in eval_cfgs:
+                    if c in record:
+                        samples[at][bi][c].append(float(record[c]))
+    json_results = build_cfg_json(
+        dataset_name,
+        attack_types,
+        attack_budgets,
+        eval_cfgs,
+        success_rate_thresholds,
+        mc.n_images,
+        samples,
+        num_steps=num_steps,
+    )
+    _save_json(json_results, results_dir, out_filename or f"{dataset_name}_cfg_results.json")
     return json_results
 
 
@@ -302,6 +351,9 @@ def overlay_precomputed_ablations(
     robustness_jpeg_quality_factors: Optional[Sequence[int]] = None,
     robustness_gaussian_blur_sigmas: Optional[Sequence[float]] = None,
     robustness_num_steps: Optional[int] = None,
+    run_cfg_ablation: bool = False,
+    eval_cfgs: Optional[Sequence[float]] = None,
+    cfg_num_steps: Optional[int] = None,
 ) -> None:
     """Overlay a precomputed attack's ablations onto the trainable ones (single-GPU path).
 
@@ -343,6 +395,19 @@ def overlay_precomputed_ablations(
         if merged is not None:
             plot_robustness_results(json_results=merged, plot_dir=plots_dir)
 
+    if run_cfg_ablation and eval_cfgs:
+        geo_json = build_and_save_cfg_ablation(
+            runner, dataset_name, [attack_name], attack_budgets, list(eval_cfgs),
+            success_rate_thresholds, results_dir, num_steps=cfg_num_steps,
+            out_filename=f"{dataset_name}_{attack_name}_cfg_results.json",
+        )
+        merged = _overlay_attack_into_ablation_json(
+            os.path.join(results_dir, f"{dataset_name}_cfg_results.json"),
+            attack_name, geo_json,
+        )
+        if merged is not None:
+            plot_cfg_success_rate(json_results=merged, plot_dir=plots_dir)
+
 
 # --------------------------------------------------------------------------- #
 # Main dataset evaluation (+ integrated ablations)
@@ -383,6 +448,9 @@ def evaluate_attack_on_dataset(
     model_transfer_num_steps: Optional[int] = None,
     transfer_pipelines: Optional[Dict[str, Any]] = None,
     attacked_model_label: Optional[str] = None,
+    run_cfg_ablation: bool = False,
+    eval_cfgs: Optional[list[float]] = None,
+    cfg_num_steps: Optional[int] = None,
 ):
     """Evaluate one or more attacks on images from a test dataset.
 
@@ -496,6 +564,9 @@ def evaluate_attack_on_dataset(
         run_model_transfer_ablation=run_model_transfer_ablation,
         model_transfer_types=list(model_transfer_types) if model_transfer_types else None,
         model_transfer_num_steps=model_transfer_num_steps,
+        run_cfg_ablation=run_cfg_ablation,
+        eval_cfgs=[float(c) for c in eval_cfgs] if eval_cfgs else None,
+        cfg_num_steps=cfg_num_steps,
     )
 
     runner = EvaluationRunner(config, pipeline, transfer_pipelines=transfer_pipelines)
@@ -588,6 +659,20 @@ def evaluate_attack_on_dataset(
         )
         plot_model_transfer_success_rate(json_results=transfer_json, plot_dir=plot_dir)
 
+    # ---- Guidance-scale (cfg) ablation (opt-in) ---------------------------- #
+    if run_cfg_ablation and eval_cfgs:
+        cfg_json = build_and_save_cfg_ablation(
+            runner,
+            dataset_name,
+            attack_types,
+            attack_budgets,
+            list(eval_cfgs),
+            list(success_rate_thresholds),
+            results_dir,
+            num_steps=cfg_num_steps,
+        )
+        plot_cfg_success_rate(json_results=cfg_json, plot_dir=plot_dir)
+
 
 # --------------------------------------------------------------------------- #
 # Multi-node sharding: per-shard training + merge-and-plot
@@ -625,6 +710,9 @@ def evaluate_attack_shard(
     model_transfer_num_steps: Optional[int] = None,
     transfer_pipelines: Optional[Dict[str, Any]] = None,
     config_dump: Optional[Dict[str, Any]] = None,
+    run_cfg_ablation: bool = False,
+    eval_cfgs: Optional[Sequence[float]] = None,
+    cfg_num_steps: Optional[int] = None,
 ):
     """Train + evaluate one shard: the given attack(s) on a window of the seeded pool.
 
@@ -704,6 +792,9 @@ def evaluate_attack_shard(
         run_model_transfer_ablation=run_model_transfer_ablation,
         model_transfer_types=list(model_transfer_types) if model_transfer_types else None,
         model_transfer_num_steps=model_transfer_num_steps,
+        run_cfg_ablation=run_cfg_ablation,
+        eval_cfgs=[float(c) for c in eval_cfgs] if eval_cfgs else None,
+        cfg_num_steps=cfg_num_steps,
     )
 
     runner = EvaluationRunner(config, pipeline, transfer_pipelines=transfer_pipelines)
@@ -778,6 +869,9 @@ def merge_shards(
     attacked_model_label: Optional[str] = None,
     config_dump: Optional[Dict[str, Any]] = None,
     shards_dir: Optional[str] = None,
+    run_cfg_ablation: bool = False,
+    eval_cfgs: Optional[Sequence[float]] = None,
+    cfg_num_steps: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Stitch per-shard state files back into one full-dataset result set, then plot.
 
@@ -850,6 +944,7 @@ def merge_shards(
         sampling_steps_results = state.get("sampling_steps_results") or {}
         robustness_results = state.get("robustness_results") or {}
         model_transfer_results = state.get("model_transfer_results") or {}
+        cfg_results = state.get("cfg_results") or {}
 
         for attack_type in attack_types:
             saved = results.get(attack_type)
@@ -874,6 +969,7 @@ def merge_shards(
                     _copy_per_image_cell(sampling_steps_results, combined.sampling_steps_results, attack_type, budget_idx, local_idx, global_idx)
                     _copy_per_image_cell(robustness_results, combined.robustness_results, attack_type, budget_idx, local_idx, global_idx)
                     _copy_per_image_cell(model_transfer_results, combined.model_transfer_results, attack_type, budget_idx, local_idx, global_idx)
+                    _copy_per_image_cell(cfg_results, combined.cfg_results, attack_type, budget_idx, local_idx, global_idx)
                     covered.add((attack_type, budget_idx, global_idx))
 
     expected = len(attack_types) * len(attack_budgets) * len(global_ids)
@@ -994,6 +1090,23 @@ def merge_shards(
             plot_model_transfer_success_rate(json_results=transfer_json, plot_dir=plots_dir)
         else:
             print("Model-transfer ablation: no merged attack carries transfer samples; skipped.")
+
+    if run_cfg_ablation and eval_cfgs:
+        cfg_attack_types = [at for at in attack_types if _attack_has_per_image_records(combined.cfg_results, at)]
+        if cfg_attack_types:
+            cfg_json = build_and_save_cfg_ablation(
+                shim,
+                dataset_name,
+                cfg_attack_types,
+                attack_budgets,
+                list(eval_cfgs),
+                list(success_rate_thresholds),
+                results_dir,
+                num_steps=cfg_num_steps,
+            )
+            plot_cfg_success_rate(json_results=cfg_json, plot_dir=plots_dir)
+        else:
+            print("Guidance-scale (cfg) ablation: no merged attack carries cfg samples; skipped.")
 
     return all_results
 

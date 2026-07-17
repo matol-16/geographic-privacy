@@ -34,6 +34,7 @@ from utils.plots.results import (
 )
 from utils.plots.ablations import (
     plot_attack_dtd_variance,
+    plot_cfg_success_rate,
     plot_clean_vs_attacked_displacement,
     plot_loss_vs_fsd,
     plot_localizability_results,
@@ -52,6 +53,7 @@ __all__ = [
     "plot_attack_success_rate",
     "plot_restarts_success",
     "plot_sampling_steps_success_rate",
+    "plot_cfg_success_rate",
     "plot_robustness_results",
     "plot_model_transfer_success_rate",
     "plot_localizability_results",

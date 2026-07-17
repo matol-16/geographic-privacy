@@ -82,6 +82,7 @@ from utils.plots_tikz import (
     plot_robustness_results_tikz,
     plot_model_transfer_success_rate_tikz,
     plot_sampling_steps_success_rate_tikz,
+    plot_robustness_and_sampling_steps_tikz,
     plot_localizability_vs_attacks_tikz,
 )
 from core import (
@@ -99,6 +100,9 @@ DEFAULT_STORED_METRICS = ["final_step_displacement_predicted", "final_step_displ
 DEFAULT_SUCCESS_RATE_THRESHOLDS = [200, 750, 2500]
 DEFAULT_GEOSHIELD_ATTACK_NAME = "geoshield"
 DEFAULT_EVAL_NUM_STEPS = [10, 25, 50, 100, 250]
+# Guidance-scale (cfg) ablation: classifier-free guidance scales the attacked image is
+# re-evaluated at (holding sampling steps at the baseline).
+DEFAULT_EVAL_CFGS = [1.0, 2.0, 5.0, 10.0]
 DEFAULT_MAX_RESTARTS = 10
 DEFAULT_IMAGES_PER_SHARD = 100
 # Robustness ablation defaults (GeoShield Fig. 6 levels; scoped to "dtd" by default).
@@ -403,6 +407,8 @@ def build_resolved_config_dump(
     run_model_transfer_ablation: Any = None,
     robustness_attack_types: Any = None,
     model_transfer_types: Any = None,
+    run_cfg_ablation: Any = None,
+    eval_cfgs: Any = None,
 ) -> Dict[str, Any]:
     """Return a deep copy of ``config`` with the CLI-resolved run parameters written back in.
 
@@ -424,11 +430,15 @@ def build_resolved_config_dump(
         dump["parallel_workers"] = parallel_workers
     if eval_num_steps is not None:
         dump["eval_num_steps"] = list(eval_num_steps)
+    if eval_cfgs is not None:
+        dump["eval_cfgs"] = list(eval_cfgs)
     if max_restarts is not None:
         dump["max_restarts"] = max_restarts
     plot = _ensure_dict(dump, "plot")
     if run_sampling_steps_ablation is not None:
         plot["run_sampling_steps_ablation"] = bool(run_sampling_steps_ablation)
+    if run_cfg_ablation is not None:
+        plot["run_cfg_ablation"] = bool(run_cfg_ablation)
     if run_robustness_ablation is not None:
         plot["run_robustness_ablation"] = bool(run_robustness_ablation)
     if run_model_transfer_ablation is not None:
@@ -514,6 +524,16 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
         get_nested_config(config, "model_transfer", "num_steps", default=None),
         None,
     )
+
+    # Guidance-scale (cfg) ablation controls (CLI > config > default). Runs for every
+    # evaluated attack (like sampling-steps), not scoped per attack type.
+    run_cfg_ablation = bool(pick_value(
+        args.run_cfg_ablation,
+        get_nested_config(config, "plot", "run_cfg_ablation", default=None),
+        False,
+    ))
+    eval_cfgs = pick_value(args.eval_cfgs, config.get("eval_cfgs"), DEFAULT_EVAL_CFGS)
+    cfg_num_steps = pick_value(args.cfg_num_steps, config.get("cfg_num_steps"), None)
     # Load the other PLONK variants once and reuse the attack pipeline for its own variant.
     transfer_pipelines = (
         load_transfer_pipelines(config, ctx.dataset, model_transfer_types, ctx.pipeline)
@@ -552,6 +572,8 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
         run_model_transfer_ablation=run_model_transfer_ablation,
         robustness_attack_types=robustness_attack_types,
         model_transfer_types=model_transfer_types,
+        run_cfg_ablation=run_cfg_ablation,
+        eval_cfgs=eval_cfgs,
     )
 
     if trainable_attack_types:
@@ -589,6 +611,9 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
             model_transfer_num_steps=model_transfer_num_steps,
             transfer_pipelines=transfer_pipelines,
             attacked_model_label=attacked_model_label,
+            run_cfg_ablation=run_cfg_ablation,
+            eval_cfgs=eval_cfgs,
+            cfg_num_steps=cfg_num_steps,
         )
 
     # GeoShield: generate out-of-process, evaluate the pairs, overlay in combined plots.
@@ -611,6 +636,9 @@ def cmd_evaluate_dataset(args, config: Dict[str, Any]) -> None:
                 robustness_jpeg_quality_factors=robustness_jpeg_quality_factors,
                 robustness_gaussian_blur_sigmas=robustness_gaussian_blur_sigmas,
                 robustness_num_steps=robustness_num_steps,
+                run_cfg_ablation=run_cfg_ablation,
+                eval_cfgs=eval_cfgs,
+                cfg_num_steps=cfg_num_steps,
             ),
         )
 
@@ -649,6 +677,9 @@ def _run_geoshield_step(
     )
     run_sampling_steps = bool(ablation_controls.get("run_sampling_steps_ablation"))
     eval_num_steps = ablation_controls.get("eval_num_steps")
+    run_cfg = bool(ablation_controls.get("run_cfg_ablation"))
+    eval_cfgs = ablation_controls.get("eval_cfgs")
+    cfg_num_steps = ablation_controls.get("cfg_num_steps")
 
     clean_dirs, attacked_dirs, gps_by_filename = generate_geoshield_pairs(
         config=config,
@@ -679,6 +710,9 @@ def _run_geoshield_step(
         robustness_jpeg_quality_factors=ablation_controls.get("robustness_jpeg_quality_factors"),
         robustness_gaussian_blur_sigmas=ablation_controls.get("robustness_gaussian_blur_sigmas"),
         robustness_num_steps=ablation_controls.get("robustness_num_steps"),
+        run_cfg_ablation=run_cfg,
+        eval_cfgs=eval_cfgs,
+        cfg_num_steps=cfg_num_steps,
     )
 
     # Overlay GeoShield with the trainable attacks in one combined set of plots.
@@ -703,8 +737,8 @@ def _run_geoshield_step(
             gps_true=plot_gps_true,
         )
 
-    # Overlay GeoShield onto the trainable sampling-steps / robustness ablation plots.
-    if run_sampling_steps or run_robustness_geoshield:
+    # Overlay GeoShield onto the trainable sampling-steps / robustness / cfg ablation plots.
+    if run_sampling_steps or run_robustness_geoshield or run_cfg:
         overlay_precomputed_ablations(
             runner=runner,
             dataset_name=ctx.dataset,
@@ -718,6 +752,9 @@ def _run_geoshield_step(
             robustness_jpeg_quality_factors=ablation_controls.get("robustness_jpeg_quality_factors"),
             robustness_gaussian_blur_sigmas=ablation_controls.get("robustness_gaussian_blur_sigmas"),
             robustness_num_steps=ablation_controls.get("robustness_num_steps"),
+            run_cfg_ablation=run_cfg,
+            eval_cfgs=eval_cfgs,
+            cfg_num_steps=cfg_num_steps,
         )
 
 
@@ -763,6 +800,13 @@ def _resolve_ablation_controls(args, config: Dict[str, Any]) -> Dict[str, Any]:
             get_nested_config(config, "model_transfer", "num_steps", default=None),
             None,
         ),
+        run_cfg_ablation=bool(pick_value(
+            args.run_cfg_ablation,
+            get_nested_config(config, "plot", "run_cfg_ablation", default=None),
+            False,
+        )),
+        eval_cfgs=pick_value(args.eval_cfgs, config.get("eval_cfgs"), DEFAULT_EVAL_CFGS),
+        cfg_num_steps=pick_value(args.cfg_num_steps, config.get("cfg_num_steps"), None),
         success_rate_thresholds=get_nested_config(
             config, "plot", "attack_success_rate_thresholds", default=DEFAULT_SUCCESS_RATE_THRESHOLDS
         ),
@@ -900,6 +944,9 @@ def _run_geoshield_shard(
         robustness_jpeg_quality_factors=ctrls.get("robustness_jpeg_quality_factors"),
         robustness_gaussian_blur_sigmas=ctrls.get("robustness_gaussian_blur_sigmas"),
         robustness_num_steps=ctrls.get("robustness_num_steps"),
+        run_cfg_ablation=bool(ctrls.get("run_cfg_ablation")),
+        eval_cfgs=ctrls.get("eval_cfgs"),
+        cfg_num_steps=ctrls.get("cfg_num_steps"),
     )
     print(f"\nGeoShield shard complete! Results saved to: {shard_results_dir}")
 
@@ -1018,6 +1065,9 @@ def cmd_evaluate_dataset_shard(args, config: Dict[str, Any]) -> None:
         model_transfer_num_steps=ctrls.get("model_transfer_num_steps"),
         transfer_pipelines=transfer_pipelines,
         config_dump=config,
+        run_cfg_ablation=ctrls["run_cfg_ablation"],
+        eval_cfgs=ctrls["eval_cfgs"],
+        cfg_num_steps=ctrls.get("cfg_num_steps"),
     )
 
     print(f"\nShard complete! Results saved to: {shard_results_dir}")
@@ -1087,6 +1137,9 @@ def cmd_merge_shards(args, config: Dict[str, Any]) -> None:
         attacked_model_label=model_type_label(config.get("model_type", "") or ""),
         config_dump=config,
         shards_dir=shards_dir,
+        run_cfg_ablation=ctrls["run_cfg_ablation"],
+        eval_cfgs=ctrls["eval_cfgs"],
+        cfg_num_steps=ctrls.get("cfg_num_steps"),
     )
 
     print(f"\nMerge complete! Results in {results_dir}, plots in {plots_dir}.")
@@ -1368,6 +1421,9 @@ def run_precomputed_attack_eval(
     robustness_jpeg_quality_factors: Optional[Sequence[int]] = None,
     robustness_gaussian_blur_sigmas: Optional[Sequence[float]] = None,
     robustness_num_steps: Optional[int] = None,
+    run_cfg_ablation: bool = False,
+    eval_cfgs: Optional[Sequence[float]] = None,
+    cfg_num_steps: Optional[int] = None,
 ) -> "PrecomputedPairEvaluationRunner":
     """Evaluate precomputed clean/attacked pairs and persist results like any attack.
 
@@ -1398,6 +1454,9 @@ def run_precomputed_attack_eval(
         robustness_jpeg_quality_factors=list(robustness_jpeg_quality_factors) if robustness_jpeg_quality_factors else None,
         robustness_gaussian_blur_sigmas=list(robustness_gaussian_blur_sigmas) if robustness_gaussian_blur_sigmas else None,
         robustness_num_steps=robustness_num_steps,
+        run_cfg_ablation=run_cfg_ablation,
+        eval_cfgs=[float(c) for c in eval_cfgs] if eval_cfgs else None,
+        cfg_num_steps=cfg_num_steps,
     )
     runner = PrecomputedPairEvaluationRunner(precomputed_config, pipeline)
     if run_config is not None:
@@ -1716,6 +1775,27 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         robustness_fn = plot_robustness_results_tikz if tikz else plot_robustness_results
         robustness_fn(json_results=json_results, plot_dir=plots_dir)
 
+    elif plot_type == "robustness-and-sampling-steps":
+        if not tikz:
+            raise ValueError("plot_type 'robustness-and-sampling-steps' is only implemented for --tikz.")
+        robustness_file = pick_value(
+            args.results_files[0] if args.results_files else None,
+            config.get("results_file"),
+            os.path.join(results_dir, f"{dataset}_robustness_results.json"),
+        )
+        sampling_steps_file = pick_value(
+            args.results_files[1] if args.results_files and len(args.results_files) > 1 else None,
+            None,
+            os.path.join(results_dir, f"{dataset}_sampling_steps_results.json"),
+        )
+        print(f"Plotting combined robustness + sampling-steps results from: {robustness_file}, {sampling_steps_file}")
+        with open(robustness_file) as f:
+            robustness_json = json.load(f)
+        sampling_steps_json = merge_sampling_steps_results([sampling_steps_file])
+        plot_robustness_and_sampling_steps_tikz(
+            robustness_json=robustness_json, sampling_steps_json=sampling_steps_json, plot_dir=plots_dir,
+        )
+
     elif plot_type == "restarts":
         if tikz:
             raise ValueError("--tikz is not supported for plot_type 'restarts' (not part of the TikZ backend).")
@@ -1817,6 +1897,12 @@ def add_ablation_args(parser: argparse.ArgumentParser) -> None:
                              f"Pass rfm for '' (default: {DEFAULT_MODEL_TRANSFER_TYPES})")
     parser.add_argument("--model-transfer-num-steps", type=int,
                         help="Sampling steps for the model-transfer eval (default: each attack's baseline)")
+    parser.add_argument("--run-cfg-ablation", action="store_true", default=None,
+                        help="Also re-evaluate each best perturbation across --eval-cfgs guidance scales")
+    parser.add_argument("--eval-cfgs", nargs="+", type=float,
+                        help=f"Guidance scales (cfg) for the cfg ablation (default: {DEFAULT_EVAL_CFGS})")
+    parser.add_argument("--cfg-num-steps", type=int,
+                        help="Sampling steps for the cfg eval (default: each attack's baseline)")
 
 
 def add_precomputed_folder_args(parser: argparse.ArgumentParser) -> None:
@@ -2006,7 +2092,7 @@ Examples:
     plot_cmd.add_argument("plot_type", nargs="?",
                           choices=["results", "success-rate", "sampling-steps", "dtd-variance",
                                    "loss-vs-fsd", "clean-vs-attacked-displacement", "restarts",
-                                   "robustness", "model-transfer"],
+                                   "robustness", "model-transfer", "robustness-and-sampling-steps"],
                           help="Type of plot to generate")
     plot_cmd.add_argument("--dataset", choices=["yfcc", "osv"], help="Dataset to plot")
     plot_cmd.add_argument("--attack-types", nargs="+", help="Attack types to plot (for 'results' plot type)")

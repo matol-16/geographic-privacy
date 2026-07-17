@@ -15,6 +15,7 @@ from utils.plots_tikz.plots import (
     plot_localizability_vs_attacks_tikz,
     plot_model_transfer_success_rate_tikz,
     plot_results_tikz,
+    plot_robustness_and_sampling_steps_tikz,
     plot_robustness_results_tikz,
     plot_sampling_steps_success_rate_tikz,
 )
@@ -31,5 +32,6 @@ __all__ = [
     "plot_sampling_steps_success_rate_tikz",
     "plot_model_transfer_success_rate_tikz",
     "plot_robustness_results_tikz",
+    "plot_robustness_and_sampling_steps_tikz",
     "plot_geolocation_teaser_tikz",
 ]

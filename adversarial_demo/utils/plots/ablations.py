@@ -348,6 +348,63 @@ def plot_sampling_steps_success_rate(
     plt.close(fig)
 
 
+def plot_cfg_success_rate(
+    json_results: dict,
+    plot_dir: str,
+    eps: float = DEFAULT_ABLATION_EPS,
+) -> None:
+    """
+    Plot attack success rate vs. the classifier-free guidance scale (cfg).
+
+    One subplot per distance threshold; one line per attack, all pinned to the
+    single attack budget closest to ``eps`` (default 8/255) so each panel isn't
+    cluttered with one line per (attack, budget) pair. ``json_results`` is the dict
+    produced by ``build_cfg_json``.
+    """
+    thresholds = json_results["success_rate_thresholds_km"]
+    eval_cfgs = json_results["eval_cfgs"]
+    attack_types = json_results["attack_types"]
+    attack_budgets = json_results["attack_budgets"]
+    dataset = json_results["dataset"]
+    # Per-type budget lists are set when merging results from different commands.
+    budgets_per_type = json_results.get("attack_budgets_per_type", {})
+
+    def _cfg_key(cfg: float) -> str:
+        return f"{float(cfg):g}"
+
+    n_thresholds = len(thresholds)
+    fig, axes = plt.subplots(1, n_thresholds, figsize=(5.5 * n_thresholds, 4.5), squeeze=False)
+
+    legend_handles, legend_labels = [], []
+    for attack_type in attack_types:
+        budget = select_closest_budget(budgets_per_type.get(attack_type, attack_budgets), eps)
+        bkey = f"budget_{budget:.6f}"
+        color = attack_color(attack_type)
+        line = None
+        for ax_idx, thr in enumerate(thresholds):
+            ax = axes[0][ax_idx]
+            rates = [
+                json_results["results"][attack_type][bkey][_cfg_key(c)]["success_rates"][str(thr)]
+                for c in eval_cfgs
+            ]
+            line, = ax.plot(eval_cfgs, rates, marker="o", color=color)
+        legend_handles.append(line)
+        legend_labels.append(_display_attack_name(attack_type))
+
+    for ax_idx, thr in enumerate(thresholds):
+        ax = axes[0][ax_idx]
+        ax.set_xlabel("Guidance scale (cfg)")
+        ax.set_ylabel("Attack success rate")
+        ax.set_title(f"Displacement > {thr} km")
+        ax.set_ylim(0.3, 1)
+        ax.grid(True, alpha=0.3)
+
+    _finalize_figure(fig, legend_handles, legend_labels)
+    fig.tight_layout()
+    _savefig(fig, plot_dir, f"{dataset}_cfg_success_rate")
+    plt.close(fig)
+
+
 def plot_model_transfer_success_rate(
     json_results: dict,
     plot_dir: str,

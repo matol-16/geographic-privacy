@@ -10,8 +10,9 @@ from PIL import Image
 
 from utils.adversarial_utils import resolve_torch_device
 from attacks.encoder_attacks import EncoderAttack
-from attacks.trajectory_deviation import DiffusionAttack, ACE, UniDef, TrainingLossAttack
+from attacks.trajectory_deviation import DiffusionAttack, ACE, UniDef, TrainingLossAttack, TargetedL2, DTDBlur, CosineTargeted
 from attacks.diffusion_attack_salman import SamplingAttack
+from attacks.diffusion_attack_truncated import TruncatedSamplingAttack
 
 
 def _run_restartable_attack(
@@ -149,9 +150,15 @@ def run_attack(
 		"sampling": "sampling",
 		"diffusion_salman": "sampling",  # backward-compatible alias for Sampling
 		"salman": "sampling",            # backward-compatible alias for Sampling
+		"truncated_sampling": "truncated_sampling",
+		"sampling_truncated": "truncated_sampling",
+		"salman_truncated": "truncated_sampling",
+		"truncated": "truncated_sampling",
 		"diffusion_l2": "diffusion_l2",
 		"dtd": "dtd",
 		"diffusion_cosine_neg": "dtd",  # backward-compatible alias for DTD
+		"dtd_blur": "dtd_blur",
+		"dtdblur": "dtd_blur",
 		"ace": "ace",
 		"diffusion_target": "ace",
 		"dtd_target": "ace",
@@ -161,6 +168,12 @@ def run_attack(
 		"cdd": "unidef",
 		"unidef_nofdje": "unidef_nofdje",
 		"training_loss": "training_loss",
+		"targeted_l2": "targeted_l2",
+		"targetedl2": "targeted_l2",
+		"l2_target": "targeted_l2",
+		"cosine_targeted": "cosine_targeted",
+		"cosinetargeted": "cosine_targeted",
+		"cosine_target": "cosine_targeted",
 	}
 	normalized_type = aliases.get(str(attack_type).lower())
 	if normalized_type is None:
@@ -200,8 +213,23 @@ def run_attack(
 			attack_type_label="dtd",
 			**kwargs
 		)
+	if normalized_type == "dtd_blur":
+		# Blur-robust DTD: cosine-neg trajectory deviation trained with an
+		# expectation-over-Gaussian-blur objective (half clean, half blurred).
+		kwargs.setdefault("dot_product_loss", "cosine_similarity_negative")
+		return _run_dtd_blur_attack(
+			source_image=source_image,
+			pipeline=pipeline,
+			**kwargs
+		)
 	if normalized_type == "sampling":
 		return _run_diffusion_salman_attack(
+			source_image=source_image,
+			pipeline=pipeline,
+			**kwargs
+		)
+	if normalized_type == "truncated_sampling":
+		return _run_truncated_sampling_attack(
 			source_image=source_image,
 			pipeline=pipeline,
 			**kwargs
@@ -229,6 +257,18 @@ def run_attack(
 		)
 	if normalized_type == "training_loss":
 		return _run_training_loss_attack(
+			source_image=source_image,
+			pipeline=pipeline,
+			**kwargs
+		)
+	if normalized_type == "targeted_l2":
+		return _run_targeted_l2_attack(
+			source_image=source_image,
+			pipeline=pipeline,
+			**kwargs
+		)
+	if normalized_type == "cosine_targeted":
+		return _run_cosine_targeted_attack(
 			source_image=source_image,
 			pipeline=pipeline,
 			**kwargs
@@ -359,6 +399,82 @@ def _run_diffusion_attack(
 	return _run_restartable_attack(
 		attack=attack,
 		attack_type=attack_type_label,
+		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
+		show_progress=show_progress,
+		early_stopping_patience=early_stopping_patience,
+		restart_eval_batch_size=restart_eval_batch_size,
+		restart_eval_cfg=restart_eval_cfg,
+		restart_eval_num_steps=restart_eval_num_steps,
+		restart_eval_seed=restart_eval_seed,
+		num_restart_workers=num_restart_workers,
+		main_num_restarts=main_num_restarts,
+	)
+
+
+def _run_dtd_blur_attack(
+	source_image: Image.Image,
+	pipeline,
+	n_steps: int = 400,
+	train_batch_size: int = 64,
+	lr: float = 2e-2,
+	eps_max: float = 1.0,
+	anchor_samples: int = 256,
+	clean_num_steps: int = 200,
+	dot_product_loss: str = "cosine_similarity_negative",
+	reconstruction_loss_weight: float = 0.0,
+	blur_sigma_min: float = 0.0,
+	blur_sigma_max: float = 4.0,
+	blur_loss_weight: float = 0.5,
+	delta_init: float = 1e-4,
+	num_restarts: int = 1,
+	restart_selection_metric: str = "final_step_displacement",
+	restart_eval_batch_size: int = 256,
+	restart_eval_cfg: float = 10.0,
+	restart_eval_num_steps: Optional[int] = None,
+	main_num_restarts: Optional[int] = None,
+	restart_eval_seed: int = 1234,
+	print_restart_results: bool = True,
+	show_progress: bool = True,
+	device: str = "cuda",
+	early_stopping_patience: int = 0,
+	num_restart_workers: int = 1,
+	**kwargs,  # Absorb unused kwargs
+) -> Dict[str, Any]:
+	"""Run the blur-robust DTD attack (expectation over Gaussian blur, half clean/half blurred)."""
+	x0_bank = _build_shared_x0_bank(
+		pipeline,
+		source_image,
+		anchor_samples=anchor_samples,
+		clean_num_steps=clean_num_steps,
+		device=device,
+		show_progress=show_progress,
+	)
+
+	attack = DTDBlur(
+		pipeline=pipeline,
+		source_image=source_image,
+		n_steps=n_steps,
+		train_batch_size=train_batch_size,
+		lr=lr,
+		eps_max=eps_max,
+		anchor_samples=anchor_samples,
+		clean_num_steps=clean_num_steps,
+		dot_product_loss=dot_product_loss,
+		reconstruction_loss_weight=reconstruction_loss_weight,
+		blur_sigma_min=blur_sigma_min,
+		blur_sigma_max=blur_sigma_max,
+		blur_loss_weight=blur_loss_weight,
+		delta_init=delta_init,
+		num_restarts=num_restarts,
+		restart_selection_metric=restart_selection_metric,
+		device=device,
+		x0_bank=x0_bank,  # Pass shared x0_bank
+	)
+	attack.restart_manager.print_results = print_restart_results
+
+	return _run_restartable_attack(
+		attack=attack,
+		attack_type="dtd_blur",
 		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
 		show_progress=show_progress,
 		early_stopping_patience=early_stopping_patience,
@@ -605,6 +721,159 @@ def _run_training_loss_attack(
 	)
 
 
+def _run_targeted_l2_attack(
+	source_image: Image.Image,
+	pipeline,
+	true_gps: Optional[Any] = None,
+	n_steps: int = 400,
+	train_batch_size: int = 64,
+	lr: float = 2e-2,
+	eps_max: float = 1.0,
+	anchor_samples: int = 256,
+	clean_num_steps: int = 200,
+	reconstruction_loss_weight: float = 0.0,
+	delta_init: float = 1e-4,
+	num_restarts: int = 1,
+	restart_selection_metric: str = "final_step_displacement",
+	restart_eval_batch_size: int = 256,
+	restart_eval_cfg: float = 10.0,
+	restart_eval_num_steps: Optional[int] = None,
+	main_num_restarts: Optional[int] = None,
+	restart_eval_seed: int = 1234,
+	print_restart_results: bool = True,
+	show_progress: bool = True,
+	device: str = "cuda",
+	early_stopping_patience: int = 0,
+	num_restart_workers: int = 1,
+	**kwargs,
+) -> Dict[str, Any]:
+	"""Run the targeted-L2 attack: minimize the training loss towards the antipodal target.
+
+	Steers the model towards the point on Earth farthest from the image's real coordinates
+	(``true_gps``, its antipode). When ``true_gps`` is omitted the attack falls back to the
+	antipode of the clean model's mean predicted location.
+	"""
+	x0_bank = _build_shared_x0_bank(
+		pipeline,
+		source_image,
+		anchor_samples=anchor_samples,
+		clean_num_steps=clean_num_steps,
+		device=device,
+		show_progress=show_progress,
+	)
+
+	attack = TargetedL2(
+		pipeline=pipeline,
+		source_image=source_image,
+		true_gps=true_gps,
+		n_steps=n_steps,
+		train_batch_size=train_batch_size,
+		lr=lr,
+		eps_max=eps_max,
+		anchor_samples=anchor_samples,
+		clean_num_steps=clean_num_steps,
+		reconstruction_loss_weight=reconstruction_loss_weight,
+		delta_init=delta_init,
+		num_restarts=num_restarts,
+		restart_selection_metric=restart_selection_metric,
+		device=device,
+		x0_bank=x0_bank,
+	)
+	attack.restart_manager.print_results = print_restart_results
+
+	return _run_restartable_attack(
+		attack=attack,
+		attack_type="targeted_l2",
+		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
+		show_progress=show_progress,
+		early_stopping_patience=early_stopping_patience,
+		restart_eval_batch_size=restart_eval_batch_size,
+		restart_eval_cfg=restart_eval_cfg,
+		restart_eval_num_steps=restart_eval_num_steps,
+		restart_eval_seed=restart_eval_seed,
+		num_restart_workers=num_restart_workers,
+		main_num_restarts=main_num_restarts,
+		finalize_kwargs={"attack_mode": "targeted"},
+	)
+
+
+def _run_cosine_targeted_attack(
+	source_image: Image.Image,
+	pipeline,
+	true_gps: Optional[Any] = None,
+	n_steps: int = 400,
+	train_batch_size: int = 64,
+	lr: float = 2e-2,
+	eps_max: float = 1.0,
+	anchor_samples: int = 256,
+	clean_num_steps: int = 200,
+	reconstruction_loss_weight: float = 0.0,
+	delta_init: float = 1e-4,
+	num_restarts: int = 1,
+	restart_selection_metric: str = "final_step_displacement",
+	restart_eval_batch_size: int = 256,
+	restart_eval_cfg: float = 10.0,
+	restart_eval_num_steps: Optional[int] = None,
+	main_num_restarts: Optional[int] = None,
+	restart_eval_seed: int = 1234,
+	print_restart_results: bool = True,
+	show_progress: bool = True,
+	device: str = "cuda",
+	early_stopping_patience: int = 0,
+	num_restart_workers: int = 1,
+	**kwargs,
+) -> Dict[str, Any]:
+	"""Run the cosine-targeted attack: direction-only steering towards the antipodal target.
+
+	Same target as ``targeted_l2`` (the point farthest from ``true_gps``, its antipode), but
+	aligns only the DIRECTION of the model's prediction with the target velocity (negative
+	cosine similarity) instead of matching it in L2. Falls back to the antipode of the clean
+	model's mean prediction when ``true_gps`` is omitted.
+	"""
+	x0_bank = _build_shared_x0_bank(
+		pipeline,
+		source_image,
+		anchor_samples=anchor_samples,
+		clean_num_steps=clean_num_steps,
+		device=device,
+		show_progress=show_progress,
+	)
+
+	attack = CosineTargeted(
+		pipeline=pipeline,
+		source_image=source_image,
+		true_gps=true_gps,
+		n_steps=n_steps,
+		train_batch_size=train_batch_size,
+		lr=lr,
+		eps_max=eps_max,
+		anchor_samples=anchor_samples,
+		clean_num_steps=clean_num_steps,
+		reconstruction_loss_weight=reconstruction_loss_weight,
+		delta_init=delta_init,
+		num_restarts=num_restarts,
+		restart_selection_metric=restart_selection_metric,
+		device=device,
+		x0_bank=x0_bank,
+	)
+	attack.restart_manager.print_results = print_restart_results
+
+	return _run_restartable_attack(
+		attack=attack,
+		attack_type="cosine_targeted",
+		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
+		show_progress=show_progress,
+		early_stopping_patience=early_stopping_patience,
+		restart_eval_batch_size=restart_eval_batch_size,
+		restart_eval_cfg=restart_eval_cfg,
+		restart_eval_num_steps=restart_eval_num_steps,
+		restart_eval_seed=restart_eval_seed,
+		num_restart_workers=num_restart_workers,
+		main_num_restarts=main_num_restarts,
+		finalize_kwargs={"attack_mode": "targeted"},
+	)
+
+
 def _run_diffusion_salman_attack(
 	source_image: Image.Image,
 	pipeline,
@@ -657,6 +926,77 @@ def _run_diffusion_salman_attack(
 	return _run_restartable_attack(
 		attack=attack,
 		attack_type="sampling",
+		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
+		show_progress=show_progress,
+		early_stopping_patience=early_stopping_patience,
+		restart_eval_batch_size=restart_eval_batch_size,
+		restart_eval_cfg=restart_eval_cfg,
+		restart_eval_num_steps=restart_eval_num_steps,
+		restart_eval_seed=restart_eval_seed,
+		num_restart_workers=num_restart_workers,
+		main_num_restarts=main_num_restarts,
+	)
+
+
+def _run_truncated_sampling_attack(
+	source_image: Image.Image,
+	pipeline,
+	n_steps: int = 400,
+	train_batch_size: int = 64,
+	lr: float = 2e-2,
+	eps_max: float = 1.0,
+	anchor_samples: int = 256,
+	total_sampling_steps: int = 250,
+	backprop_steps: int = 16,
+	clean_num_steps: int = 100,
+	target_pure_noise: bool = False,
+	dot_product_loss: str = "absolute",
+	reconstruction_loss_weight: float = 0.0,
+	delta_init: float = 1e-4,
+	num_restarts: int = 1,
+	restart_selection_metric: str = "mean_step_displacement",
+	restart_eval_batch_size: int = 256,
+	restart_eval_cfg: float = 10.0,
+	restart_eval_num_steps: Optional[int] = None,
+	main_num_restarts: Optional[int] = None,
+	restart_eval_seed: int = 1234,
+	print_restart_results: bool = True,
+	show_progress: bool = True,
+	device: str = "cuda",
+	early_stopping_patience: int = 0,
+	num_restart_workers: int = 1,
+	**kwargs,
+) -> Dict[str, Any]:
+	"""Run the sampling attack with truncated backprop through the tail of a long trajectory.
+
+	Runs a ``total_sampling_steps`` (default 250) trajectory in the forward pass but keeps
+	the autograd graph only for the final ``backprop_steps`` (default 16) steps, bounding
+	activation memory while preserving a high-fidelity sampling path.
+	"""
+	attack = TruncatedSamplingAttack(
+		pipeline=pipeline,
+		source_image=source_image,
+		n_steps=n_steps,
+		train_batch_size=train_batch_size,
+		lr=lr,
+		eps_max=eps_max,
+		anchor_samples=anchor_samples,
+		total_sampling_steps=total_sampling_steps,
+		backprop_steps=backprop_steps,
+		clean_num_steps=clean_num_steps,
+		target_pure_noise=target_pure_noise,
+		dot_product_loss=dot_product_loss,
+		reconstruction_loss_weight=reconstruction_loss_weight,
+		delta_init=delta_init,
+		num_restarts=num_restarts,
+		restart_selection_metric=restart_selection_metric,
+		device=device,
+	)
+	attack.restart_manager.print_results = print_restart_results
+
+	return _run_restartable_attack(
+		attack=attack,
+		attack_type="truncated_sampling",
 		optimizer_fn=lambda params: torch.optim.SGD(params, lr=lr),
 		show_progress=show_progress,
 		early_stopping_patience=early_stopping_patience,

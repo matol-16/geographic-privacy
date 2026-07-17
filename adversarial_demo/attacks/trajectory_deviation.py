@@ -3,6 +3,7 @@
 from plonk.pipe import _gps_degrees_to_cartesian
 from PIL import Image
 import torch
+import torchvision.transforms.functional as _tvf
 import numpy as np
 from typing import Any, Dict, List, Optional
 
@@ -868,4 +869,424 @@ class TrainingLossAttack(DiffusionAttack):
         config["model_kind"] = self.model_kind
         config.pop("target_pure_noise", None)
         config.pop("dot_product_loss", None)
+        return config
+
+
+############################################################################################
+# TargetedL2: DP-Attacker targeted noise-prediction attack towards the farthest GPS point
+############################################################################################
+
+
+class TargetedL2(TrainingLossAttack):
+    """Targeted geolocation attack replicating DP-Attacker's targeted noise-prediction loss.
+
+    Implements the targeted attack of *Diffusion Policy Attacker* (Chen, Xue & Chen,
+    NeurIPS 2024), Eq. 6 / Algorithm 1 (targeted branch), ported from diffusion policies to
+    the image-conditioned PLONK geolocation diffusion model. The paper's targeted objective
+
+        L_tar(I) = E_{k, eps_k} || eps_theta(tau_target + eps_k, k, I + delta) - eps_k ||^2   (minimized)
+
+    forward-diffuses a chosen *target action* ``tau_target`` and minimizes the denoising
+    error of the network conditioned on the perturbed image ``I + delta``. Minimizing it makes
+    the sampler -- conditioned on the protected image -- reconstruct ``tau_target`` from noise.
+    Here the "action" is the predicted GPS, and the target is the point on Earth **farthest**
+    from the image's real coordinates: the antipode ``p_far = -cart(true_gps)``.
+
+    Notation mapping (paper -> here): ``tau_target`` -> ``p_far`` (the furthest GPS, a unit
+    sphere point); ``eps_k`` -> the true forward-process target ``v_target``; ``P(I) = I +
+    delta`` -> the perturbed conditioning image; the paper's PGD sign step -> sign-SGD in the
+    l_inf ball. The forward process and true target adapt to the model parameterization
+    (auto-detected via :func:`detect_model_kind`), so the diffusion branch is a line-for-line
+    match of Eq. 6, while flow / Riemannian flow matching use the corresponding true velocity:
+
+    - **diffusion (DDPM)**: x_t = sqrt(gamma)*p_far + sqrt(1-gamma)*eps_k,  v_target = eps_k
+    - **flow matching**:    x_t = gamma*p_far + (1-gamma)*eps_k,            v_target = p_far - eps_k
+    - **Riemannian FM**:    x_t = geodesic(noise, p_far, gamma),           v_target = d(geodesic)/d(gamma)
+
+    ``true_gps`` is the image's real ``(latitude, longitude)`` in degrees. When it is not
+    provided the target falls back to the antipode of the clean model's mean predicted
+    location (a proxy for the real coordinates). Contrast :class:`TrainingLossAttack`, which
+    *maximizes* the loss against the clean prediction -- the paper's *untargeted* Eq. 5;
+    this attack *minimizes* the loss against the fixed furthest-point target (Eq. 6).
+    """
+
+    def __init__(
+        self,
+        pipeline,
+        source_image: Image.Image,
+        true_gps: Optional[Any] = None,
+        n_steps: int = 400,
+        train_batch_size: int = 64,
+        lr: float = 2e-2,
+        eps_max: float = 1.0,
+        anchor_samples: int = 256,
+        clean_num_steps: int = 200,
+        reconstruction_loss_weight: float = 0.0,
+        delta_init: float = 1e-4,
+        num_restarts: int = 1,
+        restart_selection_metric: str = "final_step_displacement",
+        device: str = "cuda",
+        x0_bank: Optional[torch.Tensor] = None,
+    ):
+        super().__init__(
+            pipeline=pipeline,
+            source_image=source_image,
+            n_steps=n_steps,
+            train_batch_size=train_batch_size,
+            lr=lr,
+            eps_max=eps_max,
+            anchor_samples=anchor_samples,
+            clean_num_steps=clean_num_steps,
+            reconstruction_loss_weight=reconstruction_loss_weight,
+            delta_init=delta_init,
+            num_restarts=num_restarts,
+            restart_selection_metric=restart_selection_metric,
+            device=device,
+            x0_bank=x0_bank,
+        )
+        # (lat, lon) in degrees; None => fall back to the clean prediction's antipode.
+        self.true_gps = tuple(float(v) for v in true_gps) if true_gps is not None else None
+        # Fixed unit-sphere point the whole trajectory is steered towards: the antipode
+        # (great-circle-farthest point) of the image's real coordinates.
+        self.target_point = self._resolve_target_point()  # (1, D), unit norm
+
+    def _resolve_target_point(self) -> torch.Tensor:
+        """Antipode of the real GPS (or of the clean mean prediction) on the unit sphere."""
+        dim = self.x0_bank.shape[-1]
+        if self.true_gps is not None:
+            # cart(gps) is a unit vector; its antipode -cart(gps) is the farthest point.
+            far = -_gps_degrees_to_cartesian(
+                np.array([[self.true_gps[0], self.true_gps[1]]]), device=self.device
+            )
+        else:
+            # No ground truth: use the antipode of the clean model's mean predicted location.
+            far = -self.x0_bank.mean(dim=0, keepdim=True)
+        far = far.to(device=self.device, dtype=self.source_tensor.dtype)
+        # Project back onto the unit sphere (the manifold the geodesic target expects).
+        far = far / (far.norm(dim=-1, keepdim=True) + 1e-8)
+        return far.reshape(1, dim)
+
+    def run_step(
+        self,
+        delta: torch.Tensor,
+        step: int,
+        optimizer: torch.optim.Optimizer,
+    ) -> float:
+        """One sign-SGD step minimizing the L2 training loss towards the antipodal target."""
+        optimizer.zero_grad(set_to_none=True)
+
+        # Fixed target point broadcast across the batch, replacing the x0-bank sample used
+        # by TrainingLossAttack: every trajectory in the batch is aimed at the antipode.
+        x1 = self.target_point.expand(self.train_batch_size, -1)
+        n = torch.randn_like(x1)
+        t = torch.rand(self.train_batch_size, device=self.device)
+        gamma = self.pipeline.scheduler(t)
+
+        if self.model_kind == "diffusion":
+            # DDPM forward process; network predicts noise n
+            x_t = torch.sqrt(gamma).unsqueeze(-1) * x1 + torch.sqrt(1.0 - gamma).unsqueeze(-1) * n
+            v_target = n
+
+        elif self.model_kind == "flow":
+            # Linear flow matching forward process; network predicts velocity (x1 - n)
+            x_t = gamma.unsqueeze(-1) * x1 + (1.0 - gamma).unsqueeze(-1) * n
+            v_target = x1 - n
+
+        else:  # "rfm"
+            # Riemannian flow matching: geodesic from a random sphere point to the target
+            # point (x1). x0_sphere is the noise end (uniform on the sphere).
+            x0_sphere = self.manifold.random_base(self.train_batch_size, x1.shape[-1]).to(
+                device=self.device, dtype=x1.dtype
+            )
+            gamma_exp = gamma.unsqueeze(-1)  # (B, 1) — vmap maps over batch dimension
+
+            def _cond_u(x0_s, x_data, g):
+                path = _sphere_geodesic(self.manifold, x0_s, x_data)
+                x_t_i, u_t_i = _func_jvp(path, (g,), (torch.ones_like(g),))
+                return x_t_i.squeeze(-2), u_t_i.squeeze(-2)
+
+            x_t_batch, v_target_batch = _func_vmap(_cond_u)(x0_sphere, x1, gamma_exp)
+            x_t = x_t_batch.reshape(self.train_batch_size, -1)
+            v_target = v_target_batch.reshape(self.train_batch_size, -1)
+
+        # Perturbed embedding (gradient tracked through the encoder)
+        perturbed_source = self.source_tensor + delta
+        emb_perturbed = compute_embedding(
+            perturbed_source,
+            self.train_batch_size,
+            self.pipeline,
+            device=self.device,
+            track_grad=True,
+        )
+
+        pred = self.pipeline.model({"y": x_t, "emb": emb_perturbed, "gamma": gamma})
+
+        # DP-Attacker Eq. 6 (targeted): pull the network's prediction towards the true
+        # forward-process target of the FURTHEST point (noise for DDPM, geodesic/flow
+        # velocity otherwise). sign-SGD below descends it (Algorithm 1 PGD step, s = +1).
+        # Subclasses override _targeted_loss to change how "towards" is measured.
+        loss = self._targeted_loss(pred, v_target, x_t)
+
+        if self.reconstruction_loss_weight > 0:
+            loss = loss + self.reconstruction_loss_weight * torch.nn.functional.l1_loss(
+                perturbed_source, self.source_tensor
+            )
+
+        loss.backward()
+
+        with torch.no_grad():
+            delta.grad = torch.sign(delta.grad)
+            optimizer.step()
+            delta.data = torch.clamp(delta.data, -self.eps_max, self.eps_max)
+            delta.grad.zero_()
+
+        return float(loss.item())
+
+    def _targeted_loss(
+        self, pred: torch.Tensor, v_target: torch.Tensor, x_t: torch.Tensor
+    ) -> torch.Tensor:
+        """L2 (MSE) between the prediction and the target velocity (DP-Attacker Eq. 6).
+
+        On the sphere the Riemannian tangent inner product is used (which for the sphere is
+        the ambient Euclidean dot product); for diffusion/flow it is plain MSE. Subclasses
+        (e.g. :class:`CosineTargeted`) override this to change the objective while keeping
+        the same target and forward process.
+        """
+        if self.model_kind == "rfm":
+            diff = pred - v_target
+            return self.manifold.inner(x_t, diff, diff).mean() / x_t.shape[-1]
+        return torch.nn.functional.mse_loss(pred, v_target)
+
+    def get_config(self) -> Dict[str, Any]:
+        config = super().get_config()
+        config["attack_mode"] = "targeted"
+        config["target"] = "antipode_of_true_gps"
+        config["true_gps"] = list(self.true_gps) if self.true_gps is not None else None
+        config["objective"] = "dp_attacker_targeted_eq6"
+        config["paper"] = "Chen, Xue & Chen, Diffusion Policy Attacker, NeurIPS 2024"
+        config["variant"] = "v2"
+        return config
+
+
+############################################################################################
+# DTDBlur: blur-robust DTD via expectation over Gaussian blur (half clean, half blurred)
+############################################################################################
+
+
+class DTDBlur(DiffusionAttack):
+    """Blur-robust Diffusion Trajectory Deviation (DTD).
+
+    Plain DTD trains the perturbation only on the clean protected image, so a defender who
+    Gaussian-blurs the protected image can wash the perturbation out. DTDBlur makes the
+    perturbation survive blur with an expectation-over-transformation objective: on every
+    step the DTD alignment loss is evaluated twice against the *same* clean reference score
+    -- once on the clean protected image and once on a Gaussian-blurred copy at a random
+    sigma drawn uniformly from ``[blur_sigma_min, blur_sigma_max]`` (default 0..4). The two
+    terms are combined half/half (``blur_loss_weight``, default 0.5), so the attack keeps
+    its clean-image strength while explicitly optimizing the blurred image too:
+
+        loss = (1 - w) * L_dtd(clean) + w * L_dtd(blur(sigma)),   sigma ~ U[min, max]
+
+    The blur is a differentiable Gaussian applied to the (normalized) perturbed image tensor,
+    so the gradient flows back to ``delta`` through the blur. As in DTD the alignment metric
+    defaults to ``cosine_similarity_negative`` (push the perturbed score anti-parallel to the
+    clean score). The reference score is always the clean, unblurred source, matching the
+    robustness ablation, which compares the blurred protected image against the clean
+    (unblurred) prediction.
+    """
+
+    def __init__(
+        self,
+        pipeline,
+        source_image: Image.Image,
+        n_steps: int = 400,
+        train_batch_size: int = 64,
+        lr: float = 2e-2,
+        eps_max: float = 1.0,
+        anchor_samples: int = 256,
+        clean_num_steps: int = 200,
+        dot_product_loss: str = "cosine_similarity_negative",
+        reconstruction_loss_weight: float = 0.0,
+        blur_sigma_min: float = 0.0,
+        blur_sigma_max: float = 4.0,
+        blur_loss_weight: float = 0.5,
+        delta_init: float = 1e-4,
+        num_restarts: int = 1,
+        restart_selection_metric: str = "final_step_displacement",
+        device: str = "cuda",
+        x0_bank: Optional[torch.Tensor] = None,
+    ):
+        super().__init__(
+            pipeline=pipeline,
+            source_image=source_image,
+            n_steps=n_steps,
+            train_batch_size=train_batch_size,
+            lr=lr,
+            eps_max=eps_max,
+            anchor_samples=anchor_samples,
+            clean_num_steps=clean_num_steps,
+            target_pure_noise=False,
+            dot_product_loss=dot_product_loss,
+            reconstruction_loss_weight=reconstruction_loss_weight,
+            delta_init=delta_init,
+            num_restarts=num_restarts,
+            restart_selection_metric=restart_selection_metric,
+            device=device,
+            x0_bank=x0_bank,
+        )
+        self.blur_sigma_min = float(blur_sigma_min)
+        self.blur_sigma_max = float(blur_sigma_max)
+        if self.blur_sigma_max < self.blur_sigma_min:
+            raise ValueError("blur_sigma_max must be >= blur_sigma_min")
+        self.blur_loss_weight = float(blur_loss_weight)
+        # Odd kernel wide enough for the largest sigma (~3 sigma on each side).
+        self.blur_kernel_size = int(2 * int(np.ceil(3.0 * max(self.blur_sigma_max, 1e-3))) + 1)
+        self._blur_eps = 1e-3  # sigmas at/below this are treated as "no blur"
+
+    def _gaussian_blur(self, image_tensor: torch.Tensor, sigma: float) -> torch.Tensor:
+        """Differentiable Gaussian blur of a [1, 3, H, W] tensor; sigma<=eps is a no-op."""
+        if sigma <= self._blur_eps:
+            return image_tensor
+        return _tvf.gaussian_blur(
+            image_tensor,
+            kernel_size=[self.blur_kernel_size, self.blur_kernel_size],
+            sigma=[float(sigma), float(sigma)],
+        )
+
+    def _sample_sigma(self) -> float:
+        """Draw a blur sigma uniformly from [blur_sigma_min, blur_sigma_max]."""
+        if self.blur_sigma_max <= self.blur_sigma_min:
+            return self.blur_sigma_min
+        return float(
+            torch.empty(1, device=self.device)
+            .uniform_(self.blur_sigma_min, self.blur_sigma_max)
+            .item()
+        )
+
+    def run_step(
+        self,
+        delta: torch.Tensor,
+        step: int,
+        optimizer: torch.optim.Optimizer,
+    ) -> float:
+        """One sign-SGD step on the blur-EOT DTD objective (half clean, half blurred)."""
+        optimizer.zero_grad(set_to_none=True)
+
+        # Shared diffusion sample for both the clean and blurred terms.
+        idx = torch.randint(0, self.x0_bank.shape[0], (self.train_batch_size,), device=self.device)
+        x0 = self.x0_bank[idx]
+        eps = torch.randn_like(x0)
+        t = torch.rand(self.train_batch_size, device=self.device)
+        gamma = self.pipeline.scheduler(t)
+        x_t = (
+            torch.sqrt(gamma).unsqueeze(-1) * x0
+            + torch.sqrt(1.0 - gamma).unsqueeze(-1) * eps
+        )
+
+        # Clean reference score (unperturbed, unblurred source); shared, no grad.
+        emb_source = compute_embedding(
+            self.source_tensor,
+            self.train_batch_size,
+            self.pipeline,
+            device=self.device,
+            track_grad=False,
+        )
+        eps_pred = self.pipeline.model({"y": x_t, "emb": emb_source, "gamma": gamma})
+
+        perturbed_source = self.source_tensor + delta
+
+        # Term 1: DTD alignment on the clean protected image (gradient through the encoder).
+        emb_clean = compute_embedding(
+            perturbed_source,
+            self.train_batch_size,
+            self.pipeline,
+            device=self.device,
+            track_grad=True,
+        )
+        eps_pred_clean = self.pipeline.model({"y": x_t, "emb": emb_clean, "gamma": gamma})
+        loss_clean = _compute_alignment_loss(
+            eps_pred, eps_pred_clean, dot_product_loss=self.dot_product_loss
+        )
+
+        # Term 2: DTD alignment on a Gaussian-blurred copy (random sigma in [min, max]).
+        # The blur is differentiable, so the gradient flows back to delta through it.
+        sigma = self._sample_sigma()
+        blurred_source = self._gaussian_blur(perturbed_source, sigma)
+        emb_blur = compute_embedding(
+            blurred_source,
+            self.train_batch_size,
+            self.pipeline,
+            device=self.device,
+            track_grad=True,
+        )
+        eps_pred_blur = self.pipeline.model({"y": x_t, "emb": emb_blur, "gamma": gamma})
+        loss_blur = _compute_alignment_loss(
+            eps_pred, eps_pred_blur, dot_product_loss=self.dot_product_loss
+        )
+
+        # Half clean, half blurred.
+        w = self.blur_loss_weight
+        loss = (1.0 - w) * loss_clean + w * loss_blur
+
+        if self.reconstruction_loss_weight > 0:
+            loss = loss + self.reconstruction_loss_weight * torch.nn.functional.l1_loss(
+                perturbed_source, self.source_tensor
+            )
+
+        loss.backward()
+
+        with torch.no_grad():
+            delta.grad = torch.sign(delta.grad)
+            optimizer.step()
+            delta.data = torch.clamp(delta.data, -self.eps_max, self.eps_max)
+            delta.grad.zero_()
+
+        return float(loss.item())
+
+    def get_config(self) -> Dict[str, Any]:
+        config = super().get_config()
+        config["blur_sigma_min"] = self.blur_sigma_min
+        config["blur_sigma_max"] = self.blur_sigma_max
+        config["blur_loss_weight"] = self.blur_loss_weight
+        config["blur_kernel_size"] = self.blur_kernel_size
+        config["attack_mode"] = "untargeted"
+        return config
+
+
+############################################################################################
+# CosineTargeted: direction-only targeting towards the farthest geographic point
+############################################################################################
+
+
+class CosineTargeted(TargetedL2):
+    """Direction-only variant of :class:`TargetedL2` (same antipodal target).
+
+    Keeps TargetedL2's target -- the point on Earth farthest from the image's real
+    coordinates (the antipode ``p_far``) -- and its forward process, but replaces the L2/MSE
+    objective of DP-Attacker Eq. 6 with a direction-only one: it minimizes the negative
+    cosine similarity between the network's prediction and the target forward-process
+    velocity ``v_target``,
+
+        min_delta  E[ -cos( network(x_t, emb(I + delta), gamma), v_target ) ],
+
+    i.e. it steers the sampling flow to *point* towards the antipode without constraining its
+    magnitude. This scale-invariant objective is often more robust than matching the full
+    vector. For the sphere the Riemannian tangent inner product equals the ambient Euclidean
+    dot product, so the plain (Euclidean) cosine used here is metric-correct for RFM.
+    """
+
+    def _targeted_loss(
+        self, pred: torch.Tensor, v_target: torch.Tensor, x_t: torch.Tensor
+    ) -> torch.Tensor:
+        # -mean(cos(v_target, pred)); minimizing maximizes the signed cosine so the
+        # prediction aligns in DIRECTION with the target velocity (towards the antipode).
+        return _compute_alignment_loss(
+            v_target, pred, dot_product_loss="cosine_similarity_target"
+        )
+
+    def get_config(self) -> Dict[str, Any]:
+        config = super().get_config()
+        config["objective"] = "cosine_targeted"
+        config["target_loss"] = "cosine_similarity_target"
+        config["variant"] = "cosine_targeted"
         return config

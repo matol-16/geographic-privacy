@@ -30,6 +30,7 @@ from utils.adversarial_metrics import trajectory_displacement
 from utils.datasets import retrieve_yfcc_images, retrieve_osv_images
 from utils.ablations import (
     evaluate_delta_across_models,
+    evaluate_delta_at_cfgs,
     evaluate_delta_at_steps,
     evaluate_delta_under_transforms,
 )
@@ -90,6 +91,13 @@ class EvaluationConfig:
     run_model_transfer_ablation: bool = False
     model_transfer_types: Optional[List[str]] = None
     model_transfer_num_steps: Optional[int] = None
+    # Guidance-scale (cfg) ablation (opt-in): re-evaluate the best perturbation of each
+    # image at every classifier-free guidance value in ``eval_cfgs`` during the same run,
+    # holding the sampling-step count at the baseline (``cfg_num_steps``, defaulting to
+    # each attack's ``restart_eval_num_steps``). Mirrors the sampling-steps ablation.
+    run_cfg_ablation: bool = False
+    eval_cfgs: Optional[List[float]] = None
+    cfg_num_steps: Optional[int] = None
 
 
 @dataclass
@@ -125,6 +133,11 @@ class PrecomputedPairEvaluationConfig:
     robustness_jpeg_quality_factors: Optional[List[int]] = None
     robustness_gaussian_blur_sigmas: Optional[List[float]] = None
     robustness_num_steps: Optional[int] = None
+    # Guidance-scale (cfg) ablation: like the sampling-steps ablation, it is an eval-time
+    # property of the attacked image, so it applies unchanged to precomputed pairs.
+    run_cfg_ablation: bool = False
+    eval_cfgs: Optional[List[float]] = None
+    cfg_num_steps: Optional[int] = None
 
 
 class ImageLoader:
@@ -371,6 +384,11 @@ class MetricsCollector:
             attack_type: [[None for _ in range(n_images)] for _ in attack_budgets]
             for attack_type in attack_types
         }
+        # Optional guidance-scale (cfg) ablation: per image, {cfg: displacement_km}.
+        self.cfg_results: Dict[str, List[List[Optional[Dict[float, float]]]]] = {
+            attack_type: [[None for _ in range(n_images)] for _ in attack_budgets]
+            for attack_type in attack_types
+        }
 
     @staticmethod
     def _to_cpu_tensor(value: Any) -> Any:
@@ -540,6 +558,16 @@ class MetricsCollector:
         """Record the cross-model transfer ablation samples for one image."""
         self.model_transfer_results[attack_type][budget_index][image_index] = dict(displacement_by_model)
 
+    def record_cfg(
+        self,
+        attack_type: str,
+        budget_index: int,
+        image_index: int,
+        displacement_by_cfg: Dict[float, float],
+    ) -> None:
+        """Record the guidance-scale (cfg) ablation samples for one image."""
+        self.cfg_results[attack_type][budget_index][image_index] = dict(displacement_by_cfg)
+
     def get_results(self) -> Dict[str, Dict[str, Any]]:
         """Get all collected results."""
         combined_results: Dict[str, Dict[str, Any]] = {}
@@ -633,6 +661,7 @@ class BaseEvaluationRunner:
             "sampling_steps_results": mc.sampling_steps_results,
             "robustness_results": mc.robustness_results,
             "model_transfer_results": mc.model_transfer_results,
+            "cfg_results": mc.cfg_results,
         }
 
     def _state_file_suffix(self) -> str:
@@ -699,6 +728,7 @@ class BaseEvaluationRunner:
             sampling_steps_results=state.get("sampling_steps_results"),
             robustness_results=state.get("robustness_results"),
             model_transfer_results=state.get("model_transfer_results"),
+            cfg_results=state.get("cfg_results"),
             shared_n_images=shared_n_images,
             reusable_budget_pairs=reusable_budget_pairs,
         )
@@ -752,6 +782,7 @@ class BaseEvaluationRunner:
         sampling_steps_results: Any,
         robustness_results: Any,
         model_transfer_results: Any,
+        cfg_results: Any,
         shared_n_images: int,
         reusable_budget_pairs: List[Tuple[int, int]],
     ) -> None:
@@ -785,6 +816,7 @@ class BaseEvaluationRunner:
                 sampling_steps_results=sampling_steps_results,
                 robustness_results=robustness_results,
                 model_transfer_results=model_transfer_results,
+                cfg_results=cfg_results,
                 shared_n_images=shared_n_images,
                 reusable_budget_pairs=reusable_budget_pairs,
             )
@@ -797,10 +829,11 @@ class BaseEvaluationRunner:
         sampling_steps_results: Any,
         robustness_results: Any,
         model_transfer_results: Any,
+        cfg_results: Any,
         shared_n_images: int,
         reusable_budget_pairs: List[Tuple[int, int]],
     ) -> None:
-        """Copy the per-image restart / location / sampling-steps / robustness / model-transfer buffers for one attack type."""
+        """Copy the per-image restart / location / sampling-steps / robustness / model-transfer / cfg buffers for one attack type."""
         mc = self.metrics_collector
         saved_restart_by_budget = restart_results.get(attack_type)
         saved_location_by_budget = location_results.get(attack_type)
@@ -815,12 +848,16 @@ class BaseEvaluationRunner:
         saved_model_transfer_by_budget = (
             model_transfer_results.get(attack_type) if isinstance(model_transfer_results, dict) else None
         )
+        saved_cfg_by_budget = (
+            cfg_results.get(attack_type) if isinstance(cfg_results, dict) else None
+        )
 
         current_restart_by_budget = mc.restart_results[attack_type]
         current_location_by_budget = mc.location_results[attack_type]
         current_steps_by_budget = mc.sampling_steps_results[attack_type]
         current_robustness_by_budget = mc.robustness_results[attack_type]
         current_model_transfer_by_budget = mc.model_transfer_results[attack_type]
+        current_cfg_by_budget = mc.cfg_results[attack_type]
         for current_budget_idx, saved_budget_idx in reusable_budget_pairs:
             if current_budget_idx >= len(current_restart_by_budget) or current_budget_idx >= len(current_location_by_budget):
                 continue
@@ -832,6 +869,7 @@ class BaseEvaluationRunner:
             current_steps_by_image = current_steps_by_budget[current_budget_idx]
             current_robustness_by_image = current_robustness_by_budget[current_budget_idx]
             current_model_transfer_by_image = current_model_transfer_by_budget[current_budget_idx]
+            current_cfg_by_image = current_cfg_by_budget[current_budget_idx]
             saved_restart_by_image = saved_restart_by_budget[saved_budget_idx]
             saved_location_by_image = saved_location_by_budget[saved_budget_idx]
             if not isinstance(saved_restart_by_image, list) or not isinstance(saved_location_by_image, list):
@@ -849,6 +887,11 @@ class BaseEvaluationRunner:
             saved_model_transfer_by_image = (
                 saved_model_transfer_by_budget[saved_budget_idx]
                 if isinstance(saved_model_transfer_by_budget, list) and saved_budget_idx < len(saved_model_transfer_by_budget)
+                else None
+            )
+            saved_cfg_by_image = (
+                saved_cfg_by_budget[saved_budget_idx]
+                if isinstance(saved_cfg_by_budget, list) and saved_budget_idx < len(saved_cfg_by_budget)
                 else None
             )
 
@@ -882,6 +925,12 @@ class BaseEvaluationRunner:
                     and saved_model_transfer_by_image[image_idx] is not None
                 ):
                     current_model_transfer_by_image[image_idx] = saved_model_transfer_by_image[image_idx]
+                if (
+                    isinstance(saved_cfg_by_image, list)
+                    and image_idx < len(saved_cfg_by_image)
+                    and saved_cfg_by_image[image_idx] is not None
+                ):
+                    current_cfg_by_image[image_idx] = saved_cfg_by_image[image_idx]
 
     def save_run_config(self, run_config: Dict[str, Any], suffix: str = "") -> None:
         """Save the resolved experiment configuration used for the run."""
@@ -953,6 +1002,9 @@ class EvaluationRunner(BaseEvaluationRunner):
             "run_model_transfer_ablation": self.config.run_model_transfer_ablation,
             "model_transfer_types": list(self.config.model_transfer_types) if self.config.model_transfer_types else None,
             "model_transfer_num_steps": self.config.model_transfer_num_steps,
+            "run_cfg_ablation": self.config.run_cfg_ablation,
+            "eval_cfgs": list(self.config.eval_cfgs) if self.config.eval_cfgs else None,
+            "cfg_num_steps": self.config.cfg_num_steps,
         }
 
     def _signature_match_keys(self) -> List[str]:
@@ -978,6 +1030,9 @@ class EvaluationRunner(BaseEvaluationRunner):
             "run_model_transfer_ablation",
             "model_transfer_types",
             "model_transfer_num_steps",
+            "run_cfg_ablation",
+            "eval_cfgs",
+            "cfg_num_steps",
         ]
 
     def _budget_identity_from_signature(self, signature: Dict[str, Any], budget_idx: int) -> Any:
@@ -1177,6 +1232,50 @@ class EvaluationRunner(BaseEvaluationRunner):
             num_steps=int(num_steps) if num_steps is not None else None,
         )
 
+    # ---- Guidance-scale (cfg) ablation ------------------------------------- #
+
+    def compute_cfg_samples(
+        self,
+        attack_type: str,
+        budget_idx: int,
+        image: Image.Image,
+        result: Dict[str, Any],
+    ) -> Optional[Dict[float, float]]:
+        """Re-evaluate the best perturbation at every ``eval_cfgs`` guidance scale.
+
+        Returns ``{cfg: displacement_km}`` or ``None`` when the ablation is disabled or no
+        usable delta is available. Sampling steps are held at the baseline
+        (``cfg_num_steps``, defaulting to the attack's ``restart_eval_num_steps``) so the
+        only thing that varies across the recorded values is the guidance scale. GPU work
+        only; recording into the collector is done separately so it can stay on the main
+        thread (matching the other ablations).
+        """
+        if not self.config.run_cfg_ablation:
+            return None
+        eval_cfgs = self.config.eval_cfgs or []
+        if not eval_cfgs:
+            return None
+        delta = result.get("delta")
+        if delta is None:
+            return None
+
+        kwargs = self.merge_attack_kwargs(attack_type, budget_idx)
+        num_steps = self.config.cfg_num_steps
+        if num_steps is None:
+            num_steps = kwargs.get("restart_eval_num_steps")
+        return evaluate_delta_at_cfgs(
+            pipeline=self.pipeline,
+            source_image=image,
+            delta=delta,
+            eval_cfgs=eval_cfgs,
+            num_steps=int(num_steps) if num_steps is not None else None,
+            batch_size=int(kwargs.get("restart_eval_batch_size", 128)),
+            # Constant eval seed (as in the sampling-steps ablation): identical shared
+            # noise for clean vs perturbed keeps the paired displacement comparable.
+            seed=int(self.config.seed),
+            device=str(kwargs.get("device", "cuda")),
+        )
+
 
 class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
     """Evaluation runner for precomputed clean/attacked image pairs."""
@@ -1283,6 +1382,9 @@ class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
             "robustness_jpeg_quality_factors": list(self.config.robustness_jpeg_quality_factors) if self.config.robustness_jpeg_quality_factors else None,
             "robustness_gaussian_blur_sigmas": list(self.config.robustness_gaussian_blur_sigmas) if self.config.robustness_gaussian_blur_sigmas else None,
             "robustness_num_steps": self.config.robustness_num_steps,
+            "run_cfg_ablation": self.config.run_cfg_ablation,
+            "eval_cfgs": list(self.config.eval_cfgs) if self.config.eval_cfgs else None,
+            "cfg_num_steps": self.config.cfg_num_steps,
         }
 
     def _signature_match_keys(self) -> List[str]:
@@ -1302,6 +1404,9 @@ class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
             "robustness_jpeg_quality_factors",
             "robustness_gaussian_blur_sigmas",
             "robustness_num_steps",
+            "run_cfg_ablation",
+            "eval_cfgs",
+            "cfg_num_steps",
         ]
 
     def _budget_identity_from_signature(self, signature: Dict[str, Any], budget_idx: int) -> Any:
@@ -1357,6 +1462,22 @@ class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
         )
 
 
+def _maybe_add_true_gps(runner, attack_type: str, image_idx: int, kwargs: Dict[str, Any]) -> None:
+    """Give the targeted-L2 attack the image's real GPS so it can aim at the antipode.
+
+    Harmless no-op for every other attack: the kwarg is only injected for the targeted-L2
+    family, and it is a transient per-call value (never persisted into the saved config).
+    """
+    if str(attack_type).lower() not in (
+        "targeted_l2", "targetedl2", "l2_target",
+        "cosine_targeted", "cosinetargeted", "cosine_target",
+    ):
+        return
+    source_gps = getattr(runner, "source_gps", None)
+    if source_gps is not None and image_idx < len(source_gps):
+        kwargs.setdefault("true_gps", tuple(source_gps[image_idx]))
+
+
 def parallel_evaluate_attacks(
     runner: EvaluationRunner,
     attack_configs: List[Tuple[str, int, int, Image.Image]],  # (attack_type, budget_idx, image_idx, image)
@@ -1374,6 +1495,7 @@ def parallel_evaluate_attacks(
         """Worker task: train the attack and (optionally) run the sampling-steps ablation."""
         eps = config.attack_budgets[budget_idx]
         kwargs = runner.merge_attack_kwargs(attack_type, budget_idx)
+        _maybe_add_true_gps(runner, attack_type, image_idx, kwargs)
 
         # Handle CUDA streams if requested
         if (config.use_cuda_streams and
@@ -1392,6 +1514,7 @@ def parallel_evaluate_attacks(
                 steps_samples = runner.compute_sampling_steps_samples(attack_type, budget_idx, image, result)
                 robustness_samples = runner.compute_robustness_samples(attack_type, budget_idx, image_idx, image, result)
                 model_transfer_samples = runner.compute_model_transfer_samples(attack_type, budget_idx, image, result)
+                cfg_samples = runner.compute_cfg_samples(attack_type, budget_idx, image, result)
             stream.synchronize()
         else:
             result = run_attack(
@@ -1405,8 +1528,9 @@ def parallel_evaluate_attacks(
             steps_samples = runner.compute_sampling_steps_samples(attack_type, budget_idx, image, result)
             robustness_samples = runner.compute_robustness_samples(attack_type, budget_idx, image_idx, image, result)
             model_transfer_samples = runner.compute_model_transfer_samples(attack_type, budget_idx, image, result)
+            cfg_samples = runner.compute_cfg_samples(attack_type, budget_idx, image, result)
 
-        return attack_type, budget_idx, image_idx, result, steps_samples, robustness_samples, model_transfer_samples
+        return attack_type, budget_idx, image_idx, result, steps_samples, robustness_samples, model_transfer_samples, cfg_samples
 
     with ThreadPoolExecutor(max_workers=config.parallel_workers) as executor:
         futures = [
@@ -1415,7 +1539,7 @@ def parallel_evaluate_attacks(
         ]
 
         for future in as_completed(futures):
-            attack_type, budget_idx, image_idx, result, steps_samples, robustness_samples, model_transfer_samples = future.result()
+            attack_type, budget_idx, image_idx, result, steps_samples, robustness_samples, model_transfer_samples, cfg_samples = future.result()
             runner.metrics_collector.record_attack_result(
                 attack_type,
                 budget_idx,
@@ -1433,6 +1557,10 @@ def parallel_evaluate_attacks(
             if model_transfer_samples is not None:
                 runner.metrics_collector.record_model_transfer(
                     attack_type, budget_idx, image_idx, model_transfer_samples
+                )
+            if cfg_samples is not None:
+                runner.metrics_collector.record_cfg(
+                    attack_type, budget_idx, image_idx, cfg_samples
                 )
             runner.save_state()
             eps = config.attack_budgets[budget_idx]
@@ -1462,6 +1590,7 @@ def sequential_evaluate_attacks(
     for attack_type, budget_idx, image_idx, image in attack_configs:
         eps = config.attack_budgets[budget_idx]
         kwargs = runner.merge_attack_kwargs(attack_type, budget_idx)
+        _maybe_add_true_gps(runner, attack_type, image_idx, kwargs)
 
         result = run_attack(
             attack_type=attack_type,
@@ -1491,6 +1620,11 @@ def sequential_evaluate_attacks(
         if model_transfer_samples is not None:
             runner.metrics_collector.record_model_transfer(
                 attack_type, budget_idx, image_idx, model_transfer_samples
+            )
+        cfg_samples = runner.compute_cfg_samples(attack_type, budget_idx, image, result)
+        if cfg_samples is not None:
+            runner.metrics_collector.record_cfg(
+                attack_type, budget_idx, image_idx, cfg_samples
             )
         runner.save_state()
 
@@ -1601,6 +1735,22 @@ def run_precomputed_pair_evaluation(runner: PrecomputedPairEvaluationRunner) -> 
             )
             runner.metrics_collector.record_robustness(
                 attack_type, budget_idx, image_idx, robustness_samples
+            )
+
+        if cfg.run_cfg_ablation and cfg.eval_cfgs:
+            from utils.ablations import evaluate_pair_at_cfgs
+            cfg_samples = evaluate_pair_at_cfgs(
+                pipeline=runner.pipeline,
+                source_image=clean_image,
+                perturbed_image=attacked_image,
+                eval_cfgs=cfg.eval_cfgs,
+                num_steps=cfg.cfg_num_steps if cfg.cfg_num_steps is not None else cfg.num_steps,
+                batch_size=cfg.batch_size,
+                seed=int(cfg.seed),
+                device=cfg.device,
+            )
+            runner.metrics_collector.record_cfg(
+                attack_type, budget_idx, image_idx, cfg_samples
             )
 
         runner.save_state()

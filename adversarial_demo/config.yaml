@@ -97,8 +97,13 @@ attack_types: ["encoder", "diffusion", "sampling"]
 # - max_restarts overrides num_restarts for the run so the always-on restart
 #   ablation reaches this depth. Leave null to keep the per-dataset num_restarts.
 # - eval_num_steps: sampling-step counts used by the sampling-steps ablation.
+# - eval_cfgs: classifier-free guidance scales used by the cfg ablation.
+# - cfg_num_steps: sampling steps held fixed during the cfg ablation (null => each
+#   attack's restart_eval_num_steps, i.e. the baseline).
 max_restarts: 8
 eval_num_steps: [8, 16, 32, 64, 128, 250]
+eval_cfgs: [1, 2, 5, 10]
+cfg_num_steps: null
 
 # Robustness-to-transformation ablation (GeoShield Fig. 6). Each trained
 # perturbation's protected image is JPEG-compressed / Gaussian-blurred and
@@ -160,6 +165,10 @@ plot:
   # evaluate-dataset (extra pipeline runs; no retraining). The restart ablation
   # is always produced (it is free).
   run_sampling_steps_ablation: true
+  # Opt-in: re-evaluate each best perturbation across eval_cfgs guidance scales during
+  # evaluate-dataset (extra pipeline runs; no retraining). Runs for every evaluated
+  # attack (like the sampling-steps ablation), not scoped per attack type.
+  run_cfg_ablation: true
   # Opt-in: degrade each best perturbation's protected image with JPEG/blur and
   # re-evaluate (GeoShield Fig. 6). Scoped to robustness.attack_types (default dtd),
   # so it is a no-op unless one of those attacks is part of the run.

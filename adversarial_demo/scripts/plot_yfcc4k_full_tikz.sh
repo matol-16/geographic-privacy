@@ -56,36 +56,36 @@ cd "${PROJECT_DIR}"
 
 CONFIG="${RESULTS_BASE}/${DATASET}_run_config_merged.yaml"
 
-# --- per-attack displacement variance ("DTD" spread), true-GPS metric ---
-"${PYTHON}" main.py plot dtd-variance --tikz \
-  --config "${CONFIG}" \
-  --dataset "${DATASET}" \
-  --results-dir "${RESULTS_BASE}" \
-  --plots-dir "${PLOTS_DIR}" \
-  --attack-types ${ATTACK_TYPES} \
-  --override plot.gps_true=true
+# # --- per-attack displacement variance ("DTD" spread), true-GPS metric ---
+# "${PYTHON}" main.py plot dtd-variance --tikz \
+#   --config "${CONFIG}" \
+#   --dataset "${DATASET}" \
+#   --results-dir "${RESULTS_BASE}" \
+#   --plots-dir "${PLOTS_DIR}" \
+#   --attack-types ${ATTACK_TYPES} \
+#   --override plot.gps_true=true
 
-# --- training loss vs. achieved FSD (dtd/training_loss/sampling only; requires
-#     results saved with the 'final_loss' field -- older runs may not have it, so
-#     this step is allowed to fail without aborting the rest of the script) ---
-"${PYTHON}" main.py plot loss-vs-fsd --tikz \
-  --config "${CONFIG}" \
-  --dataset "${DATASET}" \
-  --results-dir "${RESULTS_BASE}" \
-  --plots-dir "${PLOTS_DIR}" \
-  --attack-types dtd training_loss sampling \
-  --override plot.gps_true=true \
-  || echo "Skipping loss-vs-fsd plot (results predate the 'final_loss' field)"
+# # --- training loss vs. achieved FSD (dtd/training_loss/sampling only; requires
+# #     results saved with the 'final_loss' field -- older runs may not have it, so
+# #     this step is allowed to fail without aborting the rest of the script) ---
+# "${PYTHON}" main.py plot loss-vs-fsd --tikz \
+#   --config "${CONFIG}" \
+#   --dataset "${DATASET}" \
+#   --results-dir "${RESULTS_BASE}" \
+#   --plots-dir "${PLOTS_DIR}" \
+#   --attack-types dtd training_loss sampling \
+#   --override plot.gps_true=true \
+#   || echo "Skipping loss-vs-fsd plot (results predate the 'final_loss' field)"
 
-# --- clean-prediction-vs-truth displacement against perturbed-vs-truth displacement
-#     (true-GPS metric); shared log-log axes with a y=x "no attack effect" reference ---
-"${PYTHON}" main.py plot clean-vs-attacked-displacement --tikz \
-  --config "${CONFIG}" \
-  --dataset "${DATASET}" \
-  --results-dir "${RESULTS_BASE}" \
-  --plots-dir "${PLOTS_DIR}" \
-  --attack-types ${ATTACK_TYPES} \
-  --override plot.gps_true=true
+# # --- clean-prediction-vs-truth displacement against perturbed-vs-truth displacement
+# #     (true-GPS metric); shared log-log axes with a y=x "no attack effect" reference ---
+# "${PYTHON}" main.py plot clean-vs-attacked-displacement --tikz \
+#   --config "${CONFIG}" \
+#   --dataset "${DATASET}" \
+#   --results-dir "${RESULTS_BASE}" \
+#   --plots-dir "${PLOTS_DIR}" \
+#   --attack-types ${ATTACK_TYPES} \
+#   --override plot.gps_true=true
 
 # --- localizability vs. attack strength (box plots per attack, low/med/high
 #     localizability tertiles). Attack types are listed explicitly here rather
@@ -96,26 +96,26 @@ CONFIG="${RESULTS_BASE}/${DATASET}_run_config_merged.yaml"
   --dataset "${DATASET}" \
   --results-dir "${RESULTS_BASE}" \
   --plots-dir "${PLOTS_DIR}" \
-  --attack-types encoder sampling diffusion_l2 dtd ace training_loss
+  --attack-types geoshield training_loss sampling diffusion_l2 dtd
 
-# --- robustness to JPEG / Gaussian blur (reads <dataset>_robustness_results.json;
-#     currently restricted to the 2500km success-rate threshold) ---
-"${PYTHON}" main.py plot robustness --tikz \
-  --dataset "${DATASET}" \
-  --results-dir "${RESULTS_BASE}" \
-  --plots-dir "${PLOTS_DIR}"
+# # --- robustness to JPEG / Gaussian blur (reads <dataset>_robustness_results.json;
+# #     currently restricted to the 2500km success-rate threshold) ---
+# "${PYTHON}" main.py plot robustness --tikz \
+#   --dataset "${DATASET}" \
+#   --results-dir "${RESULTS_BASE}" \
+#   --plots-dir "${PLOTS_DIR}"
 
-# --- cross-model transferability (reads <dataset>_model_transfer_results.json) ---
-"${PYTHON}" main.py plot model-transfer --tikz \
-  --dataset "${DATASET}" \
-  --results-dir "${RESULTS_BASE}" \
-  --plots-dir "${PLOTS_DIR}"
+# # --- cross-model transferability (reads <dataset>_model_transfer_results.json) ---
+# "${PYTHON}" main.py plot model-transfer --tikz \
+#   --dataset "${DATASET}" \
+#   --results-dir "${RESULTS_BASE}" \
+#   --plots-dir "${PLOTS_DIR}"
 
-# --- success rate vs. sampling steps (reads <dataset>_sampling_steps_results.json) ---
-"${PYTHON}" main.py plot sampling-steps --tikz \
-  --dataset "${DATASET}" \
-  --results-dir "${RESULTS_BASE}" \
-  --plots-dir "${PLOTS_DIR}"
+# # --- success rate vs. sampling steps (reads <dataset>_sampling_steps_results.json) ---
+# "${PYTHON}" main.py plot sampling-steps --tikz \
+#   --dataset "${DATASET}" \
+#   --results-dir "${RESULTS_BASE}" \
+#   --plots-dir "${PLOTS_DIR}"
 
 echo
 echo "Done. TikZ sources (+ best-effort PDF/PNG previews) in ${PLOTS_DIR}/tikz."

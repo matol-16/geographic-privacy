@@ -226,6 +226,133 @@ def build_sampling_steps_json(
 
 
 # --------------------------------------------------------------------------- #
+# Guidance-scale (cfg) ablation
+# --------------------------------------------------------------------------- #
+#
+# Mirrors the sampling-steps ablation, but the swept axis is the classifier-free
+# guidance scale used at inference instead of the number of sampling steps. Each
+# trained perturbation is re-evaluated at every guidance value in ``eval_cfgs`` while
+# the sampling-step count is held at the baseline, measuring how the attack's
+# displacement holds up as the deployed model's guidance strength varies.
+
+
+def evaluate_pair_at_cfgs(
+    pipeline,
+    source_image,
+    perturbed_image,
+    eval_cfgs: Sequence[float],
+    num_steps: Optional[int] = None,
+    batch_size: int = 128,
+    seed: int = 1234,
+    device: str = "cuda",
+) -> Dict[float, float]:
+    """Evaluate an already-built clean/perturbed image pair at several guidance scales.
+
+    Returns ``{cfg: final_step_displacement_km}``. The perturbed image is taken as-is,
+    so this serves precomputed pairs (e.g. GeoShield, read from disk) where there is no
+    ``delta`` tensor to reconstruct from -- the guidance scale is the only thing that
+    varies across calls, exactly as in the trainable path. Sampling steps are held at
+    ``num_steps`` (the baseline) for every guidance value.
+    """
+    displacement_by_cfg: Dict[float, float] = {}
+    for cfg in eval_cfgs:
+        eval_result = run_paired_pipeline_with_shared_noise(
+            pipeline=pipeline,
+            source_image=source_image,
+            perturbed_image=perturbed_image,
+            batch_size=batch_size,
+            cfg=float(cfg),
+            num_steps=num_steps,
+            seed=seed,
+            device=device,
+        )
+        displacement_by_cfg[float(cfg)] = float(
+            eval_result["metrics"]["final_step_displacement"]
+        )
+    return displacement_by_cfg
+
+
+def evaluate_delta_at_cfgs(
+    pipeline,
+    source_image,
+    delta,
+    eval_cfgs: Sequence[float],
+    num_steps: Optional[int] = None,
+    batch_size: int = 128,
+    seed: int = 1234,
+    device: str = "cuda",
+) -> Dict[float, float]:
+    """Re-evaluate a single trained perturbation at several guidance scales.
+
+    Returns ``{cfg: final_step_displacement_km}``. Reuses the exact paired,
+    shared-noise evaluation used everywhere else, so the only thing that varies
+    across calls is the classifier-free guidance scale (sampling steps held at the
+    baseline ``num_steps``).
+    """
+    perturbed_image = add_perturbation_to_image(source_image, delta.to(device), pipeline)
+    return evaluate_pair_at_cfgs(
+        pipeline=pipeline,
+        source_image=source_image,
+        perturbed_image=perturbed_image,
+        eval_cfgs=eval_cfgs,
+        num_steps=num_steps,
+        batch_size=batch_size,
+        seed=seed,
+        device=device,
+    )
+
+
+def _cfg_key(cfg: float) -> str:
+    """Stable per-guidance-scale dict key (e.g. 5.0 -> ``"5"``, 2.5 -> ``"2.5"``)."""
+    return f"{float(cfg):g}"
+
+
+def build_cfg_json(
+    dataset_name: str,
+    attack_types: Sequence[str],
+    attack_budgets: Sequence[float],
+    eval_cfgs: Sequence[float],
+    success_rate_thresholds: Sequence[float],
+    n_images: int,
+    samples: Dict[str, Dict[int, Dict[float, List[float]]]],
+    num_steps: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Assemble the guidance-scale JSON consumed by ``plot_cfg_success_rate``.
+
+    ``samples[attack_type][budget_idx][cfg]`` is the list of per-image final-step
+    displacements (km) measured at that guidance scale. Mirrors
+    ``build_sampling_steps_json`` with the guidance scale as the swept axis.
+    """
+    eval_cfgs = [float(c) for c in eval_cfgs]
+    json_results: Dict[str, Any] = {
+        "dataset": dataset_name,
+        "attack_types": list(attack_types),
+        "attack_budgets": list(attack_budgets),
+        "eval_cfgs": eval_cfgs,
+        "num_steps": int(num_steps) if num_steps is not None else None,
+        "success_rate_thresholds_km": list(success_rate_thresholds),
+        "n_images": int(n_images),
+        "results": {},
+    }
+    for at in attack_types:
+        json_results["results"][at] = {}
+        for budget_idx, budget in enumerate(attack_budgets):
+            bkey = _budget_key(budget)
+            json_results["results"][at][bkey] = {}
+            for cfg in eval_cfgs:
+                disps = samples[at][budget_idx].get(cfg, [])
+                success_rates = {
+                    str(thr): float(np.mean([d > thr for d in disps])) if disps else float("nan")
+                    for thr in success_rate_thresholds
+                }
+                json_results["results"][at][bkey][_cfg_key(cfg)] = {
+                    "mean_displacement_km": float(np.mean(disps)) if disps else float("nan"),
+                    "success_rates": success_rates,
+                }
+    return json_results
+
+
+# --------------------------------------------------------------------------- #
 # Cross-model transfer ablation
 # --------------------------------------------------------------------------- #
 #
