@@ -39,10 +39,14 @@ fi
 ATTACK="${ATTACK_TYPES[$ATTACK_IDX]}"
 WINDOW_START=$(( WINDOW_IDX * IMAGES_PER_SHARD ))
 
+build_ablation_flags   # -> ABLATION_FLAGS (from the RUN_* toggles in config.sh)
+
 echo "=============================================================="
 echo "Shard task ${TASK}: attack='${ATTACK}' window ${WINDOW_IDX}/${NUM_WINDOWS}"
 echo "  images [${WINDOW_START}:$(( WINDOW_START + IMAGES_PER_SHARD ))) of ${TOTAL_IMAGES}"
 echo "  budgets=${BUDGETS_OVERRIDE}  parallel_workers=${PARALLEL_WORKERS}"
+echo "  ablations: ${ABLATION_FLAGS[*]}"
+echo "  overrides: ${OVERRIDE_FLAGS[*]}"
 echo "=============================================================="
 
 module purge 2>/dev/null || true
@@ -60,10 +64,7 @@ srun python main.py evaluate-dataset-shard \
   --image-shard-index "${WINDOW_IDX}" \
   --results-dir "${RESULTS_BASE}" \
   --parallel-workers "${PARALLEL_WORKERS}" \
-  --run-sampling-steps-ablation \
-  --run-robustness-ablation \
-  --run-model-transfer-ablation \
-  --eval-num-steps "${EVAL_NUM_STEPS[@]}" \
-  --override "attack_budgets.${DATASET}=${BUDGETS_OVERRIDE}"
+  "${ABLATION_FLAGS[@]}" \
+  "${OVERRIDE_FLAGS[@]}"
 
 echo "Shard task ${TASK} done."

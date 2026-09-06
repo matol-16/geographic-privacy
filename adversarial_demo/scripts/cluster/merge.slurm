@@ -29,18 +29,21 @@ module purge 2>/dev/null || true
 activate_env
 export MPLBACKEND=Agg
 
+build_ablation_flags   # -> ABLATION_FLAGS (must match the shards being stitched)
+
+echo "Merging attacks: ${MERGE_ATTACK_TYPES[*]}"
+echo "  ablations: ${ABLATION_FLAGS[*]}"
+echo "  overrides: ${OVERRIDE_FLAGS[*]}"
+
 cd "${PROJECT_DIR}"
 python main.py merge-shards \
   --config "${CONFIG_PATH}" \
   --dataset "${DATASET}" \
-  --attack-types "${ATTACK_TYPES[@]}" \
+  --attack-types "${MERGE_ATTACK_TYPES[@]}" \
   --total-images "${TOTAL_IMAGES}" \
   --results-dir "${RESULTS_BASE}" \
   --plots-dir "${PLOTS_DIR}" \
-  --run-sampling-steps-ablation \
-  --run-robustness-ablation \
-  --run-model-transfer-ablation \
-  --eval-num-steps "${EVAL_NUM_STEPS[@]}" \
-  --override "attack_budgets.${DATASET}=${BUDGETS_OVERRIDE}"
+  "${ABLATION_FLAGS[@]}" \
+  "${OVERRIDE_FLAGS[@]}"
 
 echo "Merge done. Results in ${RESULTS_BASE}, plots in ${PLOTS_DIR}."
