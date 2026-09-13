@@ -23,6 +23,7 @@ from typing import Optional, Sequence
 
 import numpy as np
 
+from utils.plots.common import output_stem
 from utils.plots.style import _ATTACK_COLOR_ORDER, attack_color
 
 _PDFLATEX = shutil.which("pdflatex")
@@ -52,12 +53,14 @@ _PREAMBLE = r"""\documentclass[tikz,border=2pt]{{standalone}}
 # given attack always agree across every figure -- an attack should be
 # identifiable by color *or* shape alone (colorblind-safe, grayscale-safe).
 _ATTACK_MARKERS = ["*", "square*", "triangle*", "star", "diamond*",
-                   "pentagon*", "+", "10-pointed star", "x", "asterisk"]
+                   "pentagon*", "+", "10-pointed star", "x", "asterisk",
+                   "halfcircle*", "|"]
 # "oplus*"/"otimes*" (circle + plus/cross) render as plain filled circles in
 # this pgfplots version -- indistinguishable from "*" -- so plain "+"/"x" are
 # used instead, which actually show their shape at these small mark sizes.
 _ATTACK_PATTERNS = ["north east lines", "horizontal lines", "vertical lines", "crosshatch", "dots",
-                    "north west lines", "grid", "crosshatch dots", "bricks", "fivepointed stars"]
+                    "north west lines", "grid", "crosshatch dots", "bricks", "fivepointed stars",
+                    "sixpointed stars", "checkerboard"]
 
 
 def attack_marker(attack_type: str) -> str:
@@ -85,7 +88,7 @@ _THIN_MARKERS = {"star", "asterisk", "10-pointed star", "+", "x"}
 
 def attack_mark_size(attack_type: str, base_pt: float = 1.3) -> str:
     size = base_pt * 1.6 if attack_marker(attack_type) in _THIN_MARKERS else base_pt
-    # DTD is this paper's own attack -- give it a further size bump on top of
+    # GeoFA-TD (key `dtd`) is this paper's headline attack -- give it a further size bump on top of
     # the thin-marker boost so it visibly stands out from the baselines.
     if str(attack_type).lower() == "dtd":
         size *= 1.2
@@ -93,7 +96,7 @@ def attack_mark_size(attack_type: str, base_pt: float = 1.3) -> str:
 
 
 def attack_line_width(attack_type: str, base_pt: float = 1.4) -> str:
-    """Line width for a line-plot series -- DTD gets a bit thicker so it reads
+    """Line width for a line-plot series -- GeoFA-TD gets a bit thicker so it reads
     as this paper's own attack among the baselines."""
     size = base_pt * 1.25 if str(attack_type).lower() == "dtd" else base_pt
     return f"{size:.2g}pt"
@@ -152,7 +155,7 @@ def bar_legend_image_code(color_name: str, pattern: str, pattern_color: str) -> 
 
 
 def attacks_dtd_last(attack_types: Sequence[str]) -> list[str]:
-    """Reorder so DTD (this paper's attack) is always last -- the rightmost column,
+    """Reorder so GeoFA-TD (key `dtd`, this paper's headline attack) is always last -- the rightmost column,
     bar, or facet in every figure that lays attacks out spatially -- while every
     other attack keeps its relative order."""
     attack_types = list(attack_types)
@@ -175,6 +178,9 @@ def tex_escape(text: str) -> str:
         "\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "$": r"\$",
         "#": r"\#", "_": r"\_", "{": r"\{", "}": r"\}",
         "~": r"\textasciitilde{}", "^": r"\textasciicircum{}",
+        # Unicode superscript two (used by the "GeoFA-L\u00b2" label): T1-encoded
+        # pdflatex has no glyph for it, so typeset it in math mode instead.
+        "\u00b2": r"$^{2}$",
     }
     return "".join(replacements.get(ch, ch) for ch in str(text))
 
@@ -307,6 +313,10 @@ def render_tikz(body: str, plot_dir: str, filename_stem: str, extra_preamble: st
     PNG preview. Returns the paths actually produced (missing ones are ``None``)."""
     tikz_dir = os.path.abspath(os.path.join(plot_dir, "tikz"))
     os.makedirs(tikz_dir, exist_ok=True)
+    # Process-wide suffix (``--filename-suffix``, e.g. "_appendix") lands on the
+    # .tex/.pdf/.png stems; any ``.dat`` companions written by the caller keep
+    # the bare stem, which is fine since they hold the same data either way.
+    filename_stem = output_stem(filename_stem)
     tex_path = os.path.join(tikz_dir, f"{filename_stem}.tex")
     with open(tex_path, "w") as f:
         f.write(_PREAMBLE.format(extra_preamble=extra_preamble, body=body))

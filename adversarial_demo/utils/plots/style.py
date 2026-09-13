@@ -19,11 +19,15 @@ import matplotlib.pyplot as plt
 _ATTACK_COLOR_ORDER = [
     "encoder", "sampling", "diffusion_l2", "dtd", "diffusion",
     "ace", "unidef", "unidef_nofdje", "geoshield", "training_loss",
+    "targeted_l2", "dtd_blur",
 ]
-# Okabe-Ito colorblind-safe qualitative palette (standard choice for CV papers).
+# Okabe-Ito colorblind-safe qualitative palette (standard choice for CV papers),
+# extended with two Tol colors (wine, teal) for the later attacks -- a fixed slot,
+# because the hash() fallback below is randomized per Python process.
 _ATTACK_PALETTE = [
     "#0072B2", "#E69F00", "#009E73", "#D55E00", "#CC79A7",
     "#56B4E9", "#F0E442", "#000000", "#999999", "#8B4513",
+    "#882255", "#44AA99",
 ]
 
 

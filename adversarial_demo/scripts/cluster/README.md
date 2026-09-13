@@ -12,8 +12,8 @@ Three experiments are wrapped as one-command presets. Run them from this directo
 
 ```bash
 ./preset_targeted_l2.sh yfcc    # TargetedL2  -> folds into yfcc4k_full   (40 jobs)
-./preset_targeted_l2.sh osv     # TargetedL2  -> folds into osv_5k_full   (50 jobs, + replot step)
-./preset_dtd_blur.sh            # DTD-blur robustness ablation            (40 jobs)
+./preset_targeted_l2.sh osv     # TargetedL2  -> folds into cluster_eval_2/osv_full (50 jobs, + replot step)
+./preset_dtd_blur.sh            # GeoFA-TD-blur robustness ablation       (40 jobs)
 ./preset_cfg_ablation.sh        # guidance-scale (cfg) sweep              (80 jobs)
 ```
 
@@ -92,22 +92,21 @@ results **in place**:
 
 ```bash
 ./preset_targeted_l2.sh yfcc          # -> results/cluster_eval/yfcc4k_full
-./preset_targeted_l2.sh osv           # -> results/cluster_eval/osv_5k_full
+./preset_targeted_l2.sh osv           # -> results/cluster_eval_2/osv_full
 ```
 
 - **YFCC**: `yfcc4k_full` still has every attack's shards, so this computes only the
   `targeted_l2` shards and the merge stitches the **full** attack set (existing 8 +
   targeted_l2) back into the combined results, ablation JSONs and plots. One command.
-- **OSV**: `osv_5k_full` keeps the merged per-attack `.pt` files but **not** the shards,
-  so the merge stitches only `targeted_l2` (→ `osv_targeted_l2_results.pt`, its own
-  figures in `plots_targeted_l2/`). To rebuild the *combined* OSV figures across all
-  attacks, run the printed follow-up:
+- **OSV**: `cluster_eval_2/osv_full` keeps the merged per-attack `.pt` files but **not**
+  the shards, so the merge stitches only `targeted_l2` (→ `osv_targeted_l2_results.pt`,
+  its own figures in `plots_targeted_l2/`). To rebuild the *combined* OSV figures across
+  all attacks (main + appendix layout), run the printed follow-up:
   ```bash
-  ./replot_combined.sh osv \
-    "encoder sampling dtd ace training_loss unidef targeted_l2" \
-    results/cluster_eval/osv_5k_full
+  ../make_paper_figures.sh osv          # then: python ../make_success_rate_table.py
   ```
-  `replot_combined.sh` reads only the saved `.pt` files (no GPU, seconds).
+  It reads only the saved `.pt`/`.json` files (no GPU); `targeted_l2` is already in
+  its attack lists and is simply skipped until its results file exists.
 
 The robustness transform grid is pinned (`EXTRA_OVERRIDES_STR`) to the JPEG/blur levels
 the original runs used, so targeted_l2 lines up point-for-point with the other attacks.
@@ -115,8 +114,8 @@ the original runs used, so targeted_l2 lines up point-for-point with the other a
 ### `preset_dtd_blur.sh` — blur-robustness ablation on YFCC4k
 
 Tests whether training the perturbation with **additional noise** buys robustness to
-Gaussian blur. `dtd_blur` is an expectation-over-transformation variant of DTD: each step
-the DTD loss is evaluated on the clean protected image *and* a blurred copy at a random
+Gaussian blur. `dtd_blur` is an expectation-over-transformation variant of GeoFA-TD (attack key `dtd`): each step
+the GeoFA-TD loss is evaluated on the clean protected image *and* a blurred copy at a random
 sigma (config `attack_train_args.yfcc.per_attack.dtd_blur`: `blur_sigma_min/max`,
 `blur_loss_weight`), whereas plain `dtd` trains on the clean image only.
 

@@ -20,7 +20,11 @@ from typing import Any, Optional, Sequence
 
 import numpy as np
 
-from utils.plots.ablations import DEFAULT_ABLATION_EPS, _get_clean_vs_attacked_true_samples
+from utils.plots.ablations import (
+    DEFAULT_ABLATION_EPS,
+    _get_clean_vs_attacked_true_samples,
+    conditional_quantile_curves,
+)
 from utils.plots.common import (
     _display_attack_name,
     _get_metric_samples_by_budget,
@@ -29,6 +33,7 @@ from utils.plots.common import (
     _select_displacement_metric,
     _summarize_samples,
     select_closest_budget,
+    select_thresholds,
 )
 from utils.plots_tikz.common import (
     SINGLE_MARK_LEGEND_IMAGE,
@@ -287,7 +292,7 @@ def plot_attack_dtd_variance_tikz(
         "boxplot/draw direction=y",
         f"xtick={{{ticks}}}", f"xticklabels={{{labels}}}",
         "x tick label style={rotate=30, anchor=east}",
-        "ylabel={Final-step displacement --- ``DTD'' (km)}",
+        "ylabel={Final-step displacement (km)}",
         "grid=major", "grid style={gray!25}", "ymajorgrids",
         f"width={width_cm:.1f}cm", "height=6.5cm",
     ])
@@ -388,6 +393,8 @@ def plot_clean_vs_attacked_displacement_tikz(
     attack_types=None,
     all_results=None,
     eps: float = DEFAULT_ABLATION_EPS,
+    n_cols: Optional[int] = None,
+    attack_budgets_per_type: Optional[dict] = None,
 ):
     """TikZ twin of ``utils.plots.ablations.plot_clean_vs_attacked_displacement``.
 
@@ -398,16 +405,36 @@ def plot_clean_vs_attacked_displacement_tikz(
     diagonal ridge), hiding where the mass actually concentrates. Each panel
     keeps its own attack color as a white-to-hue sequential ramp (density,
     not identity, is the encoded variable here -- every panel is already
-    single-attack) so the figure still reads as "this is Encoder's panel,
-    this is DTD's panel" at a glance. A shared log-log axis range across
+    single-attack) so the figure still reads as "this is GeoFA-enc.'s panel,
+    this is GeoFA-TD's panel" at a glance. A shared log-log axis range across
     panels keeps them directly comparable.
+
+    ``n_cols`` caps the panels per row (default 4, i.e. two rows for the full
+    eight-attack set). The main-paper figure passes the five headline attacks
+    with ``n_cols=5`` so they sit on a single line; the appendix version keeps
+    the default grid with every attack.
+
+    Each panel also carries the binned conditional median and interquartile
+    band of the attacked FSD (``conditional_quantile_curves``): Pearson r alone
+    is easy to miss in a density plot, but a band that stays detached from the
+    y=x diagonal even for well-localized images (attacked FSD independent of
+    the clean FSD -- GeoFA-TD / GeoFA-L2) versus one whose lower edge collapses
+    onto the diagonal (a share of images left unchanged) is visible at a glance.
+
+    ``attack_budgets_per_type`` overrides the budget axis of individual attacks
+    whose results come from a different run (``main.py plot --extra-results``),
+    so the ``eps`` budget is looked up in *that* run's budget list. Panels with
+    fewer samples than the rest state their ``n`` in the title.
     """
     if all_results is None:
         all_results = _load_attack_results(results_dir, dataset_name, attack_types)
     attack_types = attacks_dtd_last(attack_types)
+    attack_budgets_per_type = attack_budgets_per_type or {}
 
-    budget = select_closest_budget(attack_budgets, eps)
-    budget_idx = int(np.argmin(np.abs(np.asarray(attack_budgets, dtype=np.float64) - budget)))
+    def _budget_idx(attack_type):
+        budgets = attack_budgets_per_type.get(attack_type, attack_budgets)
+        chosen = select_closest_budget(budgets, eps)
+        return int(np.argmin(np.abs(np.asarray(budgets, dtype=np.float64) - chosen)))
 
     tikz_dir = os.path.join(plot_dir, "tikz")
     os.makedirs(tikz_dir, exist_ok=True)
@@ -419,7 +446,7 @@ def plot_clean_vs_attacked_displacement_tikz(
         res = all_results.get(attack_type)
         if res is None:
             continue
-        pairs = _get_clean_vs_attacked_true_samples(res, budget_idx)
+        pairs = _get_clean_vs_attacked_true_samples(res, _budget_idx(attack_type))
         if pairs is None:
             continue
         baseline, attacked = pairs
@@ -437,6 +464,7 @@ def plot_clean_vs_attacked_displacement_tikz(
             "No paired (clean, attacked) true-GPS displacement samples available -- this "
             "requires results saved with restart-level 'gps_source'/'true_gps' data."
         )
+    n_max = max(b.size for _, b, _, _ in panels)
 
     combined = np.concatenate(all_vals)
     positive = combined[combined > 0]
@@ -447,7 +475,7 @@ def plot_clean_vs_attacked_displacement_tikz(
     lo = float(np.percentile(positive, 2)) * 0.6 if positive.size else 1.0
     hi = float(combined.max()) * 1.3
 
-    n_cols = min(4, len(panels))
+    n_cols = min(4 if n_cols is None else max(1, int(n_cols)), len(panels))
     n_rows = int(np.ceil(len(panels) / n_cols))
 
     # Shared log-space bin grid across every panel -- same reasoning as the
@@ -484,11 +512,23 @@ def plot_clean_vs_attacked_displacement_tikz(
                         {"clean": xs_flat, "attacked": ys_flat, "density": zs_flat})
 
         r_label = f"r = {r:.2f}" if r is not None else "r = n/a"
-        title = tex_escape(f"{_display_attack_name(attack_type)} ({r_label})")
+        # A panel drawn from a smaller run (e.g. a 100-image pilot standing in
+        # for a full evaluation) says so, otherwise its sparser density would
+        # read as a weaker attack.
+        if baseline.size < n_max:
+            r_label += f", n = {baseline.size}"
+        # Two-line title (name / correlation): on the single-row headline layout
+        # the panels sit 0.5cm apart, and "GeoFA-AdvDM (r = 0.16)" on one line
+        # runs into its neighbours.
+        title = tex_escape(_display_attack_name(attack_type)) + "\\\\" + tex_escape(f"({r_label})")
         opts = [
-            f"title={{{title}}}", "xmode=log", "ymode=log", "view={0}{90}", "axis on top",
+            f"title={{{title}}}", "title style={align=center}",
+            "xmode=log", "ymode=log", "view={0}{90}", "axis on top",
             f"xmin={lo:.4g}", f"xmax={hi:.4g}", f"ymin={lo:.4g}", f"ymax={hi:.4g}",
-            "grid=both", "grid style={dashed, gray!25}",
+            # Major grid only: the grid sits on top of the density surface
+            # ("axis on top"), and log minor lines (8 per decade) stripe every
+            # panel when the data spans only a few decades (the OSV case).
+            "grid=major", "grid style={dashed, gray!25}",
             f"colormap name={colormap_name}", "point meta min=0", f"point meta max={density_max:.6g}",
         ]
         if col == 0:
@@ -501,18 +541,45 @@ def plot_clean_vs_attacked_displacement_tikz(
             f"\\addplot[black, dashed, thick, mark=none, forget plot] "
             f"{coordinates([lo, hi], [lo, hi])};",
         ]
+        # Conditional interquartile band + median curve, drawn over the density
+        # (white halo under the median so it stays legible on the darkest bins
+        # of its own hue). The band is a closed polygon (lower edge forward,
+        # upper edge back) rather than ``fill between``, which pgfplots places
+        # on its "pre main" layer -- i.e. hidden underneath the surf plot.
+        mx, qs = conditional_quantile_curves(baseline, attacked)
+        if mx.size:
+            dark = darken_hex(hexcode, 0.55)
+            colors[f"{color_name}Dark"] = dark
+            band_x = np.concatenate([mx, mx[::-1]])
+            band_y = np.concatenate([qs[25], qs[75][::-1]])
+            entries += [
+                f"\\addplot[fill={color_name}Dark, fill opacity=0.22, draw={color_name}Dark, "
+                f"draw opacity=0.9, line width=0.5pt, forget plot] "
+                f"{coordinates(band_x, band_y)} --cycle;",
+                f"\\addplot[white, line width=2.6pt, mark=*, mark size=2.1pt, "
+                f"mark options={{fill=white, draw=white}}, forget plot] {coordinates(mx, qs[50])};",
+                f"\\addplot[{color_name}Dark, line width=1.3pt, mark=*, mark size=1.4pt, "
+                f"mark options={{fill={color_name}Dark, draw={color_name}Dark}}, forget plot] "
+                f"{coordinates(mx, qs[50])};",
+            ]
         group_axes.append(f"\\nextgroupplot[{', '.join(opts)}]\n" + "\n".join(entries))
 
     # One shared density legend for the whole grid (not per-panel, since every
     # panel uses the same light-to-dark convention, just tinted with its own
     # attack hue): a plain gray gradient swatch is enough to say what shade
     # means what, without implying it's tied to any single panel's color.
+    # ...plus the two line encodings shared by every panel (median curve, y=x).
     density_legend = (
         "\\begin{scope}[shift={($(current bounding box.north)+(0,0.4cm)$)}]\n"
         "\\shade[left color=white, right color=black, draw=black, line width=0.3pt] "
-        "(-1.4,0) rectangle (1.4,0.28);\n"
-        "\\node[anchor=east, font=\\small] at (-1.55,0.14) {Low density};\n"
-        "\\node[anchor=west, font=\\small] at (1.55,0.14) {High density};\n"
+        "(-5.2,0) rectangle (-2.8,0.28);\n"
+        "\\node[anchor=east, font=\\small] at (-5.35,0.14) {Low density};\n"
+        "\\node[anchor=west, font=\\small] at (-2.65,0.14) {High density};\n"
+        "\\fill[black!45, opacity=0.3] (0.2,-0.04) rectangle (1.0,0.32);\n"
+        "\\draw[black!45, line width=1.3pt] (0.2,0.14) -- (1.0,0.14) "
+        "node[pos=0.5, circle, fill=black!45, inner sep=1.4pt] {};\n"
+        "\\node[anchor=west, font=\\small] at (1.1,0.14) "
+        "{median (band: 25--75\\%) of attacked FSD per clean-FSD bin};\n"
         "\\end{scope}"
     )
 
@@ -838,8 +905,8 @@ def plot_model_transfer_success_rate_tikz(
     is "does this attack transfer across backbones", which reads directly off
     a single cluster once the attack is the group, whereas grouping by model
     (the original layout) scattered that comparison across separate clusters.
-    Restricted to the headline attacks -- UniDef, DTD, Sampling, Encoder, and
-    GeoShield when the dataset has it -- so the chart isn't cluttered with
+    Restricted to the headline attacks -- GeoFA-UniDef, GeoFA-TD, GeoFA-sample,
+    GeoFA-enc., and GeoShield when the dataset has it -- so the chart isn't cluttered with
     every ablation baseline.
     """
     model_labels = json_results["model_labels"]
@@ -943,19 +1010,23 @@ def plot_robustness_results_tikz(
     json_results: dict,
     plot_dir: str,
     eps: float = DEFAULT_ABLATION_EPS,
+    thresholds: Optional[Sequence[float]] = None,
 ) -> dict:
-    """TikZ twin of ``utils.plots.ablations.plot_robustness_results`` -- only
-    the 200km and 2500km distance thresholds, laid out as a single row, and a
+    """TikZ twin of ``utils.plots.ablations.plot_robustness_results``, with a
     JPEG quality=100 point synthesized from the Gaussian-blur-sigma=0 level
     (quality=100 / sigma=0 are both "no transform applied", so they share the
     same success rate -- the robustness sweep just never evaluated
     quality=100 explicitly under the JPEG branch).
+
+    ``thresholds`` picks the success-rate thresholds drawn (see
+    ``select_thresholds``): the default 2500 km alone gives the main-paper
+    figure -- one row, JPEG | blur; every threshold gives the appendix
+    figure -- one row per threshold so the grid stays column-width.
     """
     attack_types = attacks_dtd_last(json_results["attack_types"])
     attack_budgets = json_results["attack_budgets"]
     dataset = json_results["dataset"]
-    _HEADLINE_THRESHOLDS = [200, 2500]
-    thresholds = [t for t in _HEADLINE_THRESHOLDS if t in json_results["success_rate_thresholds_km"]]
+    thresholds = select_thresholds(json_results["success_rate_thresholds_km"], thresholds)
     # Success rate against the *true* GPS (not the clean prediction) -- the
     # primary metric used everywhere else in this evaluation. The JSON may
     # also carry a "predicted" metric, but it renders with identical styling
@@ -966,7 +1037,10 @@ def plot_robustness_results_tikz(
     bkey = f"budget_{budget:.6f}"
 
     transforms = [("JPEG quality factor", "jpeg"), ("Gaussian blur $\\sigma$", "blur")]
-    n_cols = len(thresholds) * len(transforms)
+    # Rows are thresholds, columns are transforms -- with the single headline
+    # threshold that collapses to the one-row JPEG | blur strip.
+    n_cols = len(transforms)
+    n_rows = len(thresholds)
 
     def _sorted_levels(level_dict: dict):
         items = sorted(level_dict.items(), key=lambda kv: float(kv[0]))
@@ -1009,22 +1083,26 @@ def plot_robustness_results_tikz(
                 lines.append(line)
 
     panel_w, panel_h, h_sep = SUCCESS_RATE_PANEL_W, SUCCESS_RATE_PANEL_H, SUCCESS_RATE_H_SEP
-    v_sep = h_sep
+    # Row gaps have to fit a bottom xlabel *and* the next row's title (see
+    # plot_robustness_and_sampling_steps_tikz); irrelevant for the 1-row case.
+    v_sep = 2.2
     # The single shared legend spans the *entire* row (every panel), so it's
     # centered relative to the very first axis.
     legend_x = groupplot_legend_center_x(n_cols, panel_w, h_sep)
 
+    # groupplot fills row-major, so emit row (threshold) by row, column
+    # (transform) by column.
     group_axes = []
-    for col_idx, (xlabel, json_key) in enumerate(transforms):
-        for thr_idx, thr in enumerate(thresholds):
+    for thr_idx, thr in enumerate(thresholds):
+        for col_idx, (xlabel, json_key) in enumerate(transforms):
             opts = [
                 "ymin=0.3", "ymax=1", "grid=major", "grid style={gray!25}",
                 f"title={{Displacement > {thr} km}}",
             ]
-            # Every panel sits on the same row, so every panel gets its own
-            # transform-type xlabel (no bottom-row-only special case needed).
+            # Each row is a separate axis, so every panel carries its own
+            # transform-type xlabel rather than a bottom-row-only one.
             opts.append(f"xlabel={{{xlabel}}}")
-            if col_idx == 0 and thr_idx == 0:
+            if col_idx == 0:
                 opts.append("ylabel={Attack success rate}")
             if json_key == "jpeg":
                 opts.append("x dir=reverse")
@@ -1036,7 +1114,7 @@ def plot_robustness_results_tikz(
             group_axes.append(f"\\nextgroupplot[{', '.join(opts)}]\n" + "\n".join(blocks))
 
     body = (
-        f"\\begin{{groupplot}}[group style={{group size={n_cols} by 1, "
+        f"\\begin{{groupplot}}[group style={{group size={n_cols} by {n_rows}, "
         f"horizontal sep={h_sep}cm, vertical sep={v_sep}cm}}, width={panel_w}cm, height={panel_h}cm]\n"
         + "\n".join(group_axes) + "\n\\end{groupplot}"
     )
@@ -1048,12 +1126,14 @@ def plot_robustness_and_sampling_steps_tikz(
     sampling_steps_json: dict,
     plot_dir: str,
     eps: float = DEFAULT_ABLATION_EPS,
+    thresholds: Optional[Sequence[float]] = None,
 ) -> dict:
-    """Combined robustness figure: rows are the 200km/2500km success-rate
-    thresholds, columns are the three robustness axes -- Gaussian blur, JPEG
-    compression, and sampling steps. The blur/jpeg columns only cover the
+    """Combined robustness figure: one row per success-rate threshold (the
+    2500 km headline by default, every threshold for the appendix -- see
+    ``select_thresholds``), columns are the three robustness axes -- Gaussian
+    blur, JPEG compression, and sampling steps. The blur/jpeg columns only cover the
     attacks common to both ablations (geoshield/dtd/encoder/sampling), since
-    L2 and AdvDM never got a robustness sweep (see
+    GeoFA-L2 and GeoFA-AdvDM never got a robustness sweep (see
     plot_robustness_results_tikz's docstring) -- but they *did* get a
     sampling-steps sweep, so they still appear in that column and in the
     shared legend (registered there via a legend-only ``\\addlegendimage``,
@@ -1062,13 +1142,12 @@ def plot_robustness_and_sampling_steps_tikz(
     (SUCCESS_RATE_PANEL_W/H/H_SEP) so this figure sits at the same visual
     scale as those.
     """
-    _HEADLINE_THRESHOLDS = [200, 2500]
-    thresholds = [t for t in _HEADLINE_THRESHOLDS if t in robustness_json["success_rate_thresholds_km"]]
+    thresholds = select_thresholds(robustness_json["success_rate_thresholds_km"], thresholds)
     metric = "true"
     dataset = robustness_json["dataset"]
 
     common_attack_types = [a for a in robustness_json["attack_types"] if a in sampling_steps_json["attack_types"]]
-    # L2 (diffusion_l2) / AdvDM (training_loss): sampling-steps-only attacks,
+    # GeoFA-L2 (diffusion_l2) / GeoFA-AdvDM (training_loss): sampling-steps-only attacks,
     # requested in addition to the common set even though they can't appear
     # in the blur/jpeg columns.
     extra_attack_types = [

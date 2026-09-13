@@ -27,7 +27,12 @@ PROJECT_DIR="$(cd "${HERE}/.." && pwd)"
 # Use the plonk conda env's python (the base env lacks plonk); override with PYTHON=...
 PYTHON="${PYTHON:-/Data/mathias.ollu/conda/plonk/bin/python}"
 # Write next to the attack results so --stage plot can find both. Override with RESULTS_BASE=...
-RESULTS_BASE="${RESULTS_BASE:-${PROJECT_DIR}/results/cluster_eval/${DATASET}4k_full}"
+# (yfcc -> cluster_eval/yfcc4k_full, osv -> cluster_eval_2/osv_full: the current full runs.)
+if [[ "${DATASET}" == "osv" ]]; then
+  RESULTS_BASE="${RESULTS_BASE:-${PROJECT_DIR}/results/cluster_eval_2/osv_full}"
+else
+  RESULTS_BASE="${RESULTS_BASE:-${PROJECT_DIR}/results/cluster_eval/yfcc4k_full}"
+fi
 
 echo "=============================================================="
 echo "Localizability precompute (local, single GPU)"
@@ -47,7 +52,7 @@ cd "${PROJECT_DIR}"
 
 echo
 echo "Done. Scores in ${RESULTS_BASE}/localizability_shards/"
-echo "Once the attack results are on disk, plot with:"
+echo "Once the attack results are on disk, plot with (part of scripts/make_paper_figures.sh):"
 echo "  ${PYTHON} main.py evaluate-localizability --stage plot --dataset ${DATASET} \\"
-echo "    --attack-types dtd encoder unidef ace sampling diffusion_l2 geoshield \\"
+echo "    --attack-types geoshield training_loss sampling diffusion_l2 dtd \\"
 echo "    --results-dir ${RESULTS_BASE} --plots-dir ${RESULTS_BASE}/plots"

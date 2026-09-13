@@ -178,11 +178,34 @@ def _select_displacement_metric(gps_true: bool) -> str:
     return "final_step_displacement_true" if gps_true else "final_step_displacement_predicted"
 
 
+# Success-rate threshold the main-paper robustness figures are pinned to; the
+# appendix versions pass every threshold in the JSON instead.
+HEADLINE_ROBUSTNESS_THRESHOLDS_KM = (2500.0,)
+
+
+def select_thresholds(available, requested=None) -> list:
+    """Pick the success-rate thresholds (km) to draw, in the JSON's own order/type.
+
+    ``requested=None`` -> the 2500 km headline only; ``requested="all"`` -> every
+    available threshold; otherwise the requested values that exist (matched
+    numerically, so ``2500`` / ``2500.0`` / ``"2500"`` all work). Raises if nothing
+    matches, since a silently empty figure is worse than a loud failure.
+    """
+    available = list(available)
+    if isinstance(requested, str) and requested.lower() == "all":
+        return available
+    wanted = list(HEADLINE_ROBUSTNESS_THRESHOLDS_KM) if requested is None else [float(t) for t in requested]
+    picked = [t for t in available if any(abs(float(t) - w) < 1e-6 for w in wanted)]
+    if not picked:
+        raise ValueError(f"None of the requested thresholds {wanted} are in the results ({available}).")
+    return picked
+
+
 def select_closest_budget(attack_budgets, target_eps: float) -> float:
     """Return the value in ``attack_budgets`` closest to ``target_eps``.
 
     Used by the ablation plots (robustness, model-transfer, sampling-steps,
-    DTD-variance) to pin every panel to a single attack budget instead of
+    per-attack spread) to pin every panel to a single attack budget instead of
     drawing one line/box per budget.
     """
     arr = np.asarray(attack_budgets, dtype=np.float64).reshape(-1)
@@ -193,29 +216,64 @@ def select_closest_budget(attack_budgets, target_eps: float) -> float:
 
 
 def _display_attack_name(attack_name: str) -> str:
+    """Paper-facing label for an attack key.
+
+    Every attack evaluated here except GeoShield is an instance of the GeoFA
+    framework (Geographic Flow Attacks), so all of them carry the ``GeoFA-``
+    prefix; the suffix names the loss/target the instance optimizes. Code keys,
+    CLI flags and file names are unchanged (``dtd`` is still the headline
+    trajectory-deviation attack, now labelled "GeoFA-TD").
+
+    The superscript in "GeoFA-L\u00b2" is a plain unicode character so it renders
+    in matplotlib as-is; ``utils.plots_tikz.common.tex_escape`` turns it into
+    math mode for the pgfplots backend.
+    """
     normalized = str(attack_name).lower()
-    # DTD = Diffusion Trajectory Deviation (raw cosine-similarity objective).
+    # --- GeoFA framework ---
     if normalized in ("dtd", "diffusion_cosine_neg"):
-        return "DTD"
+        return "GeoFA-TD"
+    if normalized == "dtd_blur":
+        return "GeoFA-TD-blur"
+    if normalized == "targeted_l2":
+        return "GeoFA-DPA"
     if normalized == "diffusion":
-        return "Diffusion"
+        return "GeoFA-diffusion"
     if normalized in ("sampling", "diffusion_salman", "salman"):
-        return "Sampling"
+        return "GeoFA-sample"
     if normalized == "diffusion_l2":
-        return "L2"
-    if normalized == "ace":
-        return "ACE"
-    if normalized == "unidef":
-        return "UniDef"
-    if normalized == "unidef_nofdje":
-        return "UniDef (no FDJE)"
+        return "GeoFA-L\u00b2"
     if normalized == "encoder":
-        return "Encoder"
+        return "GeoFA-enc."
+    if normalized == "training_loss":
+        return "GeoFA-AdvDM"
+    if normalized == "ace":
+        return "GeoFA-ACE"
+    if normalized == "unidef":
+        return "GeoFA-UniDef"
+    if normalized == "unidef_nofdje":
+        return "GeoFA-UniDef (no FDJE)"
+    # --- external baseline (its own pipeline, not a GeoFA instance) ---
     if normalized == "geoshield":
         return "GeoShield"
-    if normalized == "training_loss":
-        return "AdvDM"
     return str(attack_name).replace("_", " ").title()
+
+
+# Process-wide suffix appended to every figure/JSON/TikZ output stem (e.g.
+# "_appendix"). Set once per CLI invocation via ``set_plot_filename_suffix``
+# (``main.py plot --filename-suffix``); the default (empty) leaves every
+# existing file name untouched, so merge-shards / evaluate-dataset are unaffected.
+_PLOT_FILENAME_SUFFIX = ""
+
+
+def set_plot_filename_suffix(suffix: Optional[str]) -> None:
+    """Append ``suffix`` to the stem of every plot file written from now on."""
+    global _PLOT_FILENAME_SUFFIX
+    _PLOT_FILENAME_SUFFIX = str(suffix or "")
+
+
+def output_stem(filename_stem: str) -> str:
+    """``filename_stem`` with the process-wide suffix applied (see ``set_plot_filename_suffix``)."""
+    return f"{filename_stem}{_PLOT_FILENAME_SUFFIX}"
 
 
 def save_plot_json(plot_dir: Optional[str], filename_stem: str, payload: dict) -> Optional[str]:
@@ -227,7 +285,7 @@ def save_plot_json(plot_dir: Optional[str], filename_stem: str, payload: dict) -
     if plot_dir is None:
         return None
     os.makedirs(plot_dir, exist_ok=True)
-    path = os.path.join(plot_dir, f"{filename_stem}.json")
+    path = os.path.join(plot_dir, f"{output_stem(filename_stem)}.json")
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
     print(f"Saved plot data to: {path}")

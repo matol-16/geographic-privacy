@@ -20,6 +20,7 @@ from utils.plots.common import (
     _get_metric_samples_by_budget,
     _load_attack_results,
     _select_displacement_metric,
+    output_stem,
     _summarize_samples,
     save_plot_json,
 )
@@ -34,7 +35,7 @@ def _savefig(fig, plot_dir: str, filename_stem: str) -> None:
     """Save ``fig`` as both PNG (high-dpi raster) and PDF (vector, paper quality)."""
     os.makedirs(plot_dir, exist_ok=True)
     for ext in ("png", "pdf"):
-        path = os.path.join(plot_dir, f"{filename_stem}.{ext}")
+        path = os.path.join(plot_dir, f"{output_stem(filename_stem)}.{ext}")
         fig.savefig(path, dpi=_FIGURE_DPI, bbox_inches="tight")
         print(f"Plot saved to: {path}")
 

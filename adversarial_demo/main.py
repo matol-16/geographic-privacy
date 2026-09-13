@@ -62,6 +62,7 @@ from utils.adversarial_eval import (
     merge_shards,
 )
 from utils.adversarial_utils import seed_everything, expand_to_budget_count
+from utils.plots.common import set_plot_filename_suffix
 from utils.plots_adversarial_attacks import (
     plot_results,
     plot_attack_success_rate,
@@ -1188,6 +1189,7 @@ def cmd_evaluate_localizability(args, config: Dict[str, Any]) -> None:
         return
 
     if stage == "plot":
+        set_plot_filename_suffix(getattr(args, "filename_suffix", None))
         attack_types = pick_value(args.attack_types, config.get("attack_types"), DEFAULT_ATTACK_TYPES)
         # Prefer the budgets actually used by the attack run (saved alongside the results)
         # so the budget axis of the result tensors lines up; fall back to config otherwise.
@@ -1676,6 +1678,49 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         config, "plot", "attack_success_rate_thresholds", default=DEFAULT_SUCCESS_RATE_THRESHOLDS
     )
     tikz = bool(getattr(args, "tikz", False))
+    # Appendix variants of a figure live next to the main one under a different
+    # stem (e.g. "<ds>_robustness_results_appendix"); applied to every file this
+    # invocation writes (PNG/PDF/JSON and the TikZ .tex/.pdf/.png).
+    set_plot_filename_suffix(getattr(args, "filename_suffix", None))
+    # Robustness figures: which success-rate thresholds get a row. None -> the
+    # 2500 km headline (main paper); "all" or an explicit list -> appendix.
+    robustness_thresholds = getattr(args, "thresholds", None)
+    if robustness_thresholds and len(robustness_thresholds) == 1 and str(robustness_thresholds[0]).lower() == "all":
+        robustness_thresholds = "all"
+    elif robustness_thresholds:
+        robustness_thresholds = [float(t) for t in robustness_thresholds]
+    heatmap_n_cols = getattr(args, "n_cols", None)
+    # --extra-results attack=dir: take that attack's <ds>_<attack>_results.pt from
+    # another run (e.g. a pilot run standing in until the full one lands). Only the
+    # clean-vs-attacked heatmap supports it -- it is the one figure that treats
+    # each attack independently (own panel, own budget lookup).
+    extra_results: Dict[str, str] = {}
+    for spec in getattr(args, "extra_results", None) or []:
+        if "=" not in spec:
+            raise ValueError(f"--extra-results expects ATTACK=DIR, got {spec!r}")
+        attack, path = spec.split("=", 1)
+        extra_results[attack.strip()] = path.strip()
+    if extra_results and plot_type != "clean-vs-attacked-displacement":
+        raise ValueError("--extra-results is only supported for plot_type 'clean-vs-attacked-displacement'.")
+
+    # The .pt-backed plot types load one results file per attack; an attack that
+    # was never run for this dataset (e.g. targeted_l2 before its cluster run) is
+    # dropped with a notice instead of aborting the whole figure -- but only when
+    # there is no saved eval state to fall back on, which is the path the
+    # single-GPU workflow relies on (see _load_attack_results).
+    if plot_type in ("results", "success-rate", "dtd-variance", "loss-vs-fsd", "clean-vs-attacked-displacement"):
+        has_eval_state = any(Path(results_dir).glob(f"{dataset}_seed*_eval_state*.pt"))
+        missing = [a for a in attack_types
+                   if a not in extra_results
+                   and not os.path.exists(os.path.join(results_dir, f"{dataset}_{a}_results.pt"))]
+        if missing and not has_eval_state:
+            present = [a for a in attack_types if a not in missing]
+            if not present:
+                raise FileNotFoundError(
+                    f"No {dataset} results found in {results_dir} for any of {attack_types}."
+                )
+            print(f"NOTE: skipping {missing} -- no {dataset}_<attack>_results.pt in {results_dir}")
+            attack_types = present
 
     if plot_type == "results":
         attack_budgets = get_attack_budgets(config, dataset)
@@ -1718,7 +1763,7 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
 
     elif plot_type == "dtd-variance":
         attack_budgets = get_attack_budgets(config, dataset)
-        print(f"Plotting attack displacement variance (\"DTD\") for attacks: {attack_types}")
+        print(f"Plotting per-attack displacement spread for attacks: {attack_types}")
         dtd_variance_fn = plot_attack_dtd_variance_tikz if tikz else plot_attack_dtd_variance
         dtd_variance_fn(
             results_dir=results_dir,
@@ -1747,12 +1792,32 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         attack_budgets = get_attack_budgets(config, dataset)
         print(f"Plotting clean-vs-attacked true-GPS displacement for attacks: {attack_types}")
         clean_vs_attacked_fn = plot_clean_vs_attacked_displacement_tikz if tikz else plot_clean_vs_attacked_displacement
+        clean_vs_attacked_kwargs = {"n_cols": heatmap_n_cols} if (tikz and heatmap_n_cols) else {}
+        all_results = None
+        if extra_results:
+            from utils.plots.common import _load_attack_results
+
+            base_attacks = [a for a in attack_types if a not in extra_results]
+            all_results = _load_attack_results(results_dir, dataset, base_attacks) if base_attacks else {}
+            budgets_per_type = {}
+            for attack, path in extra_results.items():
+                if attack not in attack_types:
+                    continue
+                results_path = os.path.join(path, f"{dataset}_{attack}_results.pt")
+                print(f"NOTE: {attack} results taken from {results_path}")
+                all_results[attack] = torch.load(results_path)
+                # That run's own budget list (saved next to its results) so the plotted
+                # eps is looked up on the right axis; fall back to the main run's list.
+                budgets_per_type[attack] = _load_run_attack_budgets(dataset, path) or attack_budgets
+            clean_vs_attacked_kwargs["attack_budgets_per_type"] = budgets_per_type
         clean_vs_attacked_fn(
             results_dir=results_dir,
             attack_budgets=attack_budgets,
             plot_dir=plots_dir,
             dataset_name=dataset,
             attack_types=attack_types,
+            all_results=all_results,
+            **clean_vs_attacked_kwargs,
         )
 
     elif plot_type == "sampling-steps":
@@ -1773,7 +1838,7 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         with open(results_file) as f:
             json_results = json.load(f)
         robustness_fn = plot_robustness_results_tikz if tikz else plot_robustness_results
-        robustness_fn(json_results=json_results, plot_dir=plots_dir)
+        robustness_fn(json_results=json_results, plot_dir=plots_dir, thresholds=robustness_thresholds)
 
     elif plot_type == "robustness-and-sampling-steps":
         if not tikz:
@@ -1794,6 +1859,7 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         sampling_steps_json = merge_sampling_steps_results([sampling_steps_file])
         plot_robustness_and_sampling_steps_tikz(
             robustness_json=robustness_json, sampling_steps_json=sampling_steps_json, plot_dir=plots_dir,
+            thresholds=robustness_thresholds,
         )
 
     elif plot_type == "restarts":
@@ -2044,6 +2110,8 @@ Examples:
     eval_local.add_argument("--tikz", action="store_true",
                             help="Emit standalone pgfplots .tex (+ best-effort compiled PDF/PNG preview) "
                                  "instead of a matplotlib figure, for --stage plot")
+    eval_local.add_argument("--filename-suffix", default=None,
+                            help="Appended to every output stem of --stage plot (e.g. '_appendix')")
 
     # evaluate-restarts
     eval_restarts = subparsers.add_parser("evaluate-restarts",
@@ -2103,6 +2171,20 @@ Examples:
                           help="Emit standalone pgfplots .tex (+ best-effort compiled PDF/PNG preview) "
                                "under <plots-dir>/tikz/ instead of a matplotlib figure "
                                "(not supported for plot_type 'restarts')")
+    plot_cmd.add_argument("--filename-suffix", default=None,
+                          help="Appended to every output file stem (PNG/PDF/JSON/TikZ), e.g. '_appendix' "
+                               "to write the appendix variant of a figure next to the main one")
+    plot_cmd.add_argument("--thresholds", nargs="+", default=None,
+                          help="Success-rate thresholds (km) drawn by the 'robustness' / "
+                               "'robustness-and-sampling-steps' figures: default is the 2500 km headline "
+                               "only (main paper); pass 'all' or e.g. '200 750 2500' for the appendix version")
+    plot_cmd.add_argument("--extra-results", nargs="+", default=None, metavar="ATTACK=DIR",
+                          help="For 'clean-vs-attacked-displacement': load ATTACK's <dataset>_ATTACK_results.pt "
+                               "from DIR instead of --results-dir (e.g. a pilot run standing in for a full one; "
+                               "the panel then states its n)")
+    plot_cmd.add_argument("--n-cols", type=int, default=None,
+                          help="Panels per row for the --tikz 'clean-vs-attacked-displacement' heatmap grid "
+                               "(default 4; e.g. 5 puts the five headline attacks on one line)")
 
     # list-configs
     subparsers.add_parser("list-configs", help="List available configuration parameters", parents=[global_parser])

@@ -15,9 +15,13 @@
 # Usage:
 #   ./replot_combined.sh <yfcc|osv> "<space separated attack list>" [RESULTS_BASE] [PLOTS_DIR]
 #
-# Example (OSV: existing six attacks + targeted_l2, integrated in place):
-#   ./replot_combined.sh osv "encoder sampling dtd ace training_loss unidef targeted_l2" \
-#       results/cluster_eval/osv_5k_full
+# For the full paper layout (main + appendix folders, thresholds, headline heatmap)
+# prefer scripts/make_paper_figures.sh; this is the minimal single-folder variant.
+#
+# Example (OSV: existing eight attacks + targeted_l2, integrated in place):
+#   ./replot_combined.sh osv \
+#       "encoder sampling diffusion_l2 dtd ace geoshield training_loss unidef targeted_l2" \
+#       results/cluster_eval_2/osv_full
 #
 # Env: PYTHON=/path/to/plonk/python to use a specific interpreter (skips conda
 #      activation); otherwise the plonk conda env is activated via config.sh.
@@ -30,7 +34,13 @@ ATTACKS="${2:?quoted, space-separated attack list, e.g. \"encoder dtd targeted_l
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${HERE}/../.." && pwd)"
 CONFIG_PATH="${CONFIG_PATH:-${PROJECT_DIR}/config.yaml}"
-RESULTS_BASE="${3:-${PROJECT_DIR}/results/cluster_eval/${DATASET}_5k_full}"
+# Default bases of the current full runs (yfcc: cluster_eval/yfcc4k_full, osv: cluster_eval_2/osv_full).
+if [[ "${DATASET}" == "osv" ]]; then
+  DEFAULT_BASE="${PROJECT_DIR}/results/cluster_eval_2/osv_full"
+else
+  DEFAULT_BASE="${PROJECT_DIR}/results/cluster_eval/yfcc4k_full"
+fi
+RESULTS_BASE="${3:-${DEFAULT_BASE}}"
 PLOTS_DIR="${4:-${RESULTS_BASE}/plots}"
 GPS_TRUE="${GPS_TRUE:-true}"
 

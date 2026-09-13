@@ -4,6 +4,45 @@
 
 The adversarial demo code has been refactored to reduce duplication and provide a cleaner, more maintainable codebase. The new architecture separates concerns into distinct modules and provides reusable components.
 
+## Attack naming (paper vs. code)
+
+The paper frames every attack evaluated here except GeoShield as an instance of the
+**GeoFA** framework (Geographic Flow Attacks), so all of them carry the `GeoFA-` prefix;
+the suffix names the loss/target the instance optimizes. The code keeps its historical
+keys; the paper-facing labels come from one place,
+`utils/plots/common.py::_display_attack_name`, which every figure and table goes through:
+
+| code key | paper label | | code key | paper label |
+|---|---|---|---|---|
+| `dtd` | **GeoFA-TD** (headline; formerly "DTD") | | `training_loss` | GeoFA-AdvDM |
+| `encoder` | GeoFA-enc. | | `ace` | GeoFA-ACE |
+| `sampling` | GeoFA-sample | | `unidef` | GeoFA-UniDef |
+| `diffusion_l2` | GeoFA-L² | | `geoshield` | GeoShield (external pipeline) |
+| `targeted_l2` | GeoFA-DPA | | `dtd_blur` | GeoFA-TD-blur |
+
+Config keys, CLI flags (`--attack-types dtd`, `plot dtd-variance`) and result file names
+(`<dataset>_dtd_results.pt`) are unchanged.
+
+## Paper figures and tables
+
+`scripts/make_paper_figures.sh [yfcc|osv|all]` regenerates every figure from the saved
+full-run results (no GPU) into a fixed layout per dataset:
+
+- `results/cluster_eval/yfcc4k_full/` — YFCC4k: `plots/` holds the main results **and**
+  every ablation (sampling steps, model transfer, robustness at 2500 km, restarts,
+  localizability); `plots_appendix/` holds the appendix variants.
+- `results/cluster_eval_2/osv_full/` — OSV-5M (5000 images; the only OSV run kept):
+  `plots/` holds the main results; **all** OSV ablations go to `plots_appendix/`.
+- Appendix-only variants on both datasets: robustness figures with all three thresholds
+  (`--thresholds all`) and the clean-vs-attacked heatmap over every attack; the main
+  heatmap shows GeoShield, GeoFA-enc., GeoFA-AdvDM, GeoFA-DPA, GeoFA-TD on one line
+  (`--n-cols 5`). Every appendix stem ends in `_appendix` (`plot --filename-suffix`).
+- Each `plots*/` has a `tikz/` twin (pgfplots `.tex` + compiled PDF/PNG).
+
+`scripts/make_success_rate_table.py` turns the `*_attack_success_rate.json` /
+`*_final_step_displacement_true.json` sidecars of `plots/` into the main results table
+(`results/tables/success_rate_{yfcc,osv,all,2500km}.{md,tex}`).
+
 ## File Structure
 
 ### CLI + engine

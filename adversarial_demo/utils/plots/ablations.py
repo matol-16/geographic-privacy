@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any
+from typing import Any, Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,8 +18,10 @@ from utils.plots.common import (
     _get_metric_tensor,
     _load_attack_results,
     _select_displacement_metric,
+    output_stem,
     save_plot_json,
     select_closest_budget,
+    select_thresholds,
 )
 from utils.plots.style import apply_paper_style, attack_color
 
@@ -37,7 +39,7 @@ def _savefig(fig, plot_dir: str, filename_stem: str) -> None:
     """Save ``fig`` as both PNG (high-dpi raster) and PDF (vector, paper quality)."""
     os.makedirs(plot_dir, exist_ok=True)
     for ext in ("png", "pdf"):
-        path = os.path.join(plot_dir, f"{filename_stem}.{ext}")
+        path = os.path.join(plot_dir, f"{output_stem(filename_stem)}.{ext}")
         fig.savefig(path, dpi=_FIGURE_DPI, bbox_inches="tight")
         print(f"Plot saved to: {path}")
 
@@ -259,7 +261,7 @@ def plot_restarts_success(
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
         suffix = f"_image_{img_idx}" if n_images > 1 else ""
-        path = os.path.join(plot_dir, f"{dataset}_restarts_success{suffix}.png")
+        path = os.path.join(plot_dir, f"{output_stem(f'{dataset}_restarts_success{suffix}')}.png")
         fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Plot saved to: {path}")
@@ -287,7 +289,7 @@ def plot_restarts_success(
         ax.legend(fontsize=8)
         ax.grid(True, alpha=0.3)
         fig.tight_layout()
-        path = os.path.join(plot_dir, f"{dataset}_restarts_success_summary.png")
+        path = os.path.join(plot_dir, f"{output_stem(f'{dataset}_restarts_success_summary')}.png")
         fig.savefig(path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"Summary plot saved to: {path}")
@@ -466,6 +468,7 @@ def plot_robustness_results(
     json_results: dict,
     plot_dir: str,
     eps: float = DEFAULT_ABLATION_EPS,
+    thresholds: Optional[Sequence[float]] = None,
 ) -> None:
     """Plot attack robustness to JPEG compression and Gaussian blur (GeoShield Fig. 6).
 
@@ -475,13 +478,17 @@ def plot_robustness_results(
     displacement-from-clean-prediction metric is drawn solid ("predicted") and the
     displacement-from-ground-truth metric dashed ("true", the GeoShield metric).
     ``json_results`` is the dict produced by ``build_robustness_json``.
+
+    ``thresholds`` selects which success-rate thresholds (km) get a row; the
+    default is the 2500 km headline only (main-paper figure), while passing every
+    threshold in the JSON yields the appendix version.
     """
     from matplotlib.lines import Line2D
 
     attack_types = json_results["attack_types"]
     attack_budgets = json_results["attack_budgets"]
     dataset = json_results["dataset"]
-    thresholds = [t for t in json_results["success_rate_thresholds_km"] if float(t) == 2500.0]
+    thresholds = select_thresholds(json_results["success_rate_thresholds_km"], thresholds)
     num_steps = json_results.get("num_steps")
     metrics = json_results.get("metrics", ["true"])
     metric_styles = {"true": "-"}
@@ -566,13 +573,12 @@ def plot_attack_dtd_variance(
     gps_true: bool = True,
     eps: float = DEFAULT_ABLATION_EPS,
 ):
-    """Box plot of each attack's spread in final-step displacement ("DTD") across images.
+    """Box plot of each attack's spread in final-step displacement across images.
 
     Where the other plots show *mean* attack strength, this one shows how *consistent*
     each attack is: for every attack, at the single budget closest to ``eps`` (default
     8/255), the per-image final-step displacement metric (km) — the core
-    geolocation-deviation quantity used throughout this evaluation, which we refer to
-    as "DTD" following the paper's naming — is summarized as a box (median, IQR,
+    geolocation-deviation quantity used throughout this evaluation — is summarized as a box (median, IQR,
     whiskers) plus mean/std/variance in the JSON sidecar. Attacks with a tall box move
     some images far and others barely at all; attacks with a short box are uniformly
     (in)effective.
@@ -641,7 +647,7 @@ def plot_attack_dtd_variance(
 
     ax.set_xticks(range(len(tick_labels)))
     ax.set_xticklabels(tick_labels, rotation=30, ha="right")
-    ax.set_ylabel("Final-step displacement — \"DTD\" (km)")
+    ax.set_ylabel("Final-step displacement (km)")
     ax.grid(True, axis="y", alpha=0.3)
 
     fig.tight_layout()
@@ -800,6 +806,41 @@ def _get_clean_vs_attacked_true_samples(res, budget_idx):
     return baseline[:n], attacked[:n]
 
 
+def conditional_quantile_curves(x, y, quantiles=(25, 50, 75), n_bins: int = 10, min_per_bin: int = 25):
+    """Quantiles of ``y`` per quantile bin of ``x`` (both positive, binned in log space).
+
+    The visual counterpart of the Pearson r reported in the clean-vs-attacked
+    panels. The median alone barely separates the attacks (most images end up
+    >1000 km for every attack), so the interquartile band is what carries the
+    message: an attack that leaves a fraction of images essentially unchanged
+    keeps a mass on the y=x diagonal, which pulls the 25th percentile down to the
+    diagonal for well-localized images; GeoFA-TD / GeoFA-L2 push even those
+    images far away, so their band stays detached from the diagonal (r ~ 0).
+    Quantile bins (not fixed-width) so every point rests on the same number of
+    samples. Returns ``(bin_center_x, {q: values})``; empty when there are too
+    few samples for even two bins.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    keep = (x > 0) & (y > 0) & np.isfinite(x) & np.isfinite(y)
+    x, y = x[keep], y[keep]
+    n_bins = int(min(n_bins, x.size // max(min_per_bin, 1)))
+    if n_bins < 2:
+        return np.array([]), {q: np.array([]) for q in quantiles}
+    edges = np.quantile(np.log10(x), np.linspace(0, 1, n_bins + 1))
+    edges[-1] += 1e-9
+    idx = np.clip(np.searchsorted(edges, np.log10(x), side="right") - 1, 0, n_bins - 1)
+    xs, ys = [], {q: [] for q in quantiles}
+    for b in range(n_bins):
+        m = idx == b
+        if m.sum() < 2:
+            continue
+        xs.append(10 ** np.median(np.log10(x[m])))
+        for q in quantiles:
+            ys[q].append(float(np.percentile(y[m], q)))
+    return np.asarray(xs), {q: np.asarray(v) for q, v in ys.items()}
+
+
 def plot_clean_vs_attacked_displacement(
     results_dir=None,
     attack_budgets=None,
@@ -808,6 +849,7 @@ def plot_clean_vs_attacked_displacement(
     attack_types=None,
     all_results=None,
     eps: float = DEFAULT_ABLATION_EPS,
+    attack_budgets_per_type: Optional[dict] = None,
 ):
     """Scatter clean-prediction-vs-truth displacement against perturbed-vs-truth displacement.
 
@@ -821,12 +863,19 @@ def plot_clean_vs_attacked_displacement(
         results_dir/attack_budgets/dataset_name/attack_types: same as ``plot_results``.
         all_results: optional pre-loaded ``{attack_type: results_dict}`` to skip disk I/O.
         eps: attack budget to plot (the closest available budget is used).
+        attack_budgets_per_type: per-attack budget lists for results taken from another
+            run (``main.py plot --extra-results``); defaults to ``attack_budgets``.
     """
     if all_results is None:
         all_results = _load_attack_results(results_dir, dataset_name, attack_types)
+    attack_budgets_per_type = attack_budgets_per_type or {}
 
     budget = select_closest_budget(attack_budgets, eps)
-    budget_idx = int(np.argmin(np.abs(np.asarray(attack_budgets, dtype=np.float64) - budget)))
+
+    def _budget_idx(attack_type):
+        budgets = attack_budgets_per_type.get(attack_type, attack_budgets)
+        chosen = select_closest_budget(budgets, eps)
+        return int(np.argmin(np.abs(np.asarray(budgets, dtype=np.float64) - chosen)))
 
     fig, ax = plt.subplots(figsize=(7, 7))
     json_payload: dict[str, Any] = {
@@ -840,7 +889,7 @@ def plot_clean_vs_attacked_displacement(
         res = all_results.get(attack_type)
         if res is None:
             continue
-        pairs = _get_clean_vs_attacked_true_samples(res, budget_idx)
+        pairs = _get_clean_vs_attacked_true_samples(res, _budget_idx(attack_type))
         if pairs is None:
             continue
         baseline, attacked = pairs
@@ -852,6 +901,14 @@ def plot_clean_vs_attacked_displacement(
         color = attack_color(attack_type)
         ax.scatter(baseline, attacked, s=14, color=color, alpha=0.5, edgecolors="none",
                    label=_display_attack_name(attack_type))
+        # Binned conditional median + interquartile band: makes the (in)dependence
+        # on the clean FSD readable through the overplotting (see
+        # conditional_quantile_curves).
+        mx, qs = conditional_quantile_curves(baseline, attacked)
+        if mx.size:
+            ax.fill_between(mx, qs[25], qs[75], color=color, alpha=0.18, linewidth=0, zorder=4)
+            ax.plot(mx, qs[50], color=color, linewidth=2.2, marker="o", markersize=4,
+                    markeredgecolor="white", markeredgewidth=0.6, zorder=5)
 
         pearson_r = float(np.corrcoef(baseline, attacked)[0, 1]) if baseline.size > 1 else None
         json_payload["attacks"][attack_type] = {
@@ -875,6 +932,8 @@ def plot_clean_vs_attacked_displacement(
     hi = float(combined.max())
     ax.plot([lo, hi], [lo, hi], linestyle="--", color="black", linewidth=1, alpha=0.6,
             label="y = x (no attack effect)")
+    ax.plot([], [], color="0.3", linewidth=2.2, marker="o", markersize=4,
+            markeredgecolor="white", label="median (band: 25-75%) attacked FSD per clean-FSD bin")
 
     ax.set_xscale("log")
     ax.set_yscale("log")

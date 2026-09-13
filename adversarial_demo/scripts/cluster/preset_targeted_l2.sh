@@ -4,7 +4,7 @@
 # EXISTING full-run results, reusing the shard/merge infrastructure (submit.sh).
 #
 #   ./preset_targeted_l2.sh yfcc [--dry-run]   # integrate into results/cluster_eval/yfcc4k_full
-#   ./preset_targeted_l2.sh osv  [--dry-run]   # integrate into results/cluster_eval/osv_5k_full
+#   ./preset_targeted_l2.sh osv  [--dry-run]   # integrate into results/cluster_eval_2/osv_full
 #
 # What "fully evaluated" means here == exactly what the existing full runs computed:
 #   * main displacement / success-rate results (2 budgets: 4/255 and 8/255)
@@ -23,13 +23,13 @@
 #         Result: yfcc_targeted_l2_results.pt appears and every combined figure in
 #         yfcc4k_full/plots is regenerated to include targeted_l2. One command, done.
 #
-#   OSV   osv_5k_full keeps the merged per-attack .pt files but NOT the shards, so the
-#         merge here can only stitch targeted_l2 (writing osv_targeted_l2_results.pt
-#         next to the existing six). Its own combined figures go to a side dir
-#         (plots_targeted_l2/) so nothing existing is clobbered. To rebuild the COMBINED
-#         OSV figures including targeted_l2, run the companion replot_combined.sh
-#         afterwards -- it reads the saved .pt files only (no GPU, seconds). The command
-#         is printed at the end of this run.
+#   OSV   cluster_eval_2/osv_full keeps the merged per-attack .pt files but NOT the
+#         shards, so the merge here can only stitch targeted_l2 (writing
+#         osv_targeted_l2_results.pt next to the existing eight). Its own combined
+#         figures go to a side dir (plots_targeted_l2/) so nothing existing is clobbered.
+#         To rebuild the COMBINED OSV figures including targeted_l2, run the paper figure
+#         script afterwards -- it reads the saved .pt files only (no GPU). The command is
+#         printed at the end of this run.
 #
 # Override any knob from the environment, e.g.:
 #   BUDGETS="0.0314" IMAGES_PER_SHARD=200 ./preset_targeted_l2.sh yfcc --dry-run
@@ -80,10 +80,10 @@ case "${DS}" in
     export ROBUSTNESS_ATTACK_TYPES_STR="${ROBUSTNESS_ATTACK_TYPES:-${INTEGRATION_ROBUSTNESS_ATTACKS}}"
     ;;
   osv)
-    export TOTAL_IMAGES="${TOTAL_IMAGES:-5000}"            # osv_5k_full = 5000 images x 2 budgets
-    export RESULTS_BASE="${RESULTS_BASE:-${PROJECT_DIR}/results/cluster_eval/osv_5k_full}"
+    export TOTAL_IMAGES="${TOTAL_IMAGES:-5000}"            # osv_full = 5000 images x 2 budgets
+    export RESULTS_BASE="${RESULTS_BASE:-${PROJECT_DIR}/results/cluster_eval_2/osv_full}"
     # Old OSV shards are gone -> stitch only targeted_l2, and send its own combined
-    # figures to a side dir so the existing osv_5k_full/plots are untouched.
+    # figures to a side dir so the existing osv_full/plots are untouched.
     export PLOTS_DIR="${PLOTS_DIR:-${RESULTS_BASE}/plots_targeted_l2}"
     export MERGE_ATTACK_TYPES_STR="targeted_l2"
     export ROBUSTNESS_ATTACK_TYPES_STR="${ROBUSTNESS_ATTACK_TYPES:-targeted_l2}"
@@ -99,12 +99,15 @@ if [[ "${DS}" == "osv" && " $* " != *" --dry-run "* ]]; then
   cat <<EOF
 
 --------------------------------------------------------------------------------
-OSV: once the merge above has finished, rebuild the COMBINED plots (existing six
-attacks + targeted_l2) from the saved .pt files -- no GPU, runs in seconds:
+OSV: once the merge above has finished, rebuild the COMBINED paper figures (existing
+eight attacks + targeted_l2, main + appendix) from the saved .pt files -- no GPU:
 
-  ${CLUSTER_DIR}/replot_combined.sh osv \\
-    "encoder sampling dtd ace training_loss unidef targeted_l2" \\
-    "${RESULTS_BASE}"
+  ${PROJECT_DIR}/scripts/make_paper_figures.sh osv
+
+(targeted_l2 is already in that script's attack lists; it was skipped while its
+results file was missing.) Then refresh the tables:
+
+  python ${PROJECT_DIR}/scripts/make_success_rate_table.py
 --------------------------------------------------------------------------------
 EOF
 fi
