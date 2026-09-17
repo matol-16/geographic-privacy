@@ -242,6 +242,10 @@ def _display_attack_name(attack_name: str) -> str:
         return "GeoFA-L2 v2"
     if normalized in ("diffusion_l2_v3", "l2_v3"):
         return "GeoFA-L2 v3"
+    if normalized in ("diffusion_l2_v3_old_forward", "l2_v3_old_forward"):
+        return "GeoFA-L2 v3 (old fwd.)"
+    if normalized in ("unidef_v3", "unidefv3"):
+        return "GeoFA-UniDef v3"
     if normalized == "sampling_v2":
         return "GeoFA-sample v2"
     if normalized in ("encoder_v3", "enc_v3"):

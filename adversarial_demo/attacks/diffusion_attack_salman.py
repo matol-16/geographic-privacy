@@ -35,6 +35,7 @@ class SamplingAttack(AttackBase):
         x0_bank: Optional[torch.Tensor] = None,
         reference: str = "clean_prediction",
         true_gps: Optional[Any] = None,
+        sampling_cfg: float = 0.0,  # guidance scale of the sampler that is back-propagated through
     ):
         super().__init__(
             pipeline=pipeline,
@@ -58,7 +59,9 @@ class SamplingAttack(AttackBase):
         self.dot_product_loss = dot_product_loss
         # CFG is intentionally 0 during training: using CFG would double the batch inside the
         # DDIM loop and make backprop through the full trajectory prohibitively expensive.
-        self.sampling_cfg = 0.0
+        # Guidance used inside the attacked sampler (v1: 0; the cluster_full run sets 10, the
+        # evaluation guidance). With cfg > 0 the sampler doubles the batch (cond + uncond).
+        self.sampling_cfg = float(sampling_cfg)
         self.reconstruction_loss_weight = float(reconstruction_loss_weight)
         self.delta_init = float(delta_init)
 

@@ -176,6 +176,8 @@ def run_attack(
 		"l2_v2": "diffusion_l2_v2",
 		"diffusion_l2_v3": "diffusion_l2_v3",  # l2_v2 + x_t noised from the TRUE location
 		"l2_v3": "diffusion_l2_v3",
+		"diffusion_l2_v3_old_forward": "diffusion_l2_v3_old_forward",  # v1 (Gaussian x_t, Euclidean L2) + TRUE x0: the L2 twin of dtd_v3_old_forward
+		"l2_v3_old_forward": "diffusion_l2_v3_old_forward",
 		"sampling_v2": "sampling_v2",  # GeoFA-Sampling deviating from the TRUE location (paper Eq. 8)
 		"encoder_v3": "encoder_v3",  # GeoFA-enc. with the shared sign-SGD PGD loop (paper Sec. 4.1 / Eq. 7)
 		"enc_v3": "encoder_v3",
@@ -202,6 +204,8 @@ def run_attack(
 		"uni_def": "unidef",
 		"cdd": "unidef",
 		"unidef_nofdje": "unidef_nofdje",
+		"unidef_v3": "unidef_v3",  # UniDef with x_t / target from the TRUE location (like training_loss_v3)
+		"unidefv3": "unidef_v3",
 		"training_loss": "training_loss",
 		"targeted_l2": "targeted_l2",
 		"targetedl2": "targeted_l2",
@@ -262,6 +266,20 @@ def run_attack(
 			source_image=source_image,
 			pipeline=pipeline,
 			attack_type_label="diffusion_l2_v3",
+			**kwargs
+		)
+	if normalized_type == "diffusion_l2_v3_old_forward":
+		# GeoFA-L2 with exactly the forward process of dtd_v3_old_forward: legacy Gaussian
+		# interpolant sqrt(gamma) x0 + sqrt(1-gamma) n with x0 = the TRUE location, Euclidean L2
+		# between the raw velocity predictions (no tangent projection). Differs from that TD pin
+		# by the metric only.
+		kwargs["dot_product_loss"] = "l2"
+		kwargs["forward_process"] = "gaussian"
+		kwargs["x0_source"] = "true"
+		return _run_diffusion_attack(
+			source_image=source_image,
+			pipeline=pipeline,
+			attack_type_label="diffusion_l2_v3_old_forward",
 			**kwargs
 		)
 	if normalized_type == "sampling_v2":
@@ -393,6 +411,16 @@ def run_attack(
 		return _run_unidef_attack(
 			source_image=source_image,
 			pipeline=pipeline,
+			**kwargs
+		)
+	if normalized_type == "unidef_v3":
+		# GeoFA-UniDef with x_t and the target velocity built from the TRUE location (as
+		# training_loss_v3), so it differs from GeoFA-AdvDM by the gradient estimator only.
+		kwargs["x0_source"] = "true"
+		return _run_unidef_attack(
+			source_image=source_image,
+			pipeline=pipeline,
+			attack_type_label="unidef_v3",
 			**kwargs
 		)
 	if normalized_type == "unidef_nofdje":
@@ -778,6 +806,8 @@ def _run_unidef_attack(
 	early_stopping_patience: int = 0,  # 0=disabled, >0=stop if no improvement for N steps
 	num_restart_workers: int = 1,  # Number of parallel workers for restarts; 1=sequential
 	attack_type_label: str = "unidef",  # Label stored in result dict
+	x0_source: str = "clean_model",  # "clean_model" (legacy bank) or "true" (the image's true location)
+	true_gps: Optional[Any] = None,  # (lat, lon) in degrees; required for x0_source="true"
 	**kwargs,  # Absorb unused kwargs
 ) -> Dict[str, Any]:
 	"""Run the UniDef attack: global trajectory deviation (CDD) with optional FDJE."""
@@ -788,6 +818,8 @@ def _run_unidef_attack(
 		clean_num_steps=clean_num_steps,
 		device=device,
 		show_progress=show_progress,
+		x0_source=x0_source,
+		true_gps=true_gps,
 	)
 
 	attack = UniDef(
@@ -809,6 +841,8 @@ def _run_unidef_attack(
 		restart_selection_metric=restart_selection_metric,
 		device=device,
 		x0_bank=x0_bank,  # Pass shared x0_bank
+		x0_source=x0_source,
+		true_gps=true_gps,
 	)
 	attack.restart_manager.print_results = print_restart_results
 
@@ -1084,6 +1118,7 @@ def _run_diffusion_salman_attack(
 	attack_type_label: str = "sampling",
 	reference: str = "clean_prediction",  # "clean_prediction" (v1) or "true_location" (paper Eq. 8, v2)
 	true_gps: Optional[Any] = None,
+	sampling_cfg: float = 0.0,  # guidance inside the attacked 16-step sampler (0 = v1; cluster_full uses 10)
 	**kwargs,
 ) -> Dict[str, Any]:
 	"""Run the Salman diffusion attack through the full sampling trajectory."""
@@ -1106,6 +1141,7 @@ def _run_diffusion_salman_attack(
 		device=device,
 		reference=reference,
 		true_gps=true_gps,
+		sampling_cfg=sampling_cfg,
 	)
 	attack.restart_manager.print_results = print_restart_results
 

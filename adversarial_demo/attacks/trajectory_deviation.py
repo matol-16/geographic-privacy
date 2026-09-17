@@ -639,6 +639,8 @@ class UniDef(DiffusionAttack):
         restart_selection_metric: str = "final_step_displacement",
         device: str = "cuda",
         x0_bank: Optional[torch.Tensor] = None,  # Shared x0_bank across restarts
+        x0_source: str = "clean_model",  # see DiffusionAttack ("clean_model" bank or the "true" location)
+        true_gps: Optional[Any] = None,
     ):
         super().__init__(
             pipeline=pipeline,
@@ -657,6 +659,8 @@ class UniDef(DiffusionAttack):
             restart_selection_metric=restart_selection_metric,
             device=device,
             x0_bank=x0_bank,
+            x0_source=x0_source,
+            true_gps=true_gps,
         )
 
         self.use_fdje = bool(use_fdje)

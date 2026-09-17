@@ -11,12 +11,12 @@
 # with the LATEST implementation; GeoFA-TD is pinned to v3 (old forward process), i.e. the
 # legacy Gaussian interpolant with x_t noised from the TRUE location.
 #   dtd           -> dtd_v3_old_forward        GeoFA-TD          (cosine, Gaussian x_t, true x0)
-#   diffusion_l2  -> diffusion_l2_v3           GeoFA-L2          (tangent L2, geodesic x_t, true x0)
+#   diffusion_l2  -> diffusion_l2_v3_old_forward GeoFA-L2        (Euclidean L2, Gaussian x_t, true x0: TD's forward process)
 #   targeted_l2   (single version)             GeoFA-DPA / L2-targeted (denoising loss -> antipode)
-#   sampling      -> sampling_v2               GeoFA-Sampling    (haversine to the true location, 16-step sampler)
+#   sampling      -> sampling_v2 + sampling_cfg 10  GeoFA-Sampling (haversine to the true location through the 16-step sampler at w=10)
 #   encoder       -> encoder_v3                GeoFA-enc.        (sign-SGD PGD on ||E(c+d)-E(c)||^2)
 #   training_loss -> training_loss_v3          GeoFA-AdvDM       (RFM training loss, true x0)
-#   unidef        (single version)             GeoFA-UniDef      (finite-difference Jacobian)
+#   unidef        -> unidef_v3                 GeoFA-UniDef      (finite-difference Jacobian, true x0)
 #   dtd_blur      -> dtd_blur_v3_old_forward   GeoFA-TD-blur     (dtd pin + blur-EOT term)
 #   geoshield     (external)                   GeoShield         (PNG, model-exact 336 px clean copies)
 
@@ -79,13 +79,16 @@ attack_train_args:
       dtd:
         attack_variant: dtd_v3_old_forward
       diffusion_l2:
-        attack_variant: diffusion_l2_v3
+        attack_variant: diffusion_l2_v3_old_forward
       sampling:
         attack_variant: sampling_v2
+        sampling_cfg: 10.0   # guidance inside the attacked 16-step sampler = evaluation guidance
       encoder:
         attack_variant: encoder_v3
       training_loss:
         attack_variant: training_loss_v3
+      unidef:
+        attack_variant: unidef_v3
       dtd_blur:
         attack_variant: dtd_blur_v3_old_forward
         blur_sigma_min: 0.0
@@ -118,13 +121,16 @@ attack_train_args:
       dtd:
         attack_variant: dtd_v3_old_forward
       diffusion_l2:
-        attack_variant: diffusion_l2_v3
+        attack_variant: diffusion_l2_v3_old_forward
       sampling:
         attack_variant: sampling_v2
+        sampling_cfg: 10.0   # guidance inside the attacked 16-step sampler = evaluation guidance
       encoder:
         attack_variant: encoder_v3
       training_loss:
         attack_variant: training_loss_v3
+      unidef:
+        attack_variant: unidef_v3
       dtd_blur:
         attack_variant: dtd_blur_v3_old_forward
         blur_sigma_min: 0.0

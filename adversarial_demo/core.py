@@ -1577,6 +1577,7 @@ def _maybe_add_true_gps(runner, attack_type: str, image_idx: int, kwargs: Dict[s
         "dtd_blur_v3_old_forward", "dtdblurv3oldforward",
         "training_loss_v3", "traininglossv3", "advdm_v3",
         "diffusion_l2_v3", "l2_v3", "sampling_v2",
+        "diffusion_l2_v3_old_forward", "l2_v3_old_forward", "unidef_v3", "unidefv3",
     )
     # A canonical key may be pinned to one of those implementations (``attack_variant``,
     # see attacks.run_attack); the pin decides what the attack actually needs.
