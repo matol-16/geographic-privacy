@@ -56,6 +56,10 @@ def _select_clean_images(
     clean_dir: str,
     window_start: int = 0,
     window_end: Optional[int] = None,
+    clean_image_format: str = "png",
+    clean_preprocess: str = "none",
+    input_res: Optional[int] = None,
+    pipeline=None,
 ) -> Dict[str, GpsCoord]:
     """Copy the seeded, prefix-stable backbone selection into ``clean_dir``.
 
@@ -64,6 +68,24 @@ def _select_clean_images(
     file's name to its ground-truth GPS, so the precomputed evaluator can compute the
     true-position metric (the pair keys are the file names). ``window_start``/``window_end``
     select the same image slice a trainable-attack shard would use.
+
+    ``clean_preprocess="model"`` writes the *model-preprocessed* square instead of the raw
+    file: PLONK's ``CenterCrop(ratio="1:1") -> Resize(input_res, bicubic)``. GeoShield
+    preprocesses with ``Resize(input_res) -> CenterCrop(input_res)``: the same square, but
+    cropped at an integer offset *after* the resize, i.e. shifted by a fraction of a pixel
+    w.r.t. PLONK's crop-then-resize. That sub-pixel shift alone (no perturbation) differs from
+    the evaluator's clean tensor by ~4/255 on average, and flips the prediction on ~8 % of
+    YFCC images. On an ``input_res`` square both chains are exact no-ops, so GeoShield's
+    perturbation is then measured against precisely the clean tensor the trainable attacks
+    are evaluated on. PIL's resize already yields uint8, so the PNG is bit-identical to what
+    the pipeline computes from the raw file. Requires ``clean_image_format="png"``.
+
+    When ``pipeline`` is given, the square is produced by the pipeline's OWN conditional
+    preprocessing (``conditional_preprocessing`` -> pixels -> 8 bit), so it is exact for every
+    encoder: DINOv2 (YFCC: CenterCrop(1:1) -> Resize(336)) and StreetCLIP (OSV: the CLIP
+    processor's Resize(shortest=336) -> CenterCrop(336), whose crop offset differs from the
+    DINOv2 chain by up to a pixel on odd sizes). Without a pipeline the DINOv2 chain is used
+    (only correct for the DINOv2-encoded datasets).
     """
     metadata = select_image_metadata(
         dataset, int(n_images), seed=int(seed), local_dir=local_dir,
@@ -77,12 +99,63 @@ def _select_clean_images(
         shutil.rmtree(clean_root)
     clean_root.mkdir(parents=True, exist_ok=True)
 
+    # GeoShield saves its protected image with the *same extension* as the clean file
+    # (``torchvision.utils.save_image`` -> PIL picks the format from the suffix). With the
+    # datasets' ``.jpg`` files that means the perturbation goes through JPEG (quality 75)
+    # before evaluation, while the in-process attacks are evaluated losslessly. Copying the
+    # clean images as PNG (lossless re-encode of the decoded pixels) keeps the pipeline
+    # lossless end to end. ``clean_image_format="jpg"`` restores the old (lossy) behaviour.
+    fmt = str(clean_image_format).lower().lstrip(".")
+    if fmt not in ("png", "jpg", "jpeg"):
+        raise ValueError(f"geoshield.clean_image_format must be png or jpg, got {clean_image_format!r}")
+    preprocess = str(clean_preprocess or "none").lower()
+    if preprocess not in ("none", "model"):
+        raise ValueError(f"geoshield.clean_preprocess must be 'none' or 'model', got {clean_preprocess!r}")
+    if preprocess == "model":
+        if fmt != "png":
+            raise ValueError("geoshield.clean_preprocess='model' requires clean_image_format='png' (lossless).")
+        if input_res is None:
+            raise ValueError("geoshield.clean_preprocess='model' requires geoshield.input_res (the model's input size).")
+        if pipeline is not None:
+            from utils.adversarial_utils import conditional_preprocessing, normalized_to_pixels, pixels_to_pil
+
+            def model_transform(im):
+                # Exactly the clean tensor the evaluator builds, de-normalised and quantised
+                # (the preprocessed pixels are integers/255, so the round trip is lossless).
+                tensor = conditional_preprocessing(im, pipeline, device="cpu")
+                pil = pixels_to_pil(normalized_to_pixels(tensor, pipeline).squeeze(0))
+                if pil.size != (int(input_res), int(input_res)):
+                    raise RuntimeError(
+                        f"geoshield.input_res={input_res} does not match the model input {pil.size}"
+                    )
+                return pil
+        else:
+            if dataset != "yfcc":
+                print(
+                    "GeoShield WARNING: clean_preprocess='model' without a pipeline falls back to the "
+                    f"DINOv2 chain, which is not the {dataset} encoder's preprocessing."
+                )
+            from torchvision import transforms
+            from plonk.utils.image_processing import CenterCrop  # PLONK's own crop (see plonk/pipe.py)
+            model_transform = transforms.Compose([
+                CenterCrop(ratio="1:1"),
+                transforms.Resize(int(input_res), interpolation=transforms.InterpolationMode.BICUBIC),
+            ])
     gps_by_filename: Dict[str, GpsCoord] = {}
     for path, gps, _ in metadata:
-        filename = Path(path).name
-        shutil.copy(path, clean_root / filename)
+        if fmt == "png":
+            from PIL import Image
+            filename = f"{Path(path).stem}.png"
+            with Image.open(path) as im:
+                im = im.convert("RGB")
+                if preprocess == "model":
+                    im = model_transform(im)
+                im.save(clean_root / filename, format="PNG")
+        else:
+            filename = Path(path).name
+            shutil.copy(path, clean_root / filename)
         gps_by_filename[filename] = gps
-    print(f"GeoShield: copied {len(metadata)} clean images to {clean_root}.")
+    print(f"GeoShield: copied {len(metadata)} clean images to {clean_root} (format={fmt}, preprocess={preprocess}).")
     return gps_by_filename
 
 
@@ -95,8 +168,18 @@ def _run_geoshield_generation(
     n_images: int,
     epsilon: int,
     steps: int,
+    input_res: Optional[int] = None,
+    reuse_existing: bool = False,
 ) -> Path:
     """Run ``Geoshield/geoshield.py`` once and return the dir of attacked images.
+
+    ``reuse_existing``: if an attacked dir for this output path already holds ``n_images``
+    files, return it without re-running GeoShield (the clean copies are deterministic, so
+    outputs of an interrupted run stay valid).
+
+    ``input_res`` overrides GeoShield's ``model.input_res`` (default 640 in its config). The
+    attacked model takes 336x336 inputs, so running GeoShield at 336 applies its l_inf
+    budget at the evaluated resolution instead of at 640 px followed by a bicubic downscale.
 
     GeoShield writes to ``<output>/img/<config_hash>+geoshield/<clean_basename>/``; the
     most recently written matching dir is returned (mirroring the former bash ``find``).
@@ -104,6 +187,14 @@ def _run_geoshield_generation(
     output_root = Path(output_path)
     output_root.mkdir(parents=True, exist_ok=True)
     clean_basename = Path(clean_dir).name
+
+    if reuse_existing:
+        done = [d for d in (output_root / "img").glob(f"*+geoshield/{clean_basename}")
+                if d.is_dir() and sum(1 for f in d.iterdir() if f.is_file()) >= int(n_images)]
+        if done:
+            attacked_dir = max(done, key=lambda d: d.stat().st_mtime)
+            print(f"GeoShield: reusing existing attacked images (eps={epsilon}): {attacked_dir}")
+            return attacked_dir
 
     cmd = [
         python_exe,
@@ -115,7 +206,9 @@ def _run_geoshield_generation(
         f"optim.epsilon={int(epsilon)}",
         f"optim.steps={int(steps)}",
     ]
-    print(f"GeoShield: running attack (epsilon={epsilon}/255, steps={steps})...")
+    if input_res is not None:
+        cmd.append(f"model.input_res={int(input_res)}")
+    print(f"GeoShield: running attack (epsilon={epsilon}/255, steps={steps}, input_res={input_res or 'default'})...")
     subprocess.run(cmd, cwd=str(repos_root), check=True)
 
     img_root = output_root / "img"
@@ -140,8 +233,12 @@ def generate_geoshield_pairs(
     window_start: int = 0,
     window_end: Optional[int] = None,
     run_tag: Optional[str] = None,
+    pipeline=None,
 ) -> Tuple[List[str], List[str], Dict[str, GpsCoord]]:
     """Generate GeoShield-attacked images for every budget.
+
+    ``pipeline`` (the attacked PLONK pipeline) makes ``clean_preprocess="model"`` use that
+    model's own conditional preprocessing for the clean copies (see ``_select_clean_images``).
 
     Returns ``(clean_image_dirs, attacked_image_dirs, gps_by_filename)`` -- one dir entry
     per budget, ready for ``PrecomputedPairEvaluationRunner``, plus a filename -> GPS map
@@ -159,6 +256,10 @@ def generate_geoshield_pairs(
     script = geoshield_cfg.get("script", "Geoshield/geoshield.py")
     python_exe = geoshield_cfg.get("python") or sys.executable
     steps = int(geoshield_cfg.get("steps", 100))
+    input_res = geoshield_cfg.get("input_res")  # None => GeoShield's own default (640)
+    clean_image_format = geoshield_cfg.get("clean_image_format", "png")
+    clean_preprocess = geoshield_cfg.get("clean_preprocess", "none")  # "model" => PLONK crop+resize square
+    reuse_existing = bool(geoshield_cfg.get("reuse_existing", False))
     clean_dir_base = geoshield_cfg.get("clean_dir")
     output_base = geoshield_cfg.get("output_base")
     if not clean_dir_base or not output_base:
@@ -188,7 +289,11 @@ def generate_geoshield_pairs(
 
     local_dir = (config.get("data_dirs", {}) or {}).get(dataset)
     gps_by_filename = _select_clean_images(
-        dataset, n_images, seed, local_dir, clean_dir, window_start, window_end
+        dataset, n_images, seed, local_dir, clean_dir, window_start, window_end,
+        clean_image_format=clean_image_format,
+        clean_preprocess=clean_preprocess,
+        input_res=int(input_res) if input_res is not None else None,
+        pipeline=pipeline,
     )
     num_images = len(gps_by_filename)  # actual images in this (windowed) selection
 
@@ -205,6 +310,8 @@ def generate_geoshield_pairs(
             n_images=num_images,
             epsilon=int(epsilon),
             steps=steps,
+            input_res=int(input_res) if input_res is not None else None,
+            reuse_existing=reuse_existing,
         )
         clean_dirs.append(str(clean_dir))
         attacked_dirs.append(str(attacked_dir))

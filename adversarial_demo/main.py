@@ -689,6 +689,7 @@ def _run_geoshield_step(
         attack_budgets=ctx.attack_budgets,
         seed=ctx.seed,
         geoshield_cfg=geoshield_cfg,
+        pipeline=ctx.pipeline,
     )
     runner = run_precomputed_attack_eval(
         pipeline=ctx.pipeline,
@@ -912,6 +913,17 @@ def _run_geoshield_shard(
 
     seed_everything(seed)
     pipeline = get_pipeline(config, dataset)
+    # Cross-model transfer ablation: same variants as the trainable shards.
+    run_model_transfer_ablation = bool(ctrls.get("run_model_transfer_ablation"))
+    model_transfer_types = normalize_model_transfer_types(ctrls.get("model_transfer_types"))
+    transfer_pipelines = (
+        load_transfer_pipelines(config, dataset, model_transfer_types, pipeline)
+        if run_model_transfer_ablation
+        else {}
+    )
+    # Score GeoShield exactly like the trainable attacks: the dataset's restart_eval_*
+    # settings (batch size / guidance / steps of the main evaluation).
+    eval_kwargs = get_attack_kwargs(config, dataset)[0]
     clean_dirs, attacked_dirs, gps_by_filename = generate_geoshield_pairs(
         config=config,
         dataset=dataset,
@@ -922,6 +934,7 @@ def _run_geoshield_shard(
         window_start=window_start,
         window_end=window_end,
         run_tag=run_tag,
+        pipeline=pipeline,
     )
     run_precomputed_attack_eval(
         pipeline=pipeline,
@@ -948,6 +961,13 @@ def _run_geoshield_shard(
         run_cfg_ablation=bool(ctrls.get("run_cfg_ablation")),
         eval_cfgs=ctrls.get("eval_cfgs"),
         cfg_num_steps=ctrls.get("cfg_num_steps"),
+        batch_size=int(eval_kwargs.get("restart_eval_batch_size", 256)),
+        cfg=float(eval_kwargs.get("restart_eval_cfg", 10.0)),
+        num_steps=eval_kwargs.get("restart_eval_num_steps"),
+        run_model_transfer_ablation=run_model_transfer_ablation,
+        model_transfer_types=model_transfer_types,
+        model_transfer_num_steps=ctrls.get("model_transfer_num_steps"),
+        transfer_pipelines=transfer_pipelines,
     )
     print(f"\nGeoShield shard complete! Results saved to: {shard_results_dir}")
 
@@ -1426,8 +1446,21 @@ def run_precomputed_attack_eval(
     run_cfg_ablation: bool = False,
     eval_cfgs: Optional[Sequence[float]] = None,
     cfg_num_steps: Optional[int] = None,
+    batch_size: int = 256,
+    cfg: float = 10.0,
+    num_steps: Optional[int] = None,
+    run_model_transfer_ablation: bool = False,
+    model_transfer_types: Optional[Sequence[str]] = None,
+    model_transfer_num_steps: Optional[int] = None,
+    transfer_pipelines: Optional[Dict[str, Any]] = None,
 ) -> "PrecomputedPairEvaluationRunner":
     """Evaluate precomputed clean/attacked pairs and persist results like any attack.
+
+    ``batch_size`` / ``cfg`` / ``num_steps`` are the baseline evaluation settings (pass the
+    dataset's ``restart_eval_*`` values so precomputed attacks are scored exactly like the
+    trainable ones; ``num_steps=None`` is the sampler default, 250). With
+    ``run_model_transfer_ablation`` and loaded ``transfer_pipelines`` the attacked image is
+    also re-evaluated against every PLONK variant (cross-model transfer).
 
     Shared by ``evaluate-geoshield-vs-diffusion`` and the GeoShield step folded into
     ``evaluate-dataset``. Returns the runner (use ``.metrics_collector.get_results()`` for
@@ -1459,8 +1492,14 @@ def run_precomputed_attack_eval(
         run_cfg_ablation=run_cfg_ablation,
         eval_cfgs=[float(c) for c in eval_cfgs] if eval_cfgs else None,
         cfg_num_steps=cfg_num_steps,
+        batch_size=int(batch_size),
+        cfg=float(cfg),
+        num_steps=int(num_steps) if num_steps is not None else None,
+        run_model_transfer_ablation=bool(run_model_transfer_ablation and transfer_pipelines),
+        model_transfer_types=list(model_transfer_types) if model_transfer_types else None,
+        model_transfer_num_steps=model_transfer_num_steps,
     )
-    runner = PrecomputedPairEvaluationRunner(precomputed_config, pipeline)
+    runner = PrecomputedPairEvaluationRunner(precomputed_config, pipeline, transfer_pipelines=transfer_pipelines)
     if run_config is not None:
         runner.save_run_config(run_config, suffix=precomputed_config.state_suffix)
     run_precomputed_pair_evaluation(runner)
@@ -1892,6 +1931,20 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         model_transfer_fn = plot_model_transfer_success_rate_tikz if tikz else plot_model_transfer_success_rate
         model_transfer_fn(json_results=json_results, plot_dir=plots_dir)
 
+    elif plot_type == "cfg":
+        if tikz:
+            raise ValueError("--tikz is not supported for plot_type 'cfg' (not part of the TikZ backend).")
+        from utils.plots.ablations import plot_cfg_success_rate
+        results_file = pick_value(
+            args.results_files[0] if args.results_files else None,
+            config.get("results_file"),
+            os.path.join(results_dir, f"{dataset}_cfg_results.json"),
+        )
+        print(f"Plotting guidance-scale (cfg) results from: {results_file}")
+        with open(results_file) as f:
+            json_results = json.load(f)
+        plot_cfg_success_rate(json_results=json_results, plot_dir=plots_dir)
+
     else:
         raise ValueError(f"Unknown plot type: {plot_type}")
 
@@ -2160,7 +2213,7 @@ Examples:
     plot_cmd.add_argument("plot_type", nargs="?",
                           choices=["results", "success-rate", "sampling-steps", "dtd-variance",
                                    "loss-vs-fsd", "clean-vs-attacked-displacement", "restarts",
-                                   "robustness", "model-transfer", "robustness-and-sampling-steps"],
+                                   "robustness", "model-transfer", "cfg", "robustness-and-sampling-steps"],
                           help="Type of plot to generate")
     plot_cmd.add_argument("--dataset", choices=["yfcc", "osv"], help="Dataset to plot")
     plot_cmd.add_argument("--attack-types", nargs="+", help="Attack types to plot (for 'results' plot type)")

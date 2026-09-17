@@ -39,7 +39,7 @@ fi
 ATTACK="${ATTACK_TYPES[$ATTACK_IDX]}"
 WINDOW_START=$(( WINDOW_IDX * IMAGES_PER_SHARD ))
 
-build_ablation_flags   # -> ABLATION_FLAGS (from the RUN_* toggles in config.sh)
+build_ablation_flags "${WINDOW_IDX}"   # -> ABLATION_FLAGS (RUN_* toggles; capped by ABLATION_WINDOWS)
 
 echo "=============================================================="
 echo "Shard task ${TASK}: attack='${ATTACK}' window ${WINDOW_IDX}/${NUM_WINDOWS}"
@@ -47,6 +47,7 @@ echo "  images [${WINDOW_START}:$(( WINDOW_START + IMAGES_PER_SHARD ))) of ${TOT
 echo "  budgets=${BUDGETS_OVERRIDE}  parallel_workers=${PARALLEL_WORKERS}"
 echo "  ablations: ${ABLATION_FLAGS[*]}"
 echo "  overrides: ${OVERRIDE_FLAGS[*]}"
+echo "  config:    ${CONFIG_PATH}"
 echo "=============================================================="
 
 module purge 2>/dev/null || true

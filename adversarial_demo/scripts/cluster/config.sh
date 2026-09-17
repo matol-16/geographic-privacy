@@ -61,6 +61,24 @@ read -r -a ROBUSTNESS_ATTACK_TYPES <<< "${ROBUSTNESS_ATTACK_TYPES_STR:-}"
 # transform grids etc. so a folded-in attack matches the original run exactly.
 read -r -a EXTRA_OVERRIDES <<< "${EXTRA_OVERRIDES_STR:-}"
 
+# Optional machine / run knobs, each turned into --override pairs below when set:
+#   DATA_ROOT        dir holding YFCC100M/yfcc4k and osv5m  -> data_dirs.{yfcc,osv}
+#   NUM_RESTARTS     restarts per image; sets BOTH attack_train_args.<ds>.num_restarts and
+#                    max_restarts (no extra ablation-only restarts)
+#   SAVE_DELTAS      1 -> persist every best perturbation (save_deltas)
+#   GEOSHIELD_IO_DIR base dir for GeoShield's clean copies / attacked outputs
+#                    -> geoshield.clean_dir=<dir>/clean, geoshield.output_base=<dir>/attacked
+#   ABLATION_WINDOWS run the (expensive) eval-time ablations only on the first N image
+#                    windows of every attack (a seeded random subset of N*IMAGES_PER_SHARD
+#                    images); the remaining windows compute the main result only. Empty
+#                    (default) = every window. The merge builds the ablation JSONs from the
+#                    windows that carry samples.
+DATA_ROOT="${DATA_ROOT:-}"
+NUM_RESTARTS="${NUM_RESTARTS:-}"
+SAVE_DELTAS="${SAVE_DELTAS:-}"
+GEOSHIELD_IO_DIR="${GEOSHIELD_IO_DIR:-}"
+ABLATION_WINDOWS="${ABLATION_WINDOWS:-}"
+
 # --- output paths ------------------------------------------------------------- #
 # Where shard outputs (RESULTS_BASE/shards/...) and merged results/plots go. Point this
 # at an existing full-run base to integrate a new attack into it.
@@ -78,14 +96,38 @@ OVERRIDE_FLAGS=(--override "attack_budgets.${DATASET}=${BUDGETS_OVERRIDE}")
 for _o in ${EXTRA_OVERRIDES[@]+"${EXTRA_OVERRIDES[@]}"}; do
   OVERRIDE_FLAGS+=(--override "${_o}")
 done
+if [[ -n "${DATA_ROOT}" ]]; then
+  OVERRIDE_FLAGS+=(--override "data_root=${DATA_ROOT}"
+                   --override "data_dirs.yfcc=${DATA_ROOT}/YFCC100M/yfcc4k"
+                   --override "data_dirs.osv=${DATA_ROOT}/osv5m")
+fi
+if [[ -n "${NUM_RESTARTS}" ]]; then
+  OVERRIDE_FLAGS+=(--override "attack_train_args.${DATASET}.num_restarts=${NUM_RESTARTS}"
+                   --override "max_restarts=${NUM_RESTARTS}")
+fi
+if [[ "${SAVE_DELTAS}" == 1 ]]; then
+  OVERRIDE_FLAGS+=(--override "save_deltas=true")
+fi
+if [[ -n "${GEOSHIELD_IO_DIR}" ]]; then
+  OVERRIDE_FLAGS+=(--override "geoshield.clean_dir=${GEOSHIELD_IO_DIR}/clean"
+                   --override "geoshield.output_base=${GEOSHIELD_IO_DIR}/attacked")
+fi
 
 # Assemble the ablation flags shared by the shard and merge commands from the toggles
 # above, so both stay in lock-step and new ablations are enabled in one place.
 # NB: uses if-blocks and a trailing `return 0` on purpose -- a bare `[[..]] && ..` as the
 # function's last statement returns non-zero when false and would abort callers under
 # `set -e`.
+# build_ablation_flags [window_idx]: with a window index and ABLATION_WINDOWS set, windows
+# >= ABLATION_WINDOWS get no eval-time ablation flags (main result only). The merge (no
+# window) always gets the full set, so it stitches the ablation samples that exist.
 build_ablation_flags() {
+  local window_idx="${1:-}"
   ABLATION_FLAGS=()
+  if [[ -n "${window_idx}" && -n "${ABLATION_WINDOWS}" ]] && (( window_idx >= ABLATION_WINDOWS )); then
+    ABLATION_FLAGS+=(--eval-num-steps "${EVAL_NUM_STEPS[@]}")   # harmless without the run flags
+    return 0
+  fi
   if [[ "${RUN_SAMPLING_STEPS_ABLATION}" == 1 ]]; then ABLATION_FLAGS+=(--run-sampling-steps-ablation); fi
   if [[ "${RUN_ROBUSTNESS_ABLATION}" == 1 ]];     then ABLATION_FLAGS+=(--run-robustness-ablation); fi
   if [[ "${RUN_MODEL_TRANSFER_ABLATION}" == 1 ]]; then ABLATION_FLAGS+=(--run-model-transfer-ablation); fi

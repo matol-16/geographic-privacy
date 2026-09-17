@@ -232,8 +232,26 @@ def _display_attack_name(attack_name: str) -> str:
     # --- GeoFA framework ---
     if normalized in ("dtd", "diffusion_cosine_neg"):
         return "GeoFA-TD"
+    if normalized in ("dtd_v2", "dtdv2"):
+        return "GeoFA-TD v2"
+    if normalized in ("dtd_v3", "dtdv3"):
+        return "GeoFA-TD v3"
+    if normalized in ("dtd_v3_old_forward", "dtdv3oldforward"):
+        return "GeoFA-TD v3 (old fwd.)"
+    if normalized in ("diffusion_l2_v2", "l2_v2"):
+        return "GeoFA-L2 v2"
+    if normalized in ("diffusion_l2_v3", "l2_v3"):
+        return "GeoFA-L2 v3"
+    if normalized == "sampling_v2":
+        return "GeoFA-sample v2"
+    if normalized in ("encoder_v3", "enc_v3"):
+        return "GeoFA-enc. v3"
+    if normalized in ("training_loss_v3", "traininglossv3", "advdm_v3"):
+        return "GeoFA-AdvDM v3"
     if normalized == "dtd_blur":
         return "GeoFA-TD-blur"
+    if normalized in ("dtd_blur_v3_old_forward", "dtdblurv3oldforward"):
+        return "GeoFA-TD-blur v3 (old fwd.)"
     if normalized == "targeted_l2":
         return "GeoFA-DPA"
     if normalized == "diffusion":

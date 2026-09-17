@@ -16,8 +16,8 @@
 #   * main results (displacement / success rate vs budget, per-attack spread, and the
 #     clean-vs-attacked heatmap restricted to the headline attacks on one line) -> plots/
 #     for BOTH datasets;
-#   * ablations (sampling steps, model transfer, robustness, restarts, localizability)
-#     -> plots/ on YFCC4k, plots_appendix/ on OSV;
+#   * ablations (sampling steps, guidance scale, model transfer, robustness, restarts,
+#     localizability) -> plots/ on YFCC4k, plots_appendix/ on OSV;
 #   * appendix-only variants on BOTH datasets: the robustness figures with all three
 #     success-rate thresholds (main paper keeps 2500 km only) and the heatmap over every
 #     attack (main paper: GeoShield, GeoFA-enc., GeoFA-AdvDM, GeoFA-DPA, GeoFA-TD).
@@ -171,6 +171,12 @@ run_dataset() {
     plot restarts "${ds}" "${base}" "${abl_dir}" "${cfg}" ${abl_suffix[@]+"${abl_suffix[@]}"}
   else
     echo ">>> [${ds}] no restarts JSON -- skipping"
+  fi
+  if [[ -f "${base}/${ds}_cfg_results.json" ]]; then
+    # guidance-scale sweep; matplotlib only (no TikZ twin).
+    plot cfg "${ds}" "${base}" "${abl_dir}" "${cfg}" ${abl_suffix[@]+"${abl_suffix[@]}"}
+  else
+    echo ">>> [${ds}] no cfg JSON -- skipping"
   fi
   if [[ -f "${base}/${ds}_robustness_results.json" ]]; then
     # Main-paper version: 2500 km only. On OSV the ablations are appendix material, so

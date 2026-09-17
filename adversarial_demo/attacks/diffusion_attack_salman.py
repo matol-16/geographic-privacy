@@ -33,6 +33,8 @@ class SamplingAttack(AttackBase):
         restart_selection_metric: str = "mean_step_displacement",
         device: str = "cuda",
         x0_bank: Optional[torch.Tensor] = None,
+        reference: str = "clean_prediction",
+        true_gps: Optional[Any] = None,
     ):
         super().__init__(
             pipeline=pipeline,
@@ -59,6 +61,19 @@ class SamplingAttack(AttackBase):
         self.sampling_cfg = 0.0
         self.reconstruction_loss_weight = float(reconstruction_loss_weight)
         self.delta_init = float(delta_init)
+
+        # What the perturbed prediction is pushed away from (haversine, maximised):
+        #   "clean_prediction": the clean model's prediction from the same initial noise (v1);
+        #   "true_location":    the image's true (lat, lon) -- paper Eq. 8, D(x_hat_0^{c+delta}, x_0^c).
+        if reference not in ("clean_prediction", "true_location"):
+            raise ValueError(f"Unknown reference={reference!r}; expected 'clean_prediction' or 'true_location'")
+        self.reference = reference
+        self.true_gps = tuple(float(v) for v in true_gps) if true_gps is not None else None
+        if self.reference == "true_location":
+            if self.true_gps is None:
+                raise ValueError("reference='true_location' requires the image's true GPS (true_gps=(lat, lon)).")
+            # (1, 2) in radians, the unit ``pipeline.postprocessing`` / ``haversine`` work in.
+            self._true_gps_rad = torch.deg2rad(torch.tensor([self.true_gps], device=self.device, dtype=torch.float32))
 
         self._clean_embedding = compute_embedding(
             self.source_tensor,
@@ -105,7 +120,7 @@ class SamplingAttack(AttackBase):
 
         x_t = torch.randn(self.train_batch_size, 3, device=self.device)
 
-        perturbed_source = self.source_tensor + delta
+        perturbed_source = self.perturbed_input(delta)
         emb_perturbed = compute_embedding(
             perturbed_source,
             self.train_batch_size,
@@ -115,14 +130,16 @@ class SamplingAttack(AttackBase):
         )
 
         pred_perturbed = self._sample_cartesian(emb_perturbed, x_t)
-        with torch.no_grad():
-            pred_clean = self._sample_cartesian(self._clean_embedding, x_t)
-
         pred_perturbed_gps = self.pipeline.postprocessing(pred_perturbed)
-        with torch.no_grad():
-            pred_clean_gps = self.pipeline.postprocessing(pred_clean)
 
-        loss = -haversine(pred_perturbed_gps, pred_clean_gps).mean()
+        if self.reference == "true_location":
+            reference_gps = self._true_gps_rad.expand(pred_perturbed_gps.shape[0], -1)
+        else:
+            with torch.no_grad():
+                pred_clean = self._sample_cartesian(self._clean_embedding, x_t)
+                reference_gps = self.pipeline.postprocessing(pred_clean)
+
+        loss = -haversine(pred_perturbed_gps, reference_gps).mean()
 
         # Reconstruction loss
         if self.reconstruction_loss_weight > 0:
@@ -155,4 +172,6 @@ class SamplingAttack(AttackBase):
             "reconstruction_loss_weight": self.reconstruction_loss_weight,
             "delta_init": self.delta_init,
             "num_restarts": self.restart_manager.num_restarts,
+            "reference": self.reference,
+            "true_gps": list(self.true_gps) if self.true_gps is not None else None,
         }

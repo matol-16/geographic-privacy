@@ -274,10 +274,16 @@ def plot_restarts_success(
                 bkey = f"budget_{budget:.6f}"
                 color = colors[color_idx % len(colors)]
                 label = f"{attack_type} eps={budget:.3f}"
+                # Only images with the full restart depth (missing / partial shards leave
+                # empty or shorter lists); skip the curve if none has it.
                 curves = np.array([
-                    json_results["results"][attack_type][bkey][f"image_{i}"]["best_after_k"]
-                    for i in range(n_images)
+                    c for i in range(n_images)
+                    if len(c := json_results["results"][attack_type][bkey][f"image_{i}"]["best_after_k"]) >= max_restarts
                 ])
+                if curves.size == 0:
+                    color_idx += 1
+                    continue
+                curves = curves[:, :max_restarts]
                 mean = curves.mean(axis=0)
                 std = curves.std(axis=0)
                 xs = list(range(1, max_restarts + 1))
@@ -775,28 +781,28 @@ def _get_clean_vs_attacked_true_samples(res, budget_idx):
 
     budget_restarts = restart_results[budget_idx]
     image_idx_list = []
-    gps_source_list = []
-    true_gps_list = []
+    dist_list = []
     for img_idx, image_results in enumerate(budget_restarts):
         for restart_result in (image_results or []):
             gps_source = restart_result.get("gps_source")
             true_gps = restart_result.get("true_gps")
             if gps_source is None or true_gps is None:
                 continue
+            # ``gps_source`` is the clean prediction batch, (num_samples, 2) -- older states
+            # stored a single (1, 2) sample. Average the distance to the true location over
+            # whatever samples are stored.
+            samples = gps_source.detach().cpu().float().reshape(-1, 2)
+            true_batch = torch.as_tensor(true_gps, dtype=torch.float32).detach().cpu().reshape(1, 2).expand_as(samples)
             image_idx_list.append(img_idx)
-            gps_source_list.append(gps_source.detach().cpu().float().reshape(2))
-            true_gps_list.append(torch.as_tensor(true_gps, dtype=torch.float32).detach().cpu().reshape(2))
+            dist_list.append(float(trajectory_displacement(true_batch.unsqueeze(0), samples.unsqueeze(0)).mean()))
 
     n_images = len(budget_restarts)
     baseline_sum = np.zeros(n_images, dtype=np.float64)
     baseline_count = np.zeros(n_images, dtype=np.int64)
 
-    if gps_source_list:
-        gps_source_batch = torch.stack(gps_source_list).unsqueeze(0)  # (1, N, 2)
-        true_gps_batch = torch.stack(true_gps_list).unsqueeze(0)  # (1, N, 2)
-        dists = trajectory_displacement(true_gps_batch, gps_source_batch)[0].numpy()  # (N,)
+    if dist_list:
         image_idx_arr = np.asarray(image_idx_list)
-        np.add.at(baseline_sum, image_idx_arr, dists)
+        np.add.at(baseline_sum, image_idx_arr, np.asarray(dist_list))
         np.add.at(baseline_count, image_idx_arr, 1)
 
     with np.errstate(invalid="ignore"):

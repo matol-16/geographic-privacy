@@ -98,6 +98,10 @@ class EvaluationConfig:
     run_cfg_ablation: bool = False
     eval_cfgs: Optional[List[float]] = None
     cfg_num_steps: Optional[int] = None
+    # Persist each best perturbation (delta, float32, model-input resolution) under
+    # ``<results_dir>/deltas/`` so the attacked image can be re-evaluated offline (other
+    # samplers / cfg / models / seeds) without retraining. Config key ``save_deltas``.
+    save_deltas: bool = False
 
 
 @dataclass
@@ -138,6 +142,13 @@ class PrecomputedPairEvaluationConfig:
     run_cfg_ablation: bool = False
     eval_cfgs: Optional[List[float]] = None
     cfg_num_steps: Optional[int] = None
+    # Cross-model transfer ablation: the attacked image is re-evaluated against every
+    # loaded PLONK variant (``transfer_pipelines`` are supplied to the runner separately,
+    # as for EvaluationRunner). ``model_transfer_num_steps`` of None falls back to
+    # ``num_steps`` (the baseline evaluation).
+    run_model_transfer_ablation: bool = False
+    model_transfer_types: Optional[List[str]] = None
+    model_transfer_num_steps: Optional[int] = None
 
 
 class ImageLoader:
@@ -246,14 +257,25 @@ class ResultsManager:
         attack_kwargs: List[Dict[str, Any]],
         dataset: str,
         suffix: str = "",
+        attack_type_kwargs: Optional[Dict[str, Dict[str, Any]]] = None,
+        attack_impl: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> None:
-        """Save attack arguments for reproducibility."""
+        """Save attack arguments for reproducibility.
+
+        ``attack_type_kwargs`` are the per-attack overrides (incl. ``attack_variant`` pins) and
+        ``attack_impl`` the implementation label / config that actually ran per attack key.
+        """
         filename = f"{dataset}_attack_args{suffix}.pt"
         path = os.path.join(self.results_dir, filename)
-        torch.save({
+        payload: Dict[str, Any] = {
             "attack_budgets": attack_budgets,
             "attack_kwargs": attack_kwargs,
-        }, path)
+        }
+        if attack_type_kwargs:
+            payload["attack_type_kwargs"] = attack_type_kwargs
+        if attack_impl:
+            payload["attack_impl"] = attack_impl
+        torch.save(payload, path)
         print(f"Saved attack args to: {path}")
 
     def load_attack_args(self, dataset: str, suffix: str = "") -> Dict[str, Any]:
@@ -389,6 +411,10 @@ class MetricsCollector:
             attack_type: [[None for _ in range(n_images)] for _ in attack_budgets]
             for attack_type in attack_types
         }
+        # Which implementation actually ran under each attack key (first result seen):
+        # {"attack_type": <label, e.g. "dtd_v3_old_forward" when "dtd" is pinned to it>,
+        #  "config": <the attack's own get_config()>}. Provenance only; saved in the state.
+        self.attack_impl: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _to_cpu_tensor(value: Any) -> Any:
@@ -404,18 +430,25 @@ class MetricsCollector:
         true_gps: Optional[Tuple[float, float]] = None,
     ) -> Dict[str, Any]:
         def _final_step_tensor(val: Any) -> Any:
+            """Final-step coordinates as a ``(num_samples, 2)`` tensor.
+
+            The pipeline's ``gps_*`` output is already the final step of every sample in the
+            batch, shaped ``(num_samples, 2)`` -- NOT a ``(steps, 2)`` trajectory (those are
+            returned separately as ``traj_*`` and are dropped here to keep the state small).
+            Keep all samples: ``final_step_displacement_true`` below is their mean vs the true
+            location, matching the paired ``final_step_displacement`` metric, and the clean
+            prediction stored in ``location_results`` is the same batch.
+            """
             v = self._to_cpu_tensor(val)
-            # If we have a multi-step trajectory shaped (steps, 2), keep only final step
             if isinstance(v, torch.Tensor):
-                # ensure final-step has shape (1, 2) for compatibility
-                if v.ndim == 2 and v.shape[-1] == 2:
-                    if v.shape[0] > 1:
-                        v = v[-1].unsqueeze(0)
-                    else:
-                        v = v.view(1, 2)
-                # If already a single coordinate (2,), convert to (1,2)
+                if v.ndim == 3 and v.shape[-1] == 2:
+                    # (steps, num_samples, 2) trajectory: keep the last step only.
+                    v = v[-1]
                 elif v.ndim == 1 and v.shape[0] == 2:
+                    # single coordinate (2,) -> (1, 2)
                     v = v.view(1, 2)
+                if v.ndim == 2 and v.shape[-1] == 2:
+                    v = v.reshape(-1, 2).contiguous()
             return v
 
         normalized: Dict[str, Any] = {
@@ -429,14 +462,20 @@ class MetricsCollector:
         if clean_metric is not None:
             normalized["final_step_displacement_predicted"] = float(clean_metric)
 
-        if true_gps is not None and normalized["gps_perturbed"] is not None:
-            perturbed = normalized["gps_perturbed"]
-            if isinstance(perturbed, torch.Tensor) and perturbed.ndim == 2 and perturbed.shape[-1] == 2:
-                source_coords = torch.tensor(true_gps, dtype=perturbed.dtype).view(1, 1, 2)
-                source_coords = source_coords.expand(1, perturbed.shape[0], 2)
-                perturbed_traj = perturbed.unsqueeze(0)
-                true_disp = trajectory_displacement(source_coords, perturbed_traj)
-                normalized["final_step_displacement_true"] = float(true_disp.mean().item())
+        def _mean_displacement_to_true(coords: Any) -> Optional[float]:
+            # Mean haversine distance (km) between the true location and every sample.
+            if not (isinstance(coords, torch.Tensor) and coords.ndim == 2 and coords.shape[-1] == 2):
+                return None
+            true_coords = torch.tensor(true_gps, dtype=coords.dtype).view(1, 1, 2).expand(1, coords.shape[0], 2)
+            return float(trajectory_displacement(true_coords, coords.unsqueeze(0)).mean().item())
+
+        if true_gps is not None:
+            true_disp = _mean_displacement_to_true(normalized["gps_perturbed"])
+            if true_disp is not None:
+                normalized["final_step_displacement_true"] = true_disp
+            source_true_disp = _mean_displacement_to_true(normalized["gps_source"])
+            if source_true_disp is not None:
+                normalized["final_step_displacement_source_true"] = source_true_disp
 
         normalized["true_gps"] = torch.tensor(true_gps, dtype=torch.float32) if true_gps is not None else None
 
@@ -467,6 +506,16 @@ class MetricsCollector:
             raise ValueError("Attack result missing 'best_metrics' key")
 
         true_gps = self.source_gps[image_index] if self.source_gps is not None else None
+
+        if attack_type not in self.attack_impl and attack_result.get("attack_type") is not None:
+            impl_label = str(attack_result["attack_type"])
+            impl_config = attack_result.get("config")
+            self.attack_impl[attack_type] = {
+                "attack_type": impl_label,
+                "config": dict(impl_config) if isinstance(impl_config, dict) else impl_config,
+            }
+            if impl_label != str(attack_type):
+                print(f"[attack impl] '{attack_type}' runs as '{impl_label}'")
 
         best_metrics = attack_result["best_metrics"]
         restart_results = [
@@ -662,6 +711,7 @@ class BaseEvaluationRunner:
             "robustness_results": mc.robustness_results,
             "model_transfer_results": mc.model_transfer_results,
             "cfg_results": mc.cfg_results,
+            "attack_impl": mc.attack_impl,
         }
 
     def _state_file_suffix(self) -> str:
@@ -1081,6 +1131,8 @@ class EvaluationRunner(BaseEvaluationRunner):
             self.config.attack_budgets,
             self.config.attack_kwargs,
             self.config.dataset,
+            attack_type_kwargs=self.config.attack_type_kwargs,
+            attack_impl=self.metrics_collector.attack_impl,
         )
 
     # ---- Per-attack kwargs ------------------------------------------------- #
@@ -1093,12 +1145,46 @@ class EvaluationRunner(BaseEvaluationRunner):
 
     # ---- Sampling-steps ablation ------------------------------------------ #
 
+    def save_delta(self, attack_type: str, budget_idx: int, image_idx: int, result: Dict[str, Any]) -> None:
+        """Persist the best perturbation of one (attack, budget, image) when ``save_deltas`` is set.
+
+        File: ``<results_dir>/deltas/<attack>_e<eps>_<image_id>.pt`` holding the float32 CPU
+        ``delta`` (model-input resolution, L-inf <= eps) plus its bookkeeping, enough to
+        rebuild the attacked image with ``add_perturbation_to_image`` and re-evaluate it.
+        """
+        if not getattr(self.config, "save_deltas", False):
+            return
+        delta = result.get("delta")
+        if delta is None:
+            return
+        import torch
+        out_dir = os.path.join(self.config.results_dir, "deltas")
+        os.makedirs(out_dir, exist_ok=True)
+        eps = float(self.config.attack_budgets[budget_idx])
+        ids = getattr(self.metrics_collector, "source_image_ids", None)
+        image_id = str(ids[image_idx]) if ids else str(image_idx)
+        torch.save(
+            {
+                "attack_type": attack_type,
+                "eps": eps,
+                "image_index": int(image_idx),
+                "image_id": image_id,
+                "delta": delta.detach().to("cpu", torch.float32),
+                "true_gps": (self.metrics_collector.source_gps[image_idx] if self.metrics_collector.source_gps is not None else None),
+                # {"steps"|"cfg"|"transfer": {key: {"gps_source", "gps_perturbed"}}} sample batches of the
+                # eval-time ablations (empty when disabled) -> GT-based metrics offline.
+                "ablation_gps": result.get("ablation_gps", {}),
+            },
+            os.path.join(out_dir, f"{attack_type}_e{round(eps * 255)}_{image_id}.pt"),
+        )
+
     def compute_sampling_steps_samples(
         self,
         attack_type: str,
         budget_idx: int,
         image: Image.Image,
         result: Dict[str, Any],
+        gps_out: Optional[Dict[Any, Dict[str, Any]]] = None,
     ) -> Optional[Dict[int, float]]:
         """Re-evaluate the best perturbation at every ``eval_num_steps`` count.
 
@@ -1128,6 +1214,7 @@ class EvaluationRunner(BaseEvaluationRunner):
             # paired displacement is comparable across images and step counts.
             seed=int(self.config.seed),
             device=str(kwargs.get("device", "cuda")),
+            gps_out=gps_out,
         )
 
     # ---- Robustness-to-transformation ablation ----------------------------- #
@@ -1194,6 +1281,7 @@ class EvaluationRunner(BaseEvaluationRunner):
         budget_idx: int,
         image: Image.Image,
         result: Dict[str, Any],
+        gps_out: Optional[Dict[Any, Dict[str, Any]]] = None,
     ) -> Optional[Dict[str, float]]:
         """Re-evaluate the best perturbation's attacked image against every model variant.
 
@@ -1230,6 +1318,7 @@ class EvaluationRunner(BaseEvaluationRunner):
             seed=int(self.config.seed),
             device=str(kwargs.get("device", "cuda")),
             num_steps=int(num_steps) if num_steps is not None else None,
+            gps_out=gps_out,
         )
 
     # ---- Guidance-scale (cfg) ablation ------------------------------------- #
@@ -1240,6 +1329,7 @@ class EvaluationRunner(BaseEvaluationRunner):
         budget_idx: int,
         image: Image.Image,
         result: Dict[str, Any],
+        gps_out: Optional[Dict[Any, Dict[str, Any]]] = None,
     ) -> Optional[Dict[float, float]]:
         """Re-evaluate the best perturbation at every ``eval_cfgs`` guidance scale.
 
@@ -1274,6 +1364,7 @@ class EvaluationRunner(BaseEvaluationRunner):
             # noise for clean vs perturbed keeps the paired displacement comparable.
             seed=int(self.config.seed),
             device=str(kwargs.get("device", "cuda")),
+            gps_out=gps_out,
         )
 
 
@@ -1282,8 +1373,11 @@ class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
 
     state_kind = "precomputed evaluation"
 
-    def __init__(self, config: PrecomputedPairEvaluationConfig, pipeline):
+    def __init__(self, config: PrecomputedPairEvaluationConfig, pipeline, transfer_pipelines=None):
         super().__init__(config, pipeline)
+        # Loaded PLONK variants for the cross-model transfer ablation ({label: pipeline},
+        # see utils.ablations.model_type_label); empty unless the ablation is on.
+        self.transfer_pipelines: Dict[str, Any] = transfer_pipelines or {}
 
         self.pairs_by_budget = [
             collect_common_image_pairs(clean_dir, attacked_dir)
@@ -1385,6 +1479,9 @@ class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
             "run_cfg_ablation": self.config.run_cfg_ablation,
             "eval_cfgs": list(self.config.eval_cfgs) if self.config.eval_cfgs else None,
             "cfg_num_steps": self.config.cfg_num_steps,
+            "run_model_transfer_ablation": self.config.run_model_transfer_ablation,
+            "model_transfer_types": list(self.config.model_transfer_types) if self.config.model_transfer_types else None,
+            "model_transfer_num_steps": self.config.model_transfer_num_steps,
         }
 
     def _signature_match_keys(self) -> List[str]:
@@ -1407,6 +1504,9 @@ class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
             "run_cfg_ablation",
             "eval_cfgs",
             "cfg_num_steps",
+            "run_model_transfer_ablation",
+            "model_transfer_types",
+            "model_transfer_num_steps",
         ]
 
     def _budget_identity_from_signature(self, signature: Dict[str, Any], budget_idx: int) -> Any:
@@ -1463,15 +1563,25 @@ class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
 
 
 def _maybe_add_true_gps(runner, attack_type: str, image_idx: int, kwargs: Dict[str, Any]) -> None:
-    """Give the targeted-L2 attack the image's real GPS so it can aim at the antipode.
+    """Give attacks that need the image's real GPS access to it.
 
-    Harmless no-op for every other attack: the kwarg is only injected for the targeted-L2
-    family, and it is a transient per-call value (never persisted into the saved config).
+    The targeted-L2 family aims at the antipode; the ``*_v3`` attacks (``dtd_v3``,
+    ``training_loss_v3``) noise the TRUE location in their forward process (paper Eq. 1 / 9 /
+    15) instead of clean-model samples. Harmless no-op for every other attack, and a transient
+    per-call value (never persisted into the saved config).
     """
-    if str(attack_type).lower() not in (
+    needs_true_gps = (
         "targeted_l2", "targetedl2", "l2_target",
         "cosine_targeted", "cosinetargeted", "cosine_target",
-    ):
+        "dtd_v3", "dtdv3", "dtd_v3_old_forward", "dtdv3oldforward",
+        "dtd_blur_v3_old_forward", "dtdblurv3oldforward",
+        "training_loss_v3", "traininglossv3", "advdm_v3",
+        "diffusion_l2_v3", "l2_v3", "sampling_v2",
+    )
+    # A canonical key may be pinned to one of those implementations (``attack_variant``,
+    # see attacks.run_attack); the pin decides what the attack actually needs.
+    effective_type = kwargs.get("attack_variant") or attack_type
+    if str(effective_type).lower() not in needs_true_gps:
         return
     source_gps = getattr(runner, "source_gps", None)
     if source_gps is not None and image_idx < len(source_gps):
@@ -1511,10 +1621,12 @@ def parallel_evaluate_attacks(
                     silent=True,
                     **kwargs,
                 )
-                steps_samples = runner.compute_sampling_steps_samples(attack_type, budget_idx, image, result)
+                abl_gps: Dict[str, Dict[Any, Dict[str, Any]]] = {"steps": {}, "transfer": {}, "cfg": {}}
+                result["ablation_gps"] = abl_gps
+                steps_samples = runner.compute_sampling_steps_samples(attack_type, budget_idx, image, result, gps_out=abl_gps["steps"])
                 robustness_samples = runner.compute_robustness_samples(attack_type, budget_idx, image_idx, image, result)
-                model_transfer_samples = runner.compute_model_transfer_samples(attack_type, budget_idx, image, result)
-                cfg_samples = runner.compute_cfg_samples(attack_type, budget_idx, image, result)
+                model_transfer_samples = runner.compute_model_transfer_samples(attack_type, budget_idx, image, result, gps_out=abl_gps["transfer"])
+                cfg_samples = runner.compute_cfg_samples(attack_type, budget_idx, image, result, gps_out=abl_gps["cfg"])
             stream.synchronize()
         else:
             result = run_attack(
@@ -1525,10 +1637,12 @@ def parallel_evaluate_attacks(
                 silent=True,
                 **kwargs,
             )
-            steps_samples = runner.compute_sampling_steps_samples(attack_type, budget_idx, image, result)
+            abl_gps: Dict[str, Dict[Any, Dict[str, Any]]] = {"steps": {}, "transfer": {}, "cfg": {}}
+            result["ablation_gps"] = abl_gps
+            steps_samples = runner.compute_sampling_steps_samples(attack_type, budget_idx, image, result, gps_out=abl_gps["steps"])
             robustness_samples = runner.compute_robustness_samples(attack_type, budget_idx, image_idx, image, result)
-            model_transfer_samples = runner.compute_model_transfer_samples(attack_type, budget_idx, image, result)
-            cfg_samples = runner.compute_cfg_samples(attack_type, budget_idx, image, result)
+            model_transfer_samples = runner.compute_model_transfer_samples(attack_type, budget_idx, image, result, gps_out=abl_gps["transfer"])
+            cfg_samples = runner.compute_cfg_samples(attack_type, budget_idx, image, result, gps_out=abl_gps["cfg"])
 
         return attack_type, budget_idx, image_idx, result, steps_samples, robustness_samples, model_transfer_samples, cfg_samples
 
@@ -1546,6 +1660,7 @@ def parallel_evaluate_attacks(
                 image_idx,
                 result,
             )
+            runner.save_delta(attack_type, budget_idx, image_idx, result)
             if steps_samples is not None:
                 runner.metrics_collector.record_sampling_steps(
                     attack_type, budget_idx, image_idx, steps_samples
@@ -1606,7 +1721,9 @@ def sequential_evaluate_attacks(
             image_idx,
             result,
         )
-        steps_samples = runner.compute_sampling_steps_samples(attack_type, budget_idx, image, result)
+        abl_gps: Dict[str, Dict[Any, Dict[str, Any]]] = {"steps": {}, "transfer": {}, "cfg": {}}
+        result["ablation_gps"] = abl_gps
+        steps_samples = runner.compute_sampling_steps_samples(attack_type, budget_idx, image, result, gps_out=abl_gps["steps"])
         if steps_samples is not None:
             runner.metrics_collector.record_sampling_steps(
                 attack_type, budget_idx, image_idx, steps_samples
@@ -1616,16 +1733,17 @@ def sequential_evaluate_attacks(
             runner.metrics_collector.record_robustness(
                 attack_type, budget_idx, image_idx, robustness_samples
             )
-        model_transfer_samples = runner.compute_model_transfer_samples(attack_type, budget_idx, image, result)
+        model_transfer_samples = runner.compute_model_transfer_samples(attack_type, budget_idx, image, result, gps_out=abl_gps["transfer"])
         if model_transfer_samples is not None:
             runner.metrics_collector.record_model_transfer(
                 attack_type, budget_idx, image_idx, model_transfer_samples
             )
-        cfg_samples = runner.compute_cfg_samples(attack_type, budget_idx, image, result)
+        cfg_samples = runner.compute_cfg_samples(attack_type, budget_idx, image, result, gps_out=abl_gps["cfg"])
         if cfg_samples is not None:
             runner.metrics_collector.record_cfg(
                 attack_type, budget_idx, image_idx, cfg_samples
             )
+        runner.save_delta(attack_type, budget_idx, image_idx, result)  # after the ablations: stores their GPS samples too
         runner.save_state()
 
         pbar.set_postfix(
@@ -1751,6 +1869,23 @@ def run_precomputed_pair_evaluation(runner: PrecomputedPairEvaluationRunner) -> 
             )
             runner.metrics_collector.record_cfg(
                 attack_type, budget_idx, image_idx, cfg_samples
+            )
+
+        if cfg.run_model_transfer_ablation and runner.transfer_pipelines:
+            from utils.ablations import evaluate_pair_across_models
+            transfer_num_steps = cfg.model_transfer_num_steps if cfg.model_transfer_num_steps is not None else cfg.num_steps
+            transfer_samples = evaluate_pair_across_models(
+                transfer_pipelines=runner.transfer_pipelines,
+                source_image=clean_image,
+                perturbed_image=attacked_image,
+                cfg=cfg.cfg,
+                batch_size=cfg.batch_size,
+                seed=int(cfg.seed),
+                device=cfg.device,
+                num_steps=int(transfer_num_steps) if transfer_num_steps is not None else None,
+            )
+            runner.metrics_collector.record_model_transfer(
+                attack_type, budget_idx, image_idx, transfer_samples
             )
 
         runner.save_state()

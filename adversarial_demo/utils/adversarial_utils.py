@@ -30,6 +30,7 @@ SUPPORTED_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".
 ############################################################################################
 
 
+
 def resolve_torch_device(device: Any = "cuda") -> str:
     """Return a valid torch device string, falling back to CPU when CUDA is unavailable."""
     resolved = str(device)
@@ -85,29 +86,106 @@ def conditional_preprocessing(source_image, pipeline, device="cuda"):
     return tensor
 
 
-def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
-    """Convert tensor back to PIL image with proper denormalization."""
-    # Unnormalize (assuming normalization with mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    unnormalize = transforms.Normalize(
-        mean=[-0.5 / 0.5, -0.5 / 0.5, -0.5 / 0.5],
-        std=[1 / 0.5, 1 / 0.5, 1 / 0.5]
-    )
-    unnormalized_tensor = unnormalize(tensor.squeeze(0)).clamp(0, 1)
-    
-    # Convert to PIL image
-    pil_image = transforms.ToPILImage()(unnormalized_tensor.cpu())
-    return pil_image
+# Normalisation statistics of the two encoders (fallbacks when they cannot be read off the
+# pipeline). DINOv2 uses the ImageNet statistics, StreetCLIP the CLIP ones.
+_IMAGENET_MEAN, _IMAGENET_STD = (0.485, 0.456, 0.406), (0.229, 0.224, 0.225)
+_CLIP_MEAN, _CLIP_STD = (0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)
+
+
+def _is_dinov2_pipeline(pipeline) -> bool:
+    return ("YFCC" in pipeline.model_path) or ("iNaturalist" in pipeline.model_path)
+
+
+def encoder_normalization(pipeline, device="cuda", dtype=torch.float32):
+    """Return the (mean, std) the pipeline's encoder normalises pixels with, as [1, 3, 1, 1].
+
+    Read off the pipeline's own preprocessing so the inverse below matches it exactly;
+    falls back to the canonical ImageNet / CLIP constants if the transform is not found.
+    """
+    mean, std = None, None
+    try:
+        if _is_dinov2_pipeline(pipeline):
+            for t in pipeline.cond_preprocessing.augmentation.transforms:
+                if isinstance(t, transforms.Normalize):
+                    mean, std = t.mean, t.std
+        else:
+            ip = pipeline.cond_preprocessing.processor.image_processor
+            mean, std = ip.image_mean, ip.image_std
+    except AttributeError:
+        pass
+    if mean is None or std is None:
+        mean, std = (_IMAGENET_MEAN, _IMAGENET_STD) if _is_dinov2_pipeline(pipeline) else (_CLIP_MEAN, _CLIP_STD)
+    mean = torch.as_tensor(mean, dtype=dtype, device=device).view(1, 3, 1, 1)
+    std = torch.as_tensor(std, dtype=dtype, device=device).view(1, 3, 1, 1)
+    return mean, std
+
+
+def normalized_to_pixels(tensor: torch.Tensor, pipeline) -> torch.Tensor:
+    """Encoder-input tensor (normalised) -> pixel tensor in [0, 1] (not clamped)."""
+    mean, std = encoder_normalization(pipeline, device=tensor.device, dtype=tensor.dtype)
+    return tensor * std + mean
+
+
+def pixels_to_normalized(pixels: torch.Tensor, pipeline) -> torch.Tensor:
+    """Pixel tensor in [0, 1] -> encoder-input tensor (normalised)."""
+    mean, std = encoder_normalization(pipeline, device=pixels.device, dtype=pixels.dtype)
+    return (pixels - mean) / std
+
+
+def perturbed_encoder_input(source_tensor: torch.Tensor, delta: torch.Tensor, pipeline) -> torch.Tensor:
+    """Encoder input for the protected image, for a perturbation ``delta`` in PIXEL units.
+
+    ``delta`` is defined on the [0, 1] pixel scale (so an l_inf budget of 8/255 means 8 grey
+    levels, like GeoShield's epsilon). The protected pixels are clamped to the valid range,
+    then normalised exactly like a clean image; the operation is differentiable in ``delta``.
+    Every attack goes through this function, so training sees the same image the evaluator
+    will build with :func:`add_perturbation_to_image` (up to 8-bit quantisation).
+    """
+    pixels = normalized_to_pixels(source_tensor, pipeline)
+    return pixels_to_normalized((pixels + delta).clamp(0.0, 1.0), pipeline)
+
+
+def tensor_to_pil(tensor: torch.Tensor, pipeline=None) -> Image.Image:
+    """Convert an encoder-input tensor back to a PIL image.
+
+    The inverse normalisation must match the encoder's own statistics (ImageNet for the
+    DINOv2 / YFCC pipeline, CLIP for StreetCLIP / OSV): pass ``pipeline`` so they are read
+    from it. Without a pipeline the ImageNet statistics are assumed.
+    """
+    t = tensor.detach()
+    if t.ndim == 3:
+        t = t.unsqueeze(0)
+    if pipeline is not None:
+        pixels = normalized_to_pixels(t, pipeline)
+    else:
+        mean = torch.as_tensor(_IMAGENET_MEAN, dtype=t.dtype, device=t.device).view(1, 3, 1, 1)
+        std = torch.as_tensor(_IMAGENET_STD, dtype=t.dtype, device=t.device).view(1, 3, 1, 1)
+        pixels = t * std + mean
+    return pixels_to_pil(pixels.squeeze(0))
+
+
+def pixels_to_pil(pixels: torch.Tensor) -> Image.Image:
+    """Quantise a ``[3, H, W]`` float image in [0, 1] to an 8-bit PIL image by ROUNDING.
+
+    ``ToPILImage`` does ``mul(255).byte()``, which truncates: a pixel at ``100/255 - eps``
+    with ``eps = 0.0157`` (= 4.0035/255) lands at 95.9965 and is written as 95, i.e. one grey
+    level beyond the budget on the saturated negative side (the positive side, 104.0035,
+    truncates to 104 and is exact). Even with an exact ``4/255`` float32 rounding error puts
+    some levels just below the integer. Rounding first keeps every exported pixel within
+    ``round(eps * 255)`` of the clean one.
+    """
+    pixels = pixels.detach().clamp(0.0, 1.0).mul(255).round().to(torch.uint8).cpu()
+    return Image.fromarray(pixels.permute(1, 2, 0).numpy(), mode="RGB")
 
 
 def add_perturbation_to_image(image: Image.Image, perturbation: torch.Tensor, pipeline) -> Image.Image:
-    """Apply perturbation to image and convert back to PIL format."""
-    # Convert the image to a tensor
+    """Build the protected image: clean pixels + ``perturbation`` (pixel units), clamped and
+    quantised to 8 bits. The result is a genuine image that the pipeline preprocesses exactly
+    like a clean one (its 336x336 square makes the crop/resize a no-op)."""
     image_tensor = conditional_preprocessing(image, pipeline, device=perturbation.device)  # [1, 3, H, W]
-    # Add the perturbation to the image tensor
-    perturbed_tensor = image_tensor + perturbation
-    # Convert back to PIL
-    perturbed_image = tensor_to_pil(perturbed_tensor)
-    return perturbed_image
+    pixels = normalized_to_pixels(image_tensor, pipeline)
+    protected = (pixels + perturbation.detach().to(pixels.dtype)).clamp(0.0, 1.0)
+    return pixels_to_pil(protected.squeeze(0))
 
 
 ############################################################################################

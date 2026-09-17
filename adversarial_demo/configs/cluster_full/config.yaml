@@ -1,0 +1,194 @@
+# Full-dataset cluster run ("cluster_full"): YFCC4k + OSV-5M, 4000 images each, budgets
+# 1/255, 4/255, 8/255, every attack of the paper with every ablation.
+#
+# Derived from configs/1409_FIX/config.yaml (pixel-space fix). Machine-specific paths
+# (data_dirs, results/plots dirs, GeoShield I/O dirs) are placeholders: scripts/cluster/
+# config.sh overrides them from the environment on every shard / merge command
+# (DATA_ROOT, RESULTS_BASE), so this file never needs editing per cluster.
+#
+# ATTACK VERSION PINS (attack_train_args.<ds>.per_attack.<key>.attack_variant): every attack
+# runs under its canonical key (result files, plots and tables keep the paper names) but
+# with the LATEST implementation; GeoFA-TD is pinned to v3 (old forward process), i.e. the
+# legacy Gaussian interpolant with x_t noised from the TRUE location.
+#   dtd           -> dtd_v3_old_forward        GeoFA-TD          (cosine, Gaussian x_t, true x0)
+#   diffusion_l2  -> diffusion_l2_v3           GeoFA-L2          (tangent L2, geodesic x_t, true x0)
+#   targeted_l2   (single version)             GeoFA-DPA / L2-targeted (denoising loss -> antipode)
+#   sampling      -> sampling_v2               GeoFA-Sampling    (haversine to the true location, 16-step sampler)
+#   encoder       -> encoder_v3                GeoFA-enc.        (sign-SGD PGD on ||E(c+d)-E(c)||^2)
+#   training_loss -> training_loss_v3          GeoFA-AdvDM       (RFM training loss, true x0)
+#   unidef        (single version)             GeoFA-UniDef      (finite-difference Jacobian)
+#   dtd_blur      -> dtd_blur_v3_old_forward   GeoFA-TD-blur     (dtd pin + blur-EOT term)
+#   geoshield     (external)                   GeoShield         (PNG, model-exact 336 px clean copies)
+
+device: "cuda"
+seed: 42
+
+dataset: "yfcc"
+n_images_to_eval: 4000
+# Placeholders -- overridden by scripts/cluster/config.sh (DATA_ROOT).
+data_root: "DATA"
+data_dirs:
+  yfcc: "DATA/YFCC100M/yfcc4k"
+  osv: "DATA/osv5m"
+
+build_yfcc4k:
+  yfcc_dirname: "YFCC100M"
+  downloads_dirname: "downloads"
+  dataset_dirname: "yfcc4k"
+  images_zip_name: "yfcc4k.zip"
+  imagedata_txt_name: "0aaaa.r.imagedata.txt"
+
+# Placeholders -- the shard / merge commands pass --results-dir / --plots-dir explicitly.
+results_dir: "results/cluster_full"
+plots_dir: "results/cluster_full/plots"
+
+parallel_workers: 1
+use_cuda_streams: true
+
+model_type: "" # attacked model: Riemannian flow matching ("diffusion" / "flow" are the transfer targets)
+
+pipelines:
+  yfcc: "nicolas-dufour/PLONK_YFCC"
+  osv: "nicolas-dufour/PLONK_OSV_5M"
+
+# l_inf budgets on the [0, 1] pixel scale: 1/255, 4/255, 8/255 (config.sh can override).
+attack_budgets:
+  yfcc: [0.0039, 0.0157, 0.0314]
+  osv: [0.0039, 0.0157, 0.0314]
+
+attack_train_args:
+  yfcc:
+    n_steps: 60
+    train_batch_size: 256
+    lr: 0.001
+    anchor_samples: 512
+    sampling_steps_salman: 16
+    clean_num_steps: 100
+    target_pure_noise: false
+    dot_product_loss: "cosine_similarity_negative"
+    reconstruction_loss_weight: 0.0
+    # Paper protocol: 5 random initialisations per image, keep the FSD-best (defender-side
+    # verification). config.sh's NUM_RESTARTS overrides this AND max_restarts together.
+    num_restarts: 5
+    restart_selection_metric: "final_step_displacement"
+    restart_eval_cfg: 10.0
+    restart_eval_batch_size: 128
+    restart_eval_seed: seed
+    restart_eval_num_steps: 250
+    per_attack:
+      dtd:
+        attack_variant: dtd_v3_old_forward
+      diffusion_l2:
+        attack_variant: diffusion_l2_v3
+      sampling:
+        attack_variant: sampling_v2
+      encoder:
+        attack_variant: encoder_v3
+      training_loss:
+        attack_variant: training_loss_v3
+      dtd_blur:
+        attack_variant: dtd_blur_v3_old_forward
+        blur_sigma_min: 0.0
+        blur_sigma_max: 4.0
+        blur_loss_weight: 0.5
+      ace:  # not part of this run; kept so the key stays runnable
+        dot_product_loss: "l2_target"
+        target_image: ".media/MIST.png"
+        alpha: 1
+
+  osv:
+    n_steps: 60
+    train_batch_size: 256
+    lr: 0.001
+    anchor_samples: 512
+    sampling_steps_salman: 16
+    clean_num_steps: 100
+    target_pure_noise: false
+    dot_product_loss: "cosine_similarity_negative"
+    reconstruction_loss_weight: 0.0
+    # Paper protocol: 5 random initialisations per image, keep the FSD-best (defender-side
+    # verification). config.sh's NUM_RESTARTS overrides this AND max_restarts together.
+    num_restarts: 5
+    restart_selection_metric: "final_step_displacement"
+    restart_eval_cfg: 10.0
+    restart_eval_batch_size: 128
+    restart_eval_seed: seed
+    restart_eval_num_steps: 250
+    per_attack:
+      dtd:
+        attack_variant: dtd_v3_old_forward
+      diffusion_l2:
+        attack_variant: diffusion_l2_v3
+      sampling:
+        attack_variant: sampling_v2
+      encoder:
+        attack_variant: encoder_v3
+      training_loss:
+        attack_variant: training_loss_v3
+      dtd_blur:
+        attack_variant: dtd_blur_v3_old_forward
+        blur_sigma_min: 0.0
+        blur_sigma_max: 4.0
+        blur_loss_weight: 0.5
+      ace:  # not part of this run; kept so the key stays runnable
+        dot_product_loss: "l2_target"
+        target_image: ".media/MIST.png"
+        alpha: 1
+
+save_deltas: false  # config.sh SAVE_DELTAS=1 turns it on (~1.4 MB per (attack, budget, image))
+
+# The 9 attacks of the run (canonical keys; see the pins above). GeoShield is sharded on
+# its own (one attack per shard) like the others.
+attack_types: ["dtd", "diffusion_l2", "targeted_l2", "sampling", "encoder", "training_loss", "unidef", "dtd_blur", "geoshield"]
+
+# Ablation grids. max_restarts == num_restarts: no extra restarts beyond the reported best.
+max_restarts: 5
+eval_num_steps: [8, 16, 32, 64, 250]
+eval_cfgs: [1, 2, 5, 10]
+cfg_num_steps: null
+
+# Robustness (JPEG / Gaussian blur of the protected image) for EVERY attack of the run.
+robustness:
+  attack_types: ["dtd", "diffusion_l2", "targeted_l2", "sampling", "encoder", "training_loss", "unidef", "dtd_blur", "geoshield"]
+  jpeg_quality_factors: [20, 40, 60, 80, 100]
+  gaussian_blur_sigmas: [0, 2, 4, 6, 8, 10]
+  num_steps: null
+
+# Cross-model transfer: perturbations trained against RFM, re-evaluated on the diffusion and
+# Euclidean flow-matching variants of the same dataset (same encoder). GeoShield included.
+model_transfer:
+  model_types: ["", "diffusion", "flow"]
+  num_steps: null
+
+# GeoShield: lossless PNG clean copies at the model's input resolution, produced by the
+# attacked pipeline's own preprocessing (DINOv2 chain on YFCC, StreetCLIP chain on OSV), so
+# its perturbation is measured against exactly the clean tensor the trainable attacks see.
+# clean_dir / output_base are placeholders overridden by config.sh (-> RESULTS_BASE/geoshield_io).
+geoshield:
+  enabled: false
+  attack_name: "geoshield"
+  steps: 100
+  clean_dir: "results/cluster_full/geoshield_io/clean"
+  output_base: "results/cluster_full/geoshield_io/attacked"
+  clean_image_format: "png"
+  clean_preprocess: "model"
+  input_res: 336
+  reuse_existing: true
+  epsilons: null          # derived per budget: round(b * 255) -> 1, 4, 8
+  repos_root: null        # dir holding both this repo and Geoshield/ (auto-detected)
+  script: "Geoshield/geoshield.py"
+  python: null
+
+localizability:
+  monte_carlo_samples: 256
+
+plot:
+  gps_true: true
+  plot_success_rate: true
+  attack_success_rate_thresholds: [200, 750, 2500]
+  stored_metrics: ["final_step_displacement_predicted", "final_step_displacement_true"]
+  # All opt-in ablations are switched on by config.sh (RUN_*_ABLATION=1) via CLI flags.
+  run_sampling_steps_ablation: false
+  run_cfg_ablation: false
+  run_robustness_ablation: false
+  run_model_transfer_ablation: false

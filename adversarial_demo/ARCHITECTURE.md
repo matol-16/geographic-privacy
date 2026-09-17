@@ -23,6 +23,16 @@ keys; the paper-facing labels come from one place,
 Config keys, CLI flags (`--attack-types dtd`, `plot dtd-variance`) and result file names
 (`<dataset>_dtd_results.pt`) are unchanged.
 
+**Versions and pins.** Several attacks exist in successive implementations under their own
+keys (`dtd` → `dtd_v2` / `dtd_v3` / `dtd_v3_old_forward`, `diffusion_l2` → `_v2` / `_v3`,
+`encoder_v3`, `training_loss_v3`, `sampling_v2`, `dtd_blur_v3_old_forward`; see the alias
+table in `attacks/attacks.py::run_attack`). A run can keep the canonical key and pin the
+implementation from the config: `attack_train_args.<ds>.per_attack.<key>.attack_variant:
+<variant key>` makes `run_attack` dispatch to the variant while results, plots and tables
+keep the canonical name; the pin is recorded in the saved run config and in each result's
+`attack_type` label / attack `config`. `configs/cluster_full/config.yaml` pins every attack
+of the final run this way (GeoFA-TD = `dtd_v3_old_forward`).
+
 ## Paper figures and tables
 
 `scripts/make_paper_figures.sh [yfcc|osv|all]` regenerates every figure from the saved
@@ -42,6 +52,24 @@ full-run results (no GPU) into a fixed layout per dataset:
 `scripts/make_success_rate_table.py` turns the `*_attack_success_rate.json` /
 `*_final_step_displacement_true.json` sidecars of `plots/` into the main results table
 (`results/tables/success_rate_{yfcc,osv,all,2500km}.{md,tex}`).
+
+## Perturbation convention (pixel space)
+
+Every attack optimises a perturbation `delta` **on the [0, 1] pixel scale** of the encoder's
+336x336 input, and the `l_inf` budget (`attack_budgets`, e.g. `0.0314` = 8/255) is a budget in
+grey levels -- the same convention as GeoShield's `epsilon`. `AttackBase.perturbed_input(delta)`
+(`attacks/attacks_core.py`) builds the encoder input as
+`normalize(clamp(pixels + delta, 0, 1))` with the encoder's own mean/std (ImageNet for
+DINOv2 / YFCC, CLIP for StreetCLIP / OSV, read off the pipeline by
+`utils.adversarial_utils.encoder_normalization`), and `add_perturbation_to_image` builds the
+protected 8-bit image the evaluator and ablations feed back to the pipeline with the same
+formula. Training and evaluation therefore see the same image up to quantisation.
+
+History: until 2026-09-13 `delta` was added in *normalised* space (so a "4/255" budget was
+~0.9/255 in pixels) and `tensor_to_pil` un-normalised with mean = std = 0.5, i.e. the evaluated
+"protected" image was a ~2x contrast-stretched copy of the original (40-60 % clipped pixels)
+even for `delta = 0`, while GeoShield images (read from disk) were not. Results produced
+before that date (`results/cluster_eval*`) carry this confound and must be regenerated.
 
 ## File Structure
 
@@ -311,9 +339,21 @@ merged. The single-GPU command is unchanged; this is an additive path.
   same format. `merge_shards` stitches it in like any other attack; because GeoShield is
   keyed by filename (`123.jpg`) while trainable attacks are keyed by photo-id stem
   (`123`), the merge normalises ids by stem so both land at the same global index.
-  GeoShield stays predicted-only (no ground-truth-GPS metric), matching the single-GPU
-  path. Implemented by `_run_geoshield_shard()` in `main.py` reusing
-  `utils/geoshield.generate_geoshield_pairs` (now window/run_tag aware).
+  GeoShield reports the true-GPS metric like the trainable attacks (the generator returns
+  the labels of the images it copied) and takes part in the same eval-time ablations
+  (sampling steps, cfg, robustness, and cross-model transfer via
+  `PrecomputedPairEvaluationRunner(transfer_pipelines=...)`), scored with the dataset's
+  `restart_eval_*` settings. With `clean_preprocess: model` its clean copies are produced by
+  the attacked pipeline's own conditional preprocessing (DINOv2 chain on YFCC, StreetCLIP
+  chain on OSV), so the perturbation is measured against exactly the evaluator's clean
+  tensor. Implemented by `_run_geoshield_shard()` in `main.py` reusing
+  `utils/geoshield.generate_geoshield_pairs` (window/run_tag aware, `pipeline=` for the
+  model-exact copies).
+- **The full run** (`scripts/cluster/preset_cluster_full.sh`, config
+  `configs/cluster_full/config.yaml`): 9 attacks × 3 budgets × 4000 images per dataset with
+  every ablation; `scripts/cluster/smoke_test_cluster_full.sh` reproduces the shard command
+  locally on a 2-image window, `scripts/tests/check_preprocessing_roundtrip.py` checks the
+  pixel-space round trip of both encoders. See `scripts/cluster/README.md`.
 
 ```bash
 # one shard (normally launched by the SLURM array, not by hand)

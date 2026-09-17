@@ -5,6 +5,39 @@ from `scripts/test_all_attacks.sh`) by **sharding it across many GPU jobs**, the
 A single GPU is far too slow: ~30 s/restart × 8 restarts × 4000 images × 7 attacks × 2
 budgets is thousands of GPU-hours, so we split it into independent jobs.
 
+## The full run (`preset_cluster_full.sh`) — every attack, every ablation, 3 budgets
+
+One command per dataset, from this directory (always `--dry-run` first):
+
+```bash
+./preset_cluster_full.sh yfcc --dry-run      # prints the 360-job plan, submits nothing
+./preset_cluster_full.sh yfcc                # 9 attacks x 40 windows + chained merge
+./preset_cluster_full.sh osv                 # same on the 4000-image OSV-5M subset
+# afterwards (CPU only): paper figures + tables
+./postprocess_cluster_full.sh all            # -> results/cluster_full/{yfcc,osv}_full/plots*, results/cluster_full/tables
+```
+
+| | |
+|---|---|
+| config | `configs/cluster_full/config.yaml` (machine paths injected by `config.sh`: `DATA_ROOT`, `RESULTS_BASE`, `GEOSHIELD_IO_DIR`) |
+| attacks | `dtd` (GeoFA-TD), `diffusion_l2` (GeoFA-L²), `targeted_l2` (GeoFA-DPA / L²-targeted), `sampling`, `encoder`, `training_loss` (AdvDM), `unidef`, `dtd_blur` (GeoFA-TD-blur), `geoshield` |
+| versions | pinned in the config (`per_attack.<key>.attack_variant`): the latest implementation of each, GeoFA-TD = `dtd_v3_old_forward`; result files keep the canonical names |
+| budgets | 1/255, 4/255, 8/255 |
+| images | 4000 per dataset, 100 per shard (seeded, prefix-stable ordering) |
+| restarts | `NUM_RESTARTS=5` (paper protocol, FSD-best kept; sets `num_restarts` and `max_restarts`) |
+| ablations (all attacks, GeoShield included) | sampling steps `[8 16 32 64 250]`, guidance scale `[1 2 5 10]`, JPEG `[20 40 60 80 100]`, blur σ `[0 2 4 6 8 10]`, transfer to `diffusion` / `flow`; clean vs attacked FSD comes from the always-stored per-image predictions |
+
+Cost control: the eval-time ablations dominate (≈25 paired 250-step evaluations per image
+and budget). `ABLATION_WINDOWS=10` runs them on the first 10 windows only (a seeded random
+1000-image subset; the other 30 windows compute the main result), which cuts the run to
+roughly a third. `SAVE_DELTAS=1` additionally stores every best perturbation (~1.4 MB each).
+
+Before submitting on a new machine: `scripts/cluster/smoke_test_cluster_full.sh <ds>` runs
+the exact shard command for every attack on a 2-image window with shrunken grids, then the
+merge and the post-processing (minutes on one GPU), and
+`scripts/tests/check_preprocessing_roundtrip.py` verifies the pixel-space round trip of both
+encoders (DINOv2 / StreetCLIP).
+
 ## Running the new experiments
 
 Three experiments are wrapped as one-command presets. Run them from this directory, and
@@ -182,7 +215,9 @@ overrides `config.sh` reproduces the original generic run exactly.
   dirs (a `run_tag` per window keeps concurrent shards from clobbering each other), and
   `merge-shards` stitches it in like any other attack. It needs the **Geoshield repo**
   next to `plonk/` and the `geoshield.{clean_dir,output_base}` paths set in
-  `config.yaml`; remove `geoshield` from `ATTACK_TYPES` in `config.sh` to skip it. Note
-  it produces predicted-only results (no ground-truth-GPS line), matching the single-GPU
-  GeoShield path, and its per-window clean/attacked image dirs use extra disk.
+  `config.yaml` (or `GEOSHIELD_IO_DIR`, which the full-run preset points inside
+  `RESULTS_BASE`); remove `geoshield` from `ATTACK_TYPES` in `config.sh` to skip it. It
+  reports the true-GPS metric and takes part in every eval-time ablation (sampling steps,
+  cfg, robustness, model transfer) like the trainable attacks; its per-window clean/attacked
+  image dirs use extra disk.
 - **Logs** land in `scripts/cluster/slurm_logs/`.

@@ -36,6 +36,8 @@ class EncoderAttack(AttackBase):
         num_restarts: int = 1,
         restart_selection_metric: str = "mean_step_displacement",
         device: str = "cuda",
+        update_rule: str = "adam",
+        delta_init: Optional[float] = None,
     ):
         super().__init__(
             pipeline=pipeline,
@@ -49,10 +51,24 @@ class EncoderAttack(AttackBase):
         valid_criteria = {"MSE", "MSE+Reconstruction"}
         if criterion_name not in valid_criteria:
             raise ValueError(f"Unknown criterion_name={criterion_name}. Expected one of {sorted(valid_criteria)}")
+        # update_rule:
+        #   "adam":     legacy (v1) -- Adam on the raw gradient of the *unsquared* embedding distance,
+        #               l_inf projection, delta initialised uniformly over the whole budget, and the
+        #               encoder left in train() mode.
+        #   "sign_sgd": the PGD outer loop shared by every other GeoFA attack (paper Sec. 4.1):
+        #               sign of the gradient of the *squared* distance (Eq. 7), SGD step, l_inf
+        #               projection, tiny random init (``delta_init``), encoder in eval() mode.
+        if update_rule not in ("adam", "sign_sgd"):
+            raise ValueError(f"Unknown update_rule={update_rule!r}; expected 'adam' or 'sign_sgd'")
+        self.update_rule = update_rule
+        self.delta_init = None if delta_init is None else float(delta_init)
         
         # Setup models
         pipeline.network.eval().requires_grad_(False)
-        pipeline.cond_preprocessing.emb_model.train().requires_grad_(False)
+        if self.update_rule == "sign_sgd":
+            pipeline.cond_preprocessing.emb_model.eval().requires_grad_(False)
+        else:
+            pipeline.cond_preprocessing.emb_model.train().requires_grad_(False)
         
         # Prepare embeddings
         self.z_source = model_dependent_embedding(self.source_tensor, pipeline, track_grad=False).detach()
@@ -71,8 +87,9 @@ class EncoderAttack(AttackBase):
         self.l_x = float(l_x)
 
     def initialize_delta(self, restart_idx: int) -> torch.Tensor:
-        """Initialize delta uniformly in [-eps_max, eps_max]."""
-        delta = torch.empty_like(self.source_tensor).uniform_(-self.eps_max, self.eps_max)
+        """Initialize delta uniformly in [-eps_max, eps_max] (legacy) or in [-delta_init, delta_init]."""
+        init = self.eps_max if self.delta_init is None else self.delta_init
+        delta = torch.empty_like(self.source_tensor).uniform_(-init, init)
         delta.requires_grad_(True)
         return delta
 
@@ -85,13 +102,17 @@ class EncoderAttack(AttackBase):
         """Execute one PGD step."""
         optimizer.zero_grad(set_to_none=True)
         
-        perturbed_tensor = self.source_tensor + delta
+        perturbed_tensor = self.perturbed_input(delta)
         z_perturbed = model_dependent_embedding(perturbed_tensor, self.pipeline, track_grad=True)
         
         # Embedding loss
         if self.attack_mode == "targeted":
             loss_embed = torch.nn.functional.mse_loss(z_perturbed, self.z_target)
             signed_embed_term = self.l_z * loss_embed
+        elif self.update_rule == "sign_sgd":
+            # Eq. 7: ||E(c+delta) - E(c)||^2, maximised (descend its negation).
+            embed_l2 = (z_perturbed - self.z_source).pow(2).sum(dim=-1).mean()
+            signed_embed_term = -self.l_z * embed_l2
         else:
             embed_l2 = torch.norm(z_perturbed - self.z_source, p=2, dim=-1).mean()
             signed_embed_term = -self.l_z * embed_l2
@@ -104,11 +125,16 @@ class EncoderAttack(AttackBase):
             loss = signed_embed_term
         
         loss.backward()
+        if self.update_rule == "sign_sgd":
+            with torch.no_grad():
+                delta.grad = torch.sign(delta.grad)
         optimizer.step()
         
         # Project to l_inf ball
         with torch.no_grad():
             _project_linf_(delta, self.eps_max)
+            if delta.grad is not None:
+                delta.grad.zero_()
         
         return float(loss.item())
 
@@ -120,6 +146,8 @@ class EncoderAttack(AttackBase):
             "eps_max": self.eps_max,
             "criterion_name": self.criterion_name,
             "l_z": self.l_z,
+            "update_rule": self.update_rule,
+            "delta_init": self.delta_init,
             "l_x": self.l_x,
             "num_restarts": self.restart_manager.num_restarts,
         }

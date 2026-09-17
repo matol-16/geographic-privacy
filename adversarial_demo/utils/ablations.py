@@ -17,6 +17,7 @@ import io
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
+import torch
 from PIL import Image, ImageFilter
 
 from utils.adversarial_metrics import final_prediction_distance_to_point
@@ -119,6 +120,20 @@ def build_restart_ablation_json(
 # --------------------------------------------------------------------------- #
 
 
+
+def _capture_gps(gps_out, key, eval_result) -> None:
+    """Stash the clean / perturbed GPS sample batches of one ablation eval (CPU) under ``key``.
+
+    Lets the caller compute ground-truth-based metrics (displacement vs true location,
+    ASR) offline; the returned displacement dicts stay paired (clean vs attacked) as before.
+    """
+    if gps_out is None:
+        return
+    gps_out[key] = {
+        "gps_source": torch.as_tensor(np.asarray(eval_result["gps_source"]), dtype=torch.float32).clone(),
+        "gps_perturbed": torch.as_tensor(np.asarray(eval_result["gps_perturbed"]), dtype=torch.float32).clone(),
+    }
+
 def evaluate_pair_at_steps(
     pipeline,
     source_image,
@@ -128,6 +143,7 @@ def evaluate_pair_at_steps(
     batch_size: int = 128,
     seed: int = 1234,
     device: str = "cuda",
+    gps_out: Optional[Dict[Any, Dict[str, Any]]] = None,
 ) -> Dict[int, float]:
     """Evaluate an already-built clean/perturbed image pair at several step counts.
 
@@ -151,6 +167,7 @@ def evaluate_pair_at_steps(
         displacement_by_steps[int(num_steps)] = float(
             eval_result["metrics"]["final_step_displacement"]
         )
+        _capture_gps(gps_out, int(num_steps), eval_result)
     return displacement_by_steps
 
 
@@ -163,6 +180,7 @@ def evaluate_delta_at_steps(
     batch_size: int = 128,
     seed: int = 1234,
     device: str = "cuda",
+    gps_out: Optional[Dict[Any, Dict[str, Any]]] = None,
 ) -> Dict[int, float]:
     """Re-evaluate a single trained perturbation at several sampling-step counts.
 
@@ -180,6 +198,7 @@ def evaluate_delta_at_steps(
         batch_size=batch_size,
         seed=seed,
         device=device,
+        gps_out=gps_out,
     )
 
 
@@ -245,6 +264,7 @@ def evaluate_pair_at_cfgs(
     batch_size: int = 128,
     seed: int = 1234,
     device: str = "cuda",
+    gps_out: Optional[Dict[Any, Dict[str, Any]]] = None,
 ) -> Dict[float, float]:
     """Evaluate an already-built clean/perturbed image pair at several guidance scales.
 
@@ -269,6 +289,7 @@ def evaluate_pair_at_cfgs(
         displacement_by_cfg[float(cfg)] = float(
             eval_result["metrics"]["final_step_displacement"]
         )
+        _capture_gps(gps_out, float(cfg), eval_result)
     return displacement_by_cfg
 
 
@@ -281,6 +302,7 @@ def evaluate_delta_at_cfgs(
     batch_size: int = 128,
     seed: int = 1234,
     device: str = "cuda",
+    gps_out: Optional[Dict[Any, Dict[str, Any]]] = None,
 ) -> Dict[float, float]:
     """Re-evaluate a single trained perturbation at several guidance scales.
 
@@ -299,6 +321,7 @@ def evaluate_delta_at_cfgs(
         batch_size=batch_size,
         seed=seed,
         device=device,
+        gps_out=gps_out,
     )
 
 
@@ -384,6 +407,7 @@ def evaluate_pair_across_models(
     seed: int = 1234,
     device: str = "cuda",
     num_steps: Optional[int] = None,
+    gps_out: Optional[Dict[Any, Dict[str, Any]]] = None,
 ) -> Dict[str, float]:
     """Evaluate one clean/perturbed pair against several model variants.
 
@@ -405,6 +429,7 @@ def evaluate_pair_across_models(
             device=device,
         )
         displacement_by_model[label] = float(eval_result["metrics"]["final_step_displacement"])
+        _capture_gps(gps_out, label, eval_result)
     return displacement_by_model
 
 
@@ -418,6 +443,7 @@ def evaluate_delta_across_models(
     seed: int = 1234,
     device: str = "cuda",
     num_steps: Optional[int] = None,
+    gps_out: Optional[Dict[Any, Dict[str, Any]]] = None,
 ) -> Dict[str, float]:
     """Re-evaluate a single trained perturbation against every model variant.
 
@@ -435,6 +461,7 @@ def evaluate_delta_across_models(
         seed=seed,
         device=device,
         num_steps=num_steps,
+        gps_out=gps_out,
     )
 
 

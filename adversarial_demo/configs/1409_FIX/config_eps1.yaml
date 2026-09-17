@@ -1,0 +1,206 @@
+# 1409_FIX budget ablation: identical to config.yaml except the budget (1/255 instead of 4/255)
+# and the results dir (1409_FIX_eps1). Used for the smaller-budget comparison of GeoFA-sample v2
+# vs GeoFA-TD v3 (old fwd.); deltas are saved so the same offline re-evaluations apply.
+
+# Device configuration
+device: "cuda"
+seed: 42
+
+# Dataset configuration
+dataset: "yfcc" # Options: "yfcc" or "osv"
+n_images_to_eval: 100
+data_root: "/Data/mathias.ollu/hf_cache/datasets"
+data_dirs:
+  yfcc: "/Data/mathias.ollu/hf_cache/datasets/YFCC100M/yfcc4k"
+  osv: "/Data/mathias.ollu/hf_cache/datasets/osv5m"
+
+# Dataset builder configuration
+build_yfcc4k:
+  yfcc_dirname: "YFCC100M"
+  downloads_dirname: "downloads"
+  dataset_dirname: "yfcc4k"
+  images_zip_name: "yfcc4k.zip"
+  imagedata_txt_name: "0aaaa.r.imagedata.txt"
+
+# Evaluation directories
+results_dir: "/Data/mathias.ollu/results/1409_FIX_eps1"
+plots_dir: "/Data/mathias.ollu/results/1409_FIX_eps1/plots"
+
+# Parallel processing
+parallel_workers: 4
+use_cuda_streams: true
+
+model_type: "" # Options: "diffusion", "flow" or "" - i.e. riemannian flow matching
+
+# Pipeline models per dataset
+pipelines:
+  yfcc: "nicolas-dufour/PLONK_YFCC"
+  osv: "nicolas-dufour/PLONK_OSV_5M"
+
+# Attack budgets (epsilon values) per dataset
+attack_budgets:
+  # yfcc: [0.0157, 0.0314, 0.0628] #4,8,16/255
+  # 1409_FIX (from 2026-09-14 22:30): 4/255 only. Earlier runs (dtd, dtd_v2, encoder, training_loss,
+  # geoshield_v1_cropshift) also hold 8/255; the report only tabulates 4/255.
+  yfcc: [0.0039] #1/255
+  osv: [0.0157, 0.0314] #4,8,16/255
+
+# Baseline attack training arguments
+attack_train_args:
+  yfcc:
+    n_steps: 60
+    train_batch_size: 256
+    lr: 0.001
+    anchor_samples: 512
+    sampling_steps_salman: 16
+    clean_num_steps: 100
+    target_pure_noise: false
+    dot_product_loss: "cosine_similarity_negative"
+    reconstruction_loss_weight: 0.0
+    num_restarts: 1
+    restart_selection_metric: "final_step_displacement"
+    restart_eval_cfg: 10.0
+    restart_eval_batch_size: 128
+    restart_eval_seed: seed
+    restart_eval_num_steps: 250
+    # Per-attack-type overrides, merged on top of the above only for the matching
+    # attack so every attack type can run in a single evaluation. `ace` is targeted:
+    # it pulls the score/encoding towards target_image (l2_target loss, weight alpha).
+    per_attack:
+      ace:
+        dot_product_loss: "l2_target"
+        target_image: "/users/eleves-b/2023/mathias.ollu/repos/plonk/.media/MIST.png"
+        alpha: 1
+      # `dtd_blur` is the blur-robust DTD variant: each step the DTD loss is evaluated on
+      # the clean protected image AND a Gaussian-blurred copy at a random sigma drawn from
+      # [blur_sigma_min, blur_sigma_max], mixed by blur_loss_weight (0.5 = half/half).
+      # These are the knobs of the "does training with extra noise buy blur robustness?"
+      # ablation; the robustness sweep evaluates sigma 0..10, so 6-10 is out-of-distribution.
+      dtd_blur:
+        blur_sigma_min: 0.0
+        blur_sigma_max: 4.0
+        blur_loss_weight: 0.5
+  osv:
+    n_steps: 60
+    train_batch_size: 256
+    lr: 0.001
+    anchor_samples: 512
+    sampling_steps_salman: 16
+    clean_num_steps: 100
+    target_pure_noise: false
+    dot_product_loss: "cosine_similarity_negative"
+    reconstruction_loss_weight: 0.0
+    num_restarts: 1
+    restart_selection_metric: "final_step_displacement"
+    restart_eval_cfg: 10.0
+    restart_eval_batch_size: 128
+    restart_eval_seed: seed
+    restart_eval_num_steps: 250
+    per_attack:
+      ace:
+        dot_product_loss: "l2_target"
+        target_image: "/users/eleves-b/2023/mathias.ollu/repos/plonk/.media/MIST.png"
+        alpha: 1
+
+
+# Default attack types to evaluate
+save_deltas: true  # persist each best perturbation under <results_dir>/deltas/ (offline re-eval: samplers / cfg / models)
+
+attack_types: ["dtd", "encoder", "training_loss", "dtd_v2", "dtd_v3", "dtd_v3_old_forward", "training_loss_v3", "encoder_v3", "sampling_v2", "geoshield"]  # GeoFA-TD, GeoFA-enc., GeoFA-AdvDM, GeoFA-TD v2 (geodesic x_t), GeoFA-TD v3 / GeoFA-AdvDM v3 (x_t noised from the TRUE location, paper Eq. 1/9/15), GeoShield (PNG, 336px)
+
+# Ablation defaults (evaluate-dataset and the standalone ablation commands).
+# - max_restarts overrides num_restarts for the run so the always-on restart
+#   ablation reaches this depth. Leave null to keep the per-dataset num_restarts.
+# - eval_num_steps: sampling-step counts used by the sampling-steps ablation.
+# - eval_cfgs: classifier-free guidance scales used by the cfg ablation.
+# - cfg_num_steps: sampling steps held fixed during the cfg ablation (null => each
+#   attack's restart_eval_num_steps, i.e. the baseline).
+max_restarts: 1
+eval_num_steps: [8, 16, 32, 64, 128, 250]
+eval_cfgs: [1, 2, 5, 10]
+cfg_num_steps: null
+
+# Robustness-to-transformation ablation (GeoShield Fig. 6). Each trained
+# perturbation's protected image is JPEG-compressed / Gaussian-blurred and
+# re-evaluated at the baseline sampling parameters (no sampling-steps sweep).
+# Enable via plot.run_robustness_ablation. Unlike the other ablations it is scoped
+# per attack type (attack_types below) so it only runs for the listed attacks.
+# - jpeg_quality_factors / gaussian_blur_sigmas: GeoShield's transform levels.
+# - num_steps: null => reuse each attack's restart_eval_num_steps (the baseline).
+robustness:
+  attack_types: [geoshield, dtd, encoder, sampling]
+  jpeg_quality_factors: [20, 40, 60, 80, 100]
+  gaussian_blur_sigmas: [0, 2, 4, 6, 8, 10]
+  num_steps: null
+
+# Cross-model transfer ablation. Each best perturbation is trained against the configured
+# model_type (above) but its attacked image is re-evaluated against every PLONK variant
+# below, to measure how well the attack transfers across the generative backbones (the
+# eval is cheap; training the attack is the bottleneck). Enable via
+# plot.run_model_transfer_ablation. Unlike robustness it runs for every evaluated attack.
+# - model_types: model_type suffixes to compare; "" is Riemannian flow matching (the
+#   attacked variant is reused, not reloaded). "rfm" is accepted as an alias for "".
+# - num_steps: null => use each attack's restart_eval_num_steps, i.e. the SAME number of
+#   sampling steps as the regular/main evaluation (whose displacement is measured by the
+#   restart evaluator at restart_eval_num_steps). Set an int only to override it.
+model_transfer:
+  model_types: ["", "diffusion", "flow"]
+  num_steps: null
+
+# GeoShield integration (yfcc only). GeoShield is generated out-of-process by the
+# separate Geoshield repo and folded into evaluate-dataset as just another attack:
+# list "geoshield" in attack_types (or set enabled: true) and a single evaluate-dataset
+# run trains the in-process attacks, generates + evaluates GeoShield on the same seeded
+# images/budgets, and overlays everything in the combined plots.
+# - epsilons: null => derived per budget as round(budget * 255) (0.0314 -> 8/255).
+# - repos_root: null => auto-detected (the dir holding both plonk/ and Geoshield/).
+# - python: null => the current interpreter (run inside the plonk env).
+# 1409_FIX: "fixed" GeoShield -- lossless PNG clean copies / outputs (the cluster runs went
+# through JPEG q75 because the clean files are .jpg) and input_res 336 so the l_inf budget is
+# applied at the attacked model's input resolution (default was 640 px + bicubic downscale).
+# clean_preprocess "model": clean copies are PLONK's CenterCrop(1:1)->Resize(336) square, so
+# GeoShield's own Resize(336)->CenterCrop(336) is a no-op and its perturbation is measured
+# against exactly the clean tensor the trainable attacks see (the two chains otherwise differ
+# by a sub-pixel crop shift that alone flips ~8 % of YFCC predictions).
+geoshield:
+  enabled: false
+  attack_name: "geoshield"
+  steps: 100
+  clean_dir: "/Data/mathias.ollu/results/1409_FIX/geoshield_io/clean"
+  output_base: "/Data/mathias.ollu/results/1409_FIX/geoshield_io/attacked"
+  clean_image_format: "png"
+  clean_preprocess: "model"
+  input_res: 336
+  # reuse_existing: skip GeoShield generation for a budget whose attacked dir already holds
+  # all images (clean copies are deterministic, so previously generated outputs stay valid).
+  reuse_existing: true
+  epsilons: null
+  repos_root: null
+  script: "Geoshield/geoshield.py"
+  python: null
+
+# Localizability evaluation options
+localizability:
+  monte_carlo_samples: 256
+
+# Plotting options
+plot:
+  gps_true: true
+  plot_success_rate: true
+  attack_success_rate_thresholds: [200, 750, 2500] # Distance thresholds in km
+  stored_metrics: ["final_step_displacement_predicted", "final_step_displacement_true"]
+  # Opt-in: re-evaluate each best perturbation across eval_num_steps during
+  # evaluate-dataset (extra pipeline runs; no retraining). The restart ablation
+  # is always produced (it is free).
+  run_sampling_steps_ablation: false
+  # Opt-in: re-evaluate each best perturbation across eval_cfgs guidance scales during
+  # evaluate-dataset (extra pipeline runs; no retraining). Runs for every evaluated
+  # attack (like the sampling-steps ablation), not scoped per attack type.
+  run_cfg_ablation: false
+  # Opt-in: degrade each best perturbation's protected image with JPEG/blur and
+  # re-evaluate (GeoShield Fig. 6). Scoped to robustness.attack_types (default dtd),
+  # so it is a no-op unless one of those attacks is part of the run.
+  run_robustness_ablation: false
+  # Opt-in: re-evaluate each best perturbation's attacked image against every PLONK
+  # variant in model_transfer.model_types (cross-model transfer). No retraining; cheap.
+  run_model_transfer_ablation: false

@@ -18,6 +18,8 @@ from PIL import Image
 from utils.adversarial_metrics import select_displacement_score
 from utils.adversarial_utils import (
     add_perturbation_to_image,
+    normalized_to_pixels,
+    perturbed_encoder_input,
     conditional_preprocessing,
     run_paired_pipeline_with_shared_noise,
 )
@@ -294,6 +296,8 @@ class AttackBase(ABC):
         self.device = device
         
         self.source_tensor = conditional_preprocessing(source_image, pipeline, device=device)
+        # Pixel-space view of the source ([0, 1]); perturbations live on this scale.
+        self.source_pixels = normalized_to_pixels(self.source_tensor, pipeline)
         self.restart_manager = RestartManager(
             num_restarts=num_restarts,
             selection_metric=selection_metric,
@@ -304,6 +308,16 @@ class AttackBase(ABC):
     def initialize_delta(self, restart_idx: int) -> torch.Tensor:
         """Initialize perturbation for this restart. Must set requires_grad=True."""
         pass
+
+    def perturbed_input(self, delta: torch.Tensor) -> torch.Tensor:
+        """Encoder input of the protected image for a perturbation ``delta`` in pixel units.
+
+        ``delta`` and the l_inf budget are defined on the [0, 1] pixel scale (8/255 = eight
+        grey levels, GeoShield's convention). Pixels are clamped to [0, 1] and normalised
+        with the encoder's statistics, matching what ``add_perturbation_to_image`` builds at
+        evaluation time up to 8-bit quantisation.
+        """
+        return perturbed_encoder_input(self.source_tensor, delta, self.pipeline)
 
     @abstractmethod
     def run_step(

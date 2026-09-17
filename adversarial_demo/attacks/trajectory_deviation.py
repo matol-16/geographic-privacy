@@ -125,6 +125,22 @@ def build_x0_bank_from_clean_model(
     return _gps_degrees_to_cartesian(gps_samples, device=device)
 
 
+def build_x0_bank_from_true_gps(true_gps, device="cuda") -> torch.Tensor:
+    """x0 bank holding only the image's TRUE location (``(lat, lon)`` in degrees), as a
+    ``(1, 3)`` unit vector on S^2.
+
+    This is the x0 written in the paper (Eq. 1 / 9 / 15): the forward process noises the
+    image's ground-truth location. ``build_x0_bank_from_clean_model`` instead noises samples
+    of the clean model's own predictive distribution, i.e. it queries the velocity network
+    along trajectories towards where the model *thinks* the image is. The defender owns the
+    true location (Sec. 6.1), so using it is legitimate. Selected via ``x0_source="true"``.
+    """
+    if true_gps is None:
+        raise ValueError("x0_source='true' requires the image's true GPS (true_gps=(lat, lon)).")
+    lat, lon = (float(v) for v in true_gps)
+    return _gps_degrees_to_cartesian(np.array([[lat, lon]]), device=device).to(torch.float32)
+
+
 ############################################################################################
 # Diffusion attack using AttackBase
 ############################################################################################
@@ -151,6 +167,9 @@ class DiffusionAttack(AttackBase):
         restart_selection_metric: str = "final_step_displacement",
         device: str = "cuda",
         x0_bank: Optional[torch.Tensor] = None,  # Shared x0_bank across restarts
+        forward_process: str = "model",
+        x0_source: str = "clean_model",
+        true_gps: Optional[Any] = None,
     ):
         super().__init__(
             pipeline=pipeline,
@@ -159,13 +178,43 @@ class DiffusionAttack(AttackBase):
             selection_metric=restart_selection_metric,
             device=device,
         )
+        # Where the data end-point x0 of the forward process comes from:
+        #   "clean_model": a bank of ``anchor_samples`` samples of the clean model (cfg 0), the
+        #                  legacy behaviour -- E over the model's own posterior of x0;
+        #   "true":        the image's true location (paper Eq. 1 / 9 / 15), a bank of size 1.
+        if x0_source not in ("clean_model", "true"):
+            raise ValueError(f"Unknown x0_source={x0_source!r}; expected 'clean_model' or 'true'")
+        self.x0_source = x0_source
+        self.true_gps = tuple(float(v) for v in true_gps) if true_gps is not None else None
+        # Forward process used to draw the (x_t, gamma) pairs the velocities are compared at.
+        # It must MATCH THE ATTACKED MODEL's own training forward process:
+        #   "model":    (default) the attacked model's parameterization, detected from the
+        #               pipeline -- RFM: geodesic between a uniform point of S^2 and x0 at gamma
+        #               (paper Eq. 1), with both velocities projected on the tangent space at x_t
+        #               before the alignment loss (<.,.>_{x_t}); diffusion: the DDPM interpolant
+        #               sqrt(gamma) x0 + sqrt(1-gamma) n; Euclidean flow: the linear interpolant.
+        #               ("manifold" is accepted as the former name of this option.)
+        #   "gaussian": legacy v1 behaviour -- the DDPM interpolant regardless of the model, i.e.
+        #               off the sphere with a Euclidean cosine for the RFM model. Kept only so the
+        #               v1 baselines (dtd, diffusion_l2, dtd_v3_old_forward) stay reproducible.
+        if forward_process == "manifold":
+            forward_process = "model"
+        if forward_process not in ("gaussian", "model"):
+            raise ValueError(f"Unknown forward_process={forward_process!r}; expected 'model' (or 'manifold') or 'gaussian'")
+        self.forward_process = forward_process
+        self.model_kind = detect_model_kind(pipeline)
+        self.manifold = getattr(pipeline, "manifold", None) if self.model_kind == "rfm" else None
+        if forward_process == "model" and self.model_kind == "rfm" and self.manifold is None:
+            raise ValueError("forward_process='model' needs pipeline.manifold for the RFM model")
         
         # Freeze models
         pipeline.network.eval().requires_grad_(False)
         pipeline.cond_preprocessing.emb_model.eval().requires_grad_(False)
         
         # Build x0 bank for stochastic training (or reuse provided one)
-        if x0_bank is None:
+        if x0_bank is None and x0_source == "true":
+            self.x0_bank = build_x0_bank_from_true_gps(self.true_gps, device=device)
+        elif x0_bank is None:
             self.x0_bank = build_x0_bank_from_clean_model(
                 pipeline,
                 source_image,
@@ -213,13 +262,10 @@ class DiffusionAttack(AttackBase):
         t = torch.rand(self.train_batch_size, device=self.device)
         gamma = self.pipeline.scheduler(t)
         
-        x_t = (
-            torch.sqrt(gamma).unsqueeze(-1) * x0
-            + torch.sqrt(1.0 - gamma).unsqueeze(-1) * eps
-        )
+        x_t = self._sample_x_t(x0, eps, gamma)
         
         # Compute embeddings
-        perturbed_source = self.source_tensor + delta
+        perturbed_source = self.perturbed_input(delta)
         emb_perturbed = compute_embedding(
             perturbed_source,
             self.train_batch_size,
@@ -254,6 +300,11 @@ class DiffusionAttack(AttackBase):
         else:
             eps_pred = eps
         
+        # On the sphere, compare the velocities in the tangent space at x_t (paper: <.,.>_{x_t}).
+        if self.forward_process == "model" and self.model_kind == "rfm":
+            eps_pred = self.manifold.proju(x_t, eps_pred)
+            eps_pred_perturbed = self.manifold.proju(x_t, eps_pred_perturbed)
+
         # Alignment loss
         loss = _compute_alignment_loss(eps_pred, eps_pred_perturbed, dot_product_loss=self.dot_product_loss)
         
@@ -273,6 +324,26 @@ class DiffusionAttack(AttackBase):
         
         return float(loss.item())
 
+    def _sample_x_t(self, x0: torch.Tensor, eps: torch.Tensor, gamma: torch.Tensor) -> torch.Tensor:
+        """Noised state at which clean and perturbed velocities are compared (see ``forward_process``)."""
+        if self.forward_process == "gaussian":
+            return torch.sqrt(gamma).unsqueeze(-1) * x0 + torch.sqrt(1.0 - gamma).unsqueeze(-1) * eps
+        if self.model_kind == "diffusion":
+            return torch.sqrt(gamma).unsqueeze(-1) * x0 + torch.sqrt(1.0 - gamma).unsqueeze(-1) * eps
+        if self.model_kind == "flow":
+            return gamma.unsqueeze(-1) * x0 + (1.0 - gamma).unsqueeze(-1) * eps
+        # "rfm": geodesic from a uniform point on the sphere (noise end) to the data point x0,
+        # evaluated at gamma -- exactly the training forward process (RiemannianFlowMatchingLoss).
+        x0_sphere = self.manifold.random_base(self.train_batch_size, x0.shape[-1]).to(
+            device=self.device, dtype=x0.dtype
+        )
+        gamma_exp = gamma.unsqueeze(-1)
+
+        def _point(x0_s, x1, g):
+            return _sphere_geodesic(self.manifold, x0_s, x1)(g).squeeze(-2)
+
+        return _func_vmap(_point)(x0_sphere, x0, gamma_exp).reshape(self.train_batch_size, -1)
+
     def get_config(self) -> Dict[str, Any]:
         """Return attack configuration."""
         return {
@@ -285,6 +356,10 @@ class DiffusionAttack(AttackBase):
             "reconstruction_loss_weight": self.reconstruction_loss_weight,
             "delta_init": self.delta_init,
             "num_restarts": self.restart_manager.num_restarts,
+            "forward_process": self.forward_process,
+            "x0_source": self.x0_source,
+            "true_gps": list(self.true_gps) if self.true_gps is not None else None,
+            "model_kind": self.model_kind,
         }
 
 
@@ -337,6 +412,7 @@ class ACE(DiffusionAttack):
         device: str = "cuda",
         x0_bank: Optional[torch.Tensor] = None,  # Shared x0_bank across restarts
         diagnose_grad_balance: bool = True,  # Print per-term grad norms once to check alpha
+        forward_process: str = "model",  # attacked model's own forward process (see DiffusionAttack)
     ):
         if target_image is None:
             raise ValueError("ACE requires a target_image.")
@@ -358,6 +434,7 @@ class ACE(DiffusionAttack):
             restart_selection_metric=restart_selection_metric,
             device=device,
             x0_bank=x0_bank,
+            forward_process=forward_process,
         )
 
         # Weight of the encoder l2 alignment term.
@@ -388,13 +465,12 @@ class ACE(DiffusionAttack):
         t = torch.rand(self.train_batch_size, device=self.device)
         gamma = self.pipeline.scheduler(t)
 
-        x_t = (
-            torch.sqrt(gamma).unsqueeze(-1) * x0
-            + torch.sqrt(1.0 - gamma).unsqueeze(-1) * eps
-        )
+        # x_t from the attacked model's own forward process (geodesic for RFM, DDPM / linear
+        # interpolant for diffusion / flow); "gaussian" reproduces the legacy off-sphere x_t.
+        x_t = self._sample_x_t(x0, eps, gamma)
 
         # Denoiser prediction on the perturbed source (tracks gradient)
-        perturbed_source = self.source_tensor + delta
+        perturbed_source = self.perturbed_input(delta)
         emb_perturbed = compute_embedding(
             perturbed_source,
             self.train_batch_size,
@@ -423,6 +499,10 @@ class ACE(DiffusionAttack):
             "gamma": gamma,
         }
         eps_pred_target = self.pipeline.model(model_batch_target)
+        if self.forward_process == "model" and self.model_kind == "rfm":
+            # compare velocities in the tangent space at x_t (paper: ||.||_{x_t})
+            eps_pred_target = self.manifold.proju(x_t, eps_pred_target)
+            eps_pred_perturbed = self.manifold.proju(x_t, eps_pred_perturbed)
 
         # Term 1: score-alignment loss pulling the perturbed score towards the target
         # prediction (default l2_target = MSE; configurable via dot_product_loss).
@@ -661,7 +741,7 @@ class UniDef(DiffusionAttack):
         reference = v_true
 
         # Embedding of the perturbed conditioning image (tracks grad through the encoder).
-        perturbed_source = self.source_tensor + delta
+        perturbed_source = self.perturbed_input(delta)
         emb_perturbed = compute_embedding(
             perturbed_source,
             self.train_batch_size,
@@ -765,6 +845,8 @@ class TrainingLossAttack(DiffusionAttack):
         restart_selection_metric: str = "final_step_displacement",
         device: str = "cuda",
         x0_bank: Optional[torch.Tensor] = None,
+        x0_source: str = "clean_model",
+        true_gps: Optional[Any] = None,
     ):
         super().__init__(
             pipeline=pipeline,
@@ -783,6 +865,8 @@ class TrainingLossAttack(DiffusionAttack):
             restart_selection_metric=restart_selection_metric,
             device=device,
             x0_bank=x0_bank,
+            x0_source=x0_source,
+            true_gps=true_gps,
         )
         self.model_kind = detect_model_kind(pipeline)
         self.manifold = getattr(pipeline, "manifold", None) if self.model_kind == "rfm" else None
@@ -831,7 +915,7 @@ class TrainingLossAttack(DiffusionAttack):
             v_true = v_true_batch.reshape(self.train_batch_size, -1)
 
         # Perturbed embedding (gradient tracked through the encoder)
-        perturbed_source = self.source_tensor + delta
+        perturbed_source = self.perturbed_input(delta)
         emb_perturbed = compute_embedding(
             perturbed_source,
             self.train_batch_size,
@@ -1010,7 +1094,7 @@ class TargetedL2(TrainingLossAttack):
             v_target = v_target_batch.reshape(self.train_batch_size, -1)
 
         # Perturbed embedding (gradient tracked through the encoder)
-        perturbed_source = self.source_tensor + delta
+        perturbed_source = self.perturbed_input(delta)
         emb_perturbed = compute_embedding(
             perturbed_source,
             self.train_batch_size,
@@ -1115,6 +1199,9 @@ class DTDBlur(DiffusionAttack):
         restart_selection_metric: str = "final_step_displacement",
         device: str = "cuda",
         x0_bank: Optional[torch.Tensor] = None,
+        forward_process: str = "model",  # attacked model's own forward process (see DiffusionAttack)
+        x0_source: str = "clean_model",  # see DiffusionAttack ("clean_model" bank or the "true" location)
+        true_gps: Optional[Any] = None,
     ):
         super().__init__(
             pipeline=pipeline,
@@ -1133,6 +1220,9 @@ class DTDBlur(DiffusionAttack):
             restart_selection_metric=restart_selection_metric,
             device=device,
             x0_bank=x0_bank,
+            forward_process=forward_process,
+            x0_source=x0_source,
+            true_gps=true_gps,
         )
         self.blur_sigma_min = float(blur_sigma_min)
         self.blur_sigma_max = float(blur_sigma_max)
@@ -1178,10 +1268,9 @@ class DTDBlur(DiffusionAttack):
         eps = torch.randn_like(x0)
         t = torch.rand(self.train_batch_size, device=self.device)
         gamma = self.pipeline.scheduler(t)
-        x_t = (
-            torch.sqrt(gamma).unsqueeze(-1) * x0
-            + torch.sqrt(1.0 - gamma).unsqueeze(-1) * eps
-        )
+        # x_t from the attacked model's own forward process (see DiffusionAttack._sample_x_t).
+        x_t = self._sample_x_t(x0, eps, gamma)
+        _tangent = self.forward_process == "model" and self.model_kind == "rfm"
 
         # Clean reference score (unperturbed, unblurred source); shared, no grad.
         emb_source = compute_embedding(
@@ -1192,8 +1281,10 @@ class DTDBlur(DiffusionAttack):
             track_grad=False,
         )
         eps_pred = self.pipeline.model({"y": x_t, "emb": emb_source, "gamma": gamma})
+        if _tangent:
+            eps_pred = self.manifold.proju(x_t, eps_pred)
 
-        perturbed_source = self.source_tensor + delta
+        perturbed_source = self.perturbed_input(delta)
 
         # Term 1: DTD alignment on the clean protected image (gradient through the encoder).
         emb_clean = compute_embedding(
@@ -1204,6 +1295,8 @@ class DTDBlur(DiffusionAttack):
             track_grad=True,
         )
         eps_pred_clean = self.pipeline.model({"y": x_t, "emb": emb_clean, "gamma": gamma})
+        if _tangent:
+            eps_pred_clean = self.manifold.proju(x_t, eps_pred_clean)
         loss_clean = _compute_alignment_loss(
             eps_pred, eps_pred_clean, dot_product_loss=self.dot_product_loss
         )
@@ -1220,6 +1313,8 @@ class DTDBlur(DiffusionAttack):
             track_grad=True,
         )
         eps_pred_blur = self.pipeline.model({"y": x_t, "emb": emb_blur, "gamma": gamma})
+        if _tangent:
+            eps_pred_blur = self.manifold.proju(x_t, eps_pred_blur)
         loss_blur = _compute_alignment_loss(
             eps_pred, eps_pred_blur, dot_product_loss=self.dot_product_loss
         )

@@ -795,6 +795,7 @@ def evaluate_attack_shard(
         run_cfg_ablation=run_cfg_ablation,
         eval_cfgs=[float(c) for c in eval_cfgs] if eval_cfgs else None,
         cfg_num_steps=cfg_num_steps,
+        save_deltas=bool((config_dump or {}).get("save_deltas", False)),
     )
 
     runner = EvaluationRunner(config, pipeline, transfer_pipelines=transfer_pipelines)
@@ -945,6 +946,9 @@ def merge_shards(
         robustness_results = state.get("robustness_results") or {}
         model_transfer_results = state.get("model_transfer_results") or {}
         cfg_results = state.get("cfg_results") or {}
+        for attack_type, impl in (state.get("attack_impl") or {}).items():
+            if attack_type in attack_types:
+                combined.attack_impl.setdefault(attack_type, impl)
 
         for attack_type in attack_types:
             saved = results.get(attack_type)
@@ -986,6 +990,10 @@ def merge_shards(
         results_manager.save_results(all_results[attack_type], dataset_name, attack_type)
     if config_dump is not None:
         results_manager.save_run_config(config_dump, dataset_name, suffix="_merged")
+    if combined.attack_impl:
+        pins = {k: v.get("attack_type") for k, v in combined.attack_impl.items()}
+        print(f"Attack implementations (from the shard states): {pins}")
+        results_manager.save_attack_args(attack_budgets, [], dataset_name, attack_impl=combined.attack_impl)
 
     # 5. Main plots.
     plot_results(
