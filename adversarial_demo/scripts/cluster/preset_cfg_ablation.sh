@@ -28,6 +28,11 @@ set -euo pipefail
 
 export CLUSTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${CLUSTER_DIR}/../.." && pwd)"
+# Historical runs: the repo-root config, the config file's own restart protocol and
+# GeoShield dirs (config.sh's defaults now describe the cluster_full experiment).
+export CONFIG_PATH="${CONFIG_PATH:-${PROJECT_DIR}/config.yaml}"
+export NUM_RESTARTS="${NUM_RESTARTS-}"
+export GEOSHIELD_IO_DIR="${GEOSHIELD_IO_DIR-}"
 
 export DATASET="yfcc"
 export TOTAL_IMAGES="${TOTAL_IMAGES:-4000}"

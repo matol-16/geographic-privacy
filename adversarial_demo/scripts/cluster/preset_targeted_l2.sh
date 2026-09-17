@@ -43,6 +43,11 @@ DS="${1:?usage: preset_targeted_l2.sh <yfcc|osv> [--dry-run]}"; shift || true
 
 export CLUSTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${CLUSTER_DIR}/../.." && pwd)"
+# Historical runs: the repo-root config, the config file's own restart protocol and
+# GeoShield dirs (config.sh's defaults now describe the cluster_full experiment).
+export CONFIG_PATH="${CONFIG_PATH:-${PROJECT_DIR}/config.yaml}"
+export NUM_RESTARTS="${NUM_RESTARTS-}"
+export GEOSHIELD_IO_DIR="${GEOSHIELD_IO_DIR-}"
 # shellcheck source=/dev/null
 source "${CLUSTER_DIR}/integrate_lib.sh"
 

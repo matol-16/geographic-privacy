@@ -54,15 +54,28 @@ def select_displacement_score(
 	mean_step_disp: float,
 	final_step_disp: float,
 	metric_name: str,
+	metrics: Optional[Dict[str, Any]] = None,
 ) -> float:
-	"""Select scalar score from explicit displacement metric choice."""
+	"""Scalar restart-selection score for ``metric_name``.
+
+	``mean_step_displacement`` / ``final_step_displacement`` are the paired clean-vs-attacked
+	displacements; ``final_step_displacement_true`` (the FSD, distance to the true location,
+	the paper's selection criterion) is read from ``metrics`` when available.
+	"""
 	if metric_name == "mean_step_displacement":
 		return float(mean_step_disp)
 	if metric_name == "final_step_displacement":
 		return float(final_step_disp)
+	if metric_name == "final_step_displacement_true":
+		if not metrics or metrics.get("final_step_displacement_true") is None:
+			raise ValueError(
+				"restart_selection_metric='final_step_displacement_true' but the restart metrics carry no "
+				"true-location FSD (the attack was not given true_gps)."
+			)
+		return float(metrics["final_step_displacement_true"])
 	raise ValueError(
 		f"Unknown displacement metric: {metric_name}. "
-		"Expected one of ['mean_step_displacement', 'final_step_displacement']"
+		"Expected one of ['mean_step_displacement', 'final_step_displacement', 'final_step_displacement_true']"
 	)
 
 

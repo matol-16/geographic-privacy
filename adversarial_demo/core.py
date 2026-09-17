@@ -262,8 +262,8 @@ class ResultsManager:
     ) -> None:
         """Save attack arguments for reproducibility.
 
-        ``attack_type_kwargs`` are the per-attack overrides (incl. ``attack_variant`` pins) and
-        ``attack_impl`` the implementation label / config that actually ran per attack key.
+        ``attack_type_kwargs`` are the per-attack config overrides and ``attack_impl`` the
+        label / config of the attack that actually ran per attack key.
         """
         filename = f"{dataset}_attack_args{suffix}.pt"
         path = os.path.join(self.results_dir, filename)
@@ -411,9 +411,9 @@ class MetricsCollector:
             attack_type: [[None for _ in range(n_images)] for _ in attack_budgets]
             for attack_type in attack_types
         }
-        # Which implementation actually ran under each attack key (first result seen):
-        # {"attack_type": <label, e.g. "dtd_v3_old_forward" when "dtd" is pinned to it>,
-        #  "config": <the attack's own get_config()>}. Provenance only; saved in the state.
+        # Provenance of what ran under each attack key (first result seen):
+        # {"attack_type": <label returned by the attack>, "config": <its get_config()>, e.g.
+        #  forward_process / x0_source / sampling_cfg}. Saved in the state and attack_args.
         self.attack_impl: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
@@ -1563,27 +1563,13 @@ class PrecomputedPairEvaluationRunner(BaseEvaluationRunner):
 
 
 def _maybe_add_true_gps(runner, attack_type: str, image_idx: int, kwargs: Dict[str, Any]) -> None:
-    """Give attacks that need the image's real GPS access to it.
+    """Give every attack access to the image's real GPS (a transient per-call kwarg).
 
-    The targeted-L2 family aims at the antipode; the ``*_v3`` attacks (``dtd_v3``,
-    ``training_loss_v3``) noise the TRUE location in their forward process (paper Eq. 1 / 9 /
-    15) instead of clean-model samples. Harmless no-op for every other attack, and a transient
-    per-call value (never persisted into the saved config).
+    The standard GeoFA attacks noise the TRUE location in their forward process (Eq. 1 / 9 /
+    15), GeoFA-DPA aims at its antipode and GeoFA-Sampling maximises the distance to it;
+    the restart selection by FSD (``final_step_displacement_true``) needs it for every attack.
+    Attacks that do not use it simply ignore the kwarg. Never persisted into the saved config.
     """
-    needs_true_gps = (
-        "targeted_l2", "targetedl2", "l2_target",
-        "cosine_targeted", "cosinetargeted", "cosine_target",
-        "dtd_v3", "dtdv3", "dtd_v3_old_forward", "dtdv3oldforward",
-        "dtd_blur_v3_old_forward", "dtdblurv3oldforward",
-        "training_loss_v3", "traininglossv3", "advdm_v3",
-        "diffusion_l2_v3", "l2_v3", "sampling_v2",
-        "diffusion_l2_v3_old_forward", "l2_v3_old_forward", "unidef_v3", "unidefv3",
-    )
-    # A canonical key may be pinned to one of those implementations (``attack_variant``,
-    # see attacks.run_attack); the pin decides what the attack actually needs.
-    effective_type = kwargs.get("attack_variant") or attack_type
-    if str(effective_type).lower() not in needs_true_gps:
-        return
     source_gps = getattr(runner, "source_gps", None)
     if source_gps is not None and image_idx < len(source_gps):
         kwargs.setdefault("true_gps", tuple(source_gps[image_idx]))

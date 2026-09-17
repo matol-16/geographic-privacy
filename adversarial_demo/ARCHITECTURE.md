@@ -23,15 +23,18 @@ keys; the paper-facing labels come from one place,
 Config keys, CLI flags (`--attack-types dtd`, `plot dtd-variance`) and result file names
 (`<dataset>_dtd_results.pt`) are unchanged.
 
-**Versions and pins.** Several attacks exist in successive implementations under their own
-keys (`dtd` → `dtd_v2` / `dtd_v3` / `dtd_v3_old_forward`, `diffusion_l2` → `_v2` / `_v3`,
-`encoder_v3`, `training_loss_v3`, `sampling_v2`, `dtd_blur_v3_old_forward`; see the alias
-table in `attacks/attacks.py::run_attack`). A run can keep the canonical key and pin the
-implementation from the config: `attack_train_args.<ds>.per_attack.<key>.attack_variant:
-<variant key>` makes `run_attack` dispatch to the variant while results, plots and tables
-keep the canonical name; the pin is recorded in the saved run config and in each result's
-`attack_type` label / attack `config`. `configs/cluster_full/config.yaml` pins every attack
-of the final run this way (GeoFA-TD = `dtd_v3_old_forward`).
+**Standard specification.** Each key runs one fixed mechanism (the settings of the paper's
+runs; see `attacks/attacks.py::run_attack` and `configs/cluster_full/ATTACK_SPECS.md`):
+GeoFA-TD / GeoFA-L² deviate from the clean velocity prediction (cosine / L²) at
+x_t = √γ·x₀ + √(1−γ)·n with x₀ the image's TRUE location; GeoFA-AdvDM and GeoFA-UniDef maximise
+the RFM training loss on the same true-location forward process (UniDef with the
+finite-difference gradient); GeoFA-DPA minimises it towards the antipode; GeoFA-Sampling
+maximises the haversine distance to the true location through the 16-step sampler at w = 10;
+GeoFA-enc. maximises ‖E(c+δ)−E(c)‖² with the shared sign-SGD loop. Earlier behaviours remain
+reachable through explicit options (`forward_process="model"`, `x0_source="clean_model"`,
+`update_rule="adam"`, `reference="clean_prediction"`, `sampling_cfg=0`, `use_fdje=False`),
+never through separate keys. What actually ran is recorded per key in the state / attack_args
+(`attack_impl`: label + the attack's `get_config()`).
 
 ## Paper figures and tables
 
@@ -351,7 +354,8 @@ merged. The single-GPU command is unchanged; this is an additive path.
   model-exact copies).
 - **The full run** (`scripts/cluster/preset_cluster_full.sh`, config
   `configs/cluster_full/config.yaml`): 9 attacks × 3 budgets × 4000 images per dataset with
-  every ablation; `scripts/cluster/smoke_test_cluster_full.sh` reproduces the shard command
+  every ablation, 5 restarts selected by the FSD to the true location
+  (`restart_selection_metric: final_step_displacement_true`); `scripts/cluster/smoke_test_cluster_full.sh` reproduces the shard command
   locally on a 2-image window, `scripts/tests/check_preprocessing_roundtrip.py` checks the
   pixel-space round trip of both encoders. See `scripts/cluster/README.md`.
 

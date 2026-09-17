@@ -133,6 +133,7 @@ class RestartManager:
             mean_step_disp=mean_step_disp,
             final_step_disp=final_step_disp,
             metric_name=self.selection_metric,
+            metrics=metrics,
         )
         
         final_loss = float(loss_value) if loss_value is not None else (float(history[-1]) if history else float("inf"))
@@ -142,6 +143,9 @@ class RestartManager:
             "restart": restart_idx,
             "mean_step_displacement": float(mean_step_disp),
             "final_step_displacement": float(final_step_disp),
+            "final_step_displacement_true": (
+                float(metrics["final_step_displacement_true"]) if metrics.get("final_step_displacement_true") is not None else None
+            ),
             "score": float(score),
             "final_loss": final_loss,
             "min_loss": min_loss,
@@ -155,7 +159,8 @@ class RestartManager:
                 f"min_loss={summary['min_loss']:.6f}, "
                 f"mean_step_disp={summary['mean_step_displacement']:.6f}, "
                 f"final_step_disp={summary['final_step_displacement']:.6f}, "
-                f"selection_score={summary['score']:.6f}"
+                f"fsd_true={summary['final_step_displacement_true']}, "
+                f"selection_score={summary['score']:.6f} ({self.selection_metric})"
             )
         
         # Only restarts within the main-result depth are eligible to be selected as the

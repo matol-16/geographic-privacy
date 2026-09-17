@@ -5,26 +5,32 @@ from `scripts/test_all_attacks.sh`) by **sharding it across many GPU jobs**, the
 A single GPU is far too slow: ~30 s/restart × 8 restarts × 4000 images × 7 attacks × 2
 budgets is thousands of GPU-hours, so we split it into independent jobs.
 
-## The full run (`preset_cluster_full.sh`) — every attack, every ablation, 3 budgets
+## The full run — every attack, every ablation, 3 budgets (the default configuration)
 
-One command per dataset, from this directory (always `--dry-run` first):
+`config.sh`'s defaults ARE the full experiment, so from scratch on the cluster:
 
 ```bash
-./preset_cluster_full.sh yfcc --dry-run      # prints the 360-job plan, submits nothing
-./preset_cluster_full.sh yfcc                # 9 attacks x 40 windows + chained merge
-./preset_cluster_full.sh osv                 # same on the 4000-image OSV-5M subset
-# afterwards (CPU only): paper figures + tables
-./postprocess_cluster_full.sh all            # -> results/cluster_full/{yfcc,osv}_full/plots*, results/cluster_full/tables
+# 0. one-time: fill the #SBATCH placeholders in eval_shard.slurm / merge.slurm (account /
+#    constraint / qos), have DATA/{YFCC100M/yfcc4k,osv5m} under adversarial_demo (or export
+#    DATA_ROOT), the plonk conda env, and the Geoshield repo next to this repo's root.
+# 1. optional but recommended: local smoke test of the exact shard command + merge + figures
+scripts/cluster/smoke_test_cluster_full.sh yfcc && scripts/cluster/smoke_test_cluster_full.sh osv
+# 2. preview, then submit both datasets (each: 9 attacks x 40 windows = 360 GPU jobs + merge)
+./preset_cluster_full.sh yfcc --dry-run
+./preset_cluster_full.sh yfcc          # == DATASET=yfcc ./submit.sh
+./preset_cluster_full.sh osv           # == DATASET=osv  ./submit.sh
+# 3. afterwards (CPU only): paper figures + tables
+./postprocess_cluster_full.sh all      # -> results/cluster_full/{yfcc,osv}_full/plots*, results/cluster_full/tables
 ```
 
 | | |
 |---|---|
 | config | `configs/cluster_full/config.yaml` (machine paths injected by `config.sh`: `DATA_ROOT`, `RESULTS_BASE`, `GEOSHIELD_IO_DIR`) |
 | attacks | `dtd` (GeoFA-TD), `diffusion_l2` (GeoFA-L²), `targeted_l2` (GeoFA-DPA / L²-targeted), `sampling`, `encoder`, `training_loss` (AdvDM), `unidef`, `dtd_blur` (GeoFA-TD-blur), `geoshield` |
-| versions | pinned in the config (`per_attack.<key>.attack_variant`): the latest implementation of each, GeoFA-TD = `dtd_v3_old_forward`; result files keep the canonical names |
+| specification | one fixed mechanism per key (`attacks/attacks.py::run_attack`, `configs/cluster_full/ATTACK_SPECS.md`); what ran is recorded per key in `attack_args` (`attack_impl`) |
 | budgets | 1/255, 4/255, 8/255 |
 | images | 4000 per dataset, 100 per shard (seeded, prefix-stable ordering) |
-| restarts | `NUM_RESTARTS=5` (paper protocol, FSD-best kept; sets `num_restarts` and `max_restarts`) |
+| restarts | `NUM_RESTARTS=5` (paper protocol; the restart with the highest FSD to the *true* location is kept; sets `num_restarts` and `max_restarts`) |
 | ablations (all attacks, GeoShield included) | sampling steps `[8 16 32 64 250]`, guidance scale `[1 2 5 10]`, JPEG `[20 40 60 80 100]`, blur σ `[0 2 4 6 8 10]`, transfer to `diffusion` / `flow`; clean vs attacked FSD comes from the always-stored per-image predictions |
 
 Cost control: the eval-time ablations dominate (≈25 paired 250-step evaluations per image

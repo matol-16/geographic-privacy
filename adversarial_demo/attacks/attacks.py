@@ -9,10 +9,18 @@ import torch
 from PIL import Image
 
 from utils.adversarial_utils import resolve_torch_device
+from utils.adversarial_metrics import final_prediction_distance_to_point
 from attacks.encoder_attacks import EncoderAttack
 from attacks.trajectory_deviation import DiffusionAttack, ACE, UniDef, TrainingLossAttack, TargetedL2, DTDBlur, CosineTargeted
 from attacks.diffusion_attack_salman import SamplingAttack
 from attacks.diffusion_attack_truncated import TruncatedSamplingAttack
+
+
+def _fsd_to_point(gps, point) -> float:
+	"""Mean haversine distance (km) from a batch of final predictions ``gps`` [(N, 2) degrees] to ``point``."""
+	import numpy as np
+	coords = torch.as_tensor(np.asarray(gps), dtype=torch.float32).reshape(-1, 2)
+	return final_prediction_distance_to_point(coords.unsqueeze(0), point)
 
 
 def _run_restartable_attack(
@@ -28,9 +36,23 @@ def _run_restartable_attack(
 	num_restart_workers: int,
 	finalize_kwargs: Optional[Dict[str, Any]] = None,
 	main_num_restarts: Optional[int] = None,
+	true_gps: Optional[Any] = None,
 ) -> Dict[str, Any]:
-	"""Train, evaluate, and select the best restart for a restartable attack."""
+	"""Train, evaluate, and select the best restart for a restartable attack.
+
+	``true_gps`` (the image's (lat, lon)) adds ``final_step_displacement_true`` -- the FSD, i.e.
+	the mean haversine distance between the attacked prediction and the true location -- to
+	every restart's metrics, so restarts can be selected by it
+	(``restart_selection_metric="final_step_displacement_true"``, the paper's protocol).
+	"""
 	finalize_kwargs = finalize_kwargs or {}
+	if true_gps is not None:
+		true_gps = tuple(float(v) for v in true_gps)
+	elif attack.restart_manager.selection_metric == "final_step_displacement_true":
+		raise ValueError(
+			"restart_selection_metric='final_step_displacement_true' needs the image's true GPS "
+			"(pass true_gps=(lat, lon))."
+		)
 	# Restrict the reported best to the first ``main_num_restarts`` restarts; the rest are
 	# still evaluated to populate the restart ablation (see RestartManager.update_best).
 	if main_num_restarts is not None:
@@ -54,6 +76,11 @@ def _run_restartable_attack(
 			num_steps=restart_eval_num_steps,
 			seed=restart_eval_seed,
 		)
+		if true_gps is not None:
+			# Same quantity MetricsCollector reports as the FSD (final step, mean over the batch,
+			# haversine to the true location) for the attacked and the clean prediction.
+			eval_result["metrics"]["final_step_displacement_true"] = _fsd_to_point(eval_result["gps_perturbed"], true_gps)
+			eval_result["metrics"]["final_step_displacement_source_true"] = _fsd_to_point(eval_result["gps_source"], true_gps)
 
 		return restart_idx, delta, history, eval_result
 
@@ -124,19 +151,40 @@ def run_attack(
 	"""
 	Run any supported attack from one API.
 
-	You can pass a superset of hyperparameters: only those accepted by the
-	chosen attack class will be forwarded (unrecognised keys are ignored).
+	Standard specification of each attack key (the settings of the paper's runs; every
+	legacy behaviour stays reachable through the explicit options named in brackets):
+
+	  dtd            GeoFA-TD: min E cos(psi(x_t|c+d), psi(x_t|c)); x_t = sqrt(g) x0 + sqrt(1-g) n
+	                 with x0 = the image's TRUE location, Euclidean cosine
+	                 [forward_process="model" -> geodesic x_t + tangent cosine; x0_source="clean_model"]
+	  diffusion_l2   GeoFA-L2: max E ||psi(x_t|c+d) - psi(x_t|c)||^2, same x_t as dtd (metric-only difference)
+	  targeted_l2    GeoFA-DPA / L2-targeted: min RFM training loss towards the antipode of the true location
+	  sampling       GeoFA-Sampling: max E haversine(x0_hat(x_N), true location) through the 16-step
+	                 sampler run at guidance w = 10 [reference="clean_prediction", sampling_cfg=0]
+	  encoder        GeoFA-enc.: max ||E(c+d) - E(c)||^2 with the shared sign-SGD PGD loop
+	                 [update_rule="adam", delta_init=None -> the original Adam/full-budget-init version]
+	  training_loss  GeoFA-AdvDM: max RFM training loss, x_t and target from the TRUE location
+	                 [x0_source="clean_model"]
+	  unidef         GeoFA-UniDef: training_loss with the finite-difference (FDJE) gradient estimator
+	                 [use_fdje=False, x0_source="clean_model"]
+	  dtd_blur       GeoFA-TD-blur: dtd + the same loss on a Gaussian-blurred copy (blur EOT)
+	  ace            GeoFA-ACE (image-space target), diffusion / truncated_sampling / cosine_targeted:
+	                 other baselines and ablations.
+
+	You can pass a superset of hyperparameters: only those accepted by the chosen attack
+	are forwarded (unrecognised keys are ignored).
 
 	Args:
-		attack_type: "encoder", "diffusion", "ace", "sampling", or "diffusion_salman" (alias).
+		attack_type: one of the keys above (a few short aliases are accepted, see ``aliases``).
 		source_image: PIL source image to attack.
 		pipeline: PLONK pipeline instance.
-		target_image: Target image for targeted attacks ("encoder" and "ace").
+		target_image: Target image for targeted attacks ("encoder" targeted mode and "ace").
 		silent: If True, suppress all prints and progress bars from the attack.
-		**kwargs: forwarded to the attack implementation.
-	
+		**kwargs: forwarded to the attack implementation (incl. ``true_gps`` = the image's
+			(lat, lon), which the true-location attacks require).
+
 	Returns:
-		Standardized attack result dict with attack_type, delta, history, source_tensor, 
+		Standardized attack result dict with attack_type, delta, history, source_tensor,
 		best_metrics, config, etc.
 	"""
 	if silent:
@@ -149,80 +197,33 @@ def run_attack(
 	else:
 		kwargs["device"] = resolve_torch_device("cuda")
 
-	# Optional version pin: ``attack_variant`` (config ``per_attack.<key>.attack_variant``)
-	# runs the attack under a canonical key (``dtd``, ``diffusion_l2``, ...) with the
-	# implementation of another key (``dtd_v3_old_forward``, ``diffusion_l2_v3``, ...).
-	# Results / plots keep the canonical name; the variant is recorded in the result
-	# (``attack_type_label`` / ``config``) and in the saved run config.
-	attack_variant = kwargs.pop("attack_variant", None)
-	dispatch_type = attack_variant if attack_variant else attack_type
-
-	# Normalize attack type
 	aliases = {
-		"encoder": "encoder",
-		"enc": "encoder",
-		"diffusion": "diffusion",
-		"diff": "diffusion",
-		"sampling": "sampling",
-		"diffusion_salman": "sampling",  # backward-compatible alias for Sampling
-		"salman": "sampling",            # backward-compatible alias for Sampling
-		"truncated_sampling": "truncated_sampling",
-		"sampling_truncated": "truncated_sampling",
-		"salman_truncated": "truncated_sampling",
-		"truncated": "truncated_sampling",
+		"dtd": "dtd",
+		"diffusion_cosine_neg": "dtd",  # historical name of GeoFA-TD
 		"diffusion_l2": "diffusion_l2",
 		"l2": "diffusion_l2",
-		"diffusion_l2_v2": "diffusion_l2_v2",  # GeoFA-L2 with the geodesic x_t / tangent L2 (paper Eq. 12)
-		"l2_v2": "diffusion_l2_v2",
-		"diffusion_l2_v3": "diffusion_l2_v3",  # l2_v2 + x_t noised from the TRUE location
-		"l2_v3": "diffusion_l2_v3",
-		"diffusion_l2_v3_old_forward": "diffusion_l2_v3_old_forward",  # v1 (Gaussian x_t, Euclidean L2) + TRUE x0: the L2 twin of dtd_v3_old_forward
-		"l2_v3_old_forward": "diffusion_l2_v3_old_forward",
-		"sampling_v2": "sampling_v2",  # GeoFA-Sampling deviating from the TRUE location (paper Eq. 8)
-		"encoder_v3": "encoder_v3",  # GeoFA-enc. with the shared sign-SGD PGD loop (paper Sec. 4.1 / Eq. 7)
-		"enc_v3": "encoder_v3",
-		"dtd": "dtd",
-		"diffusion_cosine_neg": "dtd",  # backward-compatible alias for DTD
-		"dtd_v2": "dtd_v2",  # GeoFA-TD with the model's own (geodesic) forward process
-		"dtdv2": "dtd_v2",
-		"dtd_v3": "dtd_v3",  # dtd_v2 + x_t noised from the TRUE location (paper Eq. 1 / 15)
-		"dtdv3": "dtd_v3",
-		"dtd_v3_old_forward": "dtd_v3_old_forward",  # v1 (Gaussian x_t) + TRUE x0: isolates the x0 change
-		"dtdv3oldforward": "dtd_v3_old_forward",
-		"training_loss_v3": "training_loss_v3",  # GeoFA-AdvDM + x_t / target from the TRUE location (Eq. 9)
-		"traininglossv3": "training_loss_v3",
-		"advdm_v3": "training_loss_v3",
-		"dtd_blur": "dtd_blur",
-		"dtdblur": "dtd_blur",
-		"dtd_blur_v3_old_forward": "dtd_blur_v3_old_forward",  # dtd_blur on top of dtd_v3_old_forward (Gaussian x_t + TRUE x0)
-		"dtdblurv3oldforward": "dtd_blur_v3_old_forward",
-		"ace": "ace",
-		"diffusion_target": "ace",
-		"dtd_target": "ace",
-		"diff_target": "ace",
-		"unidef": "unidef",
-		"uni_def": "unidef",
-		"cdd": "unidef",
-		"unidef_nofdje": "unidef_nofdje",
-		"unidef_v3": "unidef_v3",  # UniDef with x_t / target from the TRUE location (like training_loss_v3)
-		"unidefv3": "unidef_v3",
-		"training_loss": "training_loss",
 		"targeted_l2": "targeted_l2",
-		"targetedl2": "targeted_l2",
 		"l2_target": "targeted_l2",
+		"dpa": "targeted_l2",
+		"sampling": "sampling",
+		"diffusion_salman": "sampling",  # historical name
+		"encoder": "encoder",
+		"enc": "encoder",
+		"training_loss": "training_loss",
+		"advdm": "training_loss",
+		"unidef": "unidef",
+		"dtd_blur": "dtd_blur",
+		"ace": "ace",
+		"diffusion": "diffusion",
+		"truncated_sampling": "truncated_sampling",
 		"cosine_targeted": "cosine_targeted",
-		"cosinetargeted": "cosine_targeted",
-		"cosine_target": "cosine_targeted",
 	}
-	normalized_type = aliases.get(str(dispatch_type).lower())
+	normalized_type = aliases.get(str(attack_type).lower())
 	if normalized_type is None:
 		raise ValueError(
-			f"Unknown attack_type={dispatch_type}. Expected one of {sorted(aliases.keys())}"
+			f"Unknown attack_type={attack_type}. Expected one of {sorted(aliases.keys())}"
 		)
-	if attack_variant and aliases.get(str(attack_type).lower()) is None:
-		raise ValueError(f"Unknown attack_type={attack_type} (pinned to variant {attack_variant!r})")
 
-	# Run the appropriate attack
 	if normalized_type == "encoder":
 		return _run_encoder_attack(
 			source_image=source_image,
@@ -230,162 +231,26 @@ def run_attack(
 			pipeline=pipeline,
 			**kwargs
 		)
-	if normalized_type == "diffusion":
-		return _run_diffusion_attack(
-			source_image=source_image,
-			pipeline=pipeline,
-			**kwargs
-		)
-	if normalized_type == "diffusion_l2":
-		# GeoFA-L2 v1 (legacy): Gaussian x_t regardless of the model; see diffusion_l2_v2 for Eq. 12.
-		kwargs["dot_product_loss"] = "l2"
-		kwargs.setdefault("forward_process", "gaussian")
-		return _run_diffusion_attack(
-			source_image=source_image,
-			pipeline=pipeline,
-			attack_type_label="diffusion_l2",
-			**kwargs
-		)
-	if normalized_type == "diffusion_l2_v2":
-		# GeoFA-L2 v2: paper Eq. 12 as written -- (x_t, gamma) from the model's own geodesic
-		# forward process and the L2 distance taken between tangent-projected velocities.
-		kwargs["dot_product_loss"] = "l2"
-		kwargs["forward_process"] = "model"
-		return _run_diffusion_attack(
-			source_image=source_image,
-			pipeline=pipeline,
-			attack_type_label="diffusion_l2_v2",
-			**kwargs
-		)
-	if normalized_type == "diffusion_l2_v3":
-		# GeoFA-L2 v3: l2_v2 with x_t noised from the image's TRUE location (Eq. 1 x0).
-		kwargs["dot_product_loss"] = "l2"
-		kwargs["forward_process"] = "model"
-		kwargs["x0_source"] = "true"
-		return _run_diffusion_attack(
-			source_image=source_image,
-			pipeline=pipeline,
-			attack_type_label="diffusion_l2_v3",
-			**kwargs
-		)
-	if normalized_type == "diffusion_l2_v3_old_forward":
-		# GeoFA-L2 with exactly the forward process of dtd_v3_old_forward: legacy Gaussian
-		# interpolant sqrt(gamma) x0 + sqrt(1-gamma) n with x0 = the TRUE location, Euclidean L2
-		# between the raw velocity predictions (no tangent projection). Differs from that TD pin
-		# by the metric only.
-		kwargs["dot_product_loss"] = "l2"
-		kwargs["forward_process"] = "gaussian"
-		kwargs["x0_source"] = "true"
-		return _run_diffusion_attack(
-			source_image=source_image,
-			pipeline=pipeline,
-			attack_type_label="diffusion_l2_v3_old_forward",
-			**kwargs
-		)
-	if normalized_type == "sampling_v2":
-		# GeoFA-Sampling v2: maximise the haversine distance between the perturbed prediction and
-		# the image's TRUE location (paper Eq. 8); v1 deviates from the clean prediction instead.
-		kwargs["reference"] = "true_location"
-		return _run_diffusion_salman_attack(
-			source_image=source_image,
-			pipeline=pipeline,
-			attack_type_label="sampling_v2",
-			**kwargs
-		)
-	if normalized_type == "encoder_v3":
-		# GeoFA-enc. v3: same untargeted objective, but optimised with the PGD loop every other
-		# GeoFA attack uses (sign-SGD, squared L2 of Eq. 7, tiny init, encoder in eval mode) --
-		# v1 used Adam on the unsquared distance with a full-budget uniform init.
-		kwargs["update_rule"] = "sign_sgd"
-		kwargs.setdefault("delta_init", 1e-4)
-		return _run_encoder_attack(
-			source_image=source_image,
-			target_image=target_image,
-			pipeline=pipeline,
-			attack_type_label="encoder_v3",
-			**kwargs
-		)
 	if normalized_type == "dtd":
-		# DTD (Diffusion Trajectory Deviation): raw (signed) cosine-similarity
-		# objective between the clean and perturbed eps predictions.
-		# v1 (legacy): Gaussian x_t regardless of the model; dtd_v2 / dtd_v3 use the model's own.
 		kwargs["dot_product_loss"] = "cosine_similarity_negative"
-		kwargs.setdefault("forward_process", "gaussian")
 		return _run_diffusion_attack(
 			source_image=source_image,
 			pipeline=pipeline,
 			attack_type_label="dtd",
 			**kwargs
 		)
-	if normalized_type == "dtd_v2":
-		# GeoFA-TD v2: same cosine objective, but (x_t, gamma) are drawn from the model's own
-		# forward process (geodesic on S^2 for RFM) and velocities are compared in the tangent
-		# space at x_t, as written in the paper (Eq. 1 / Eq. 15). v1 ("dtd") uses the legacy
-		# Gaussian interpolant sqrt(gamma) x0 + sqrt(1-gamma) n, which leaves the sphere.
-		kwargs["dot_product_loss"] = "cosine_similarity_negative"
-		kwargs["forward_process"] = "model"
+	if normalized_type == "diffusion_l2":
+		kwargs["dot_product_loss"] = "l2"
 		return _run_diffusion_attack(
 			source_image=source_image,
 			pipeline=pipeline,
-			attack_type_label="dtd_v2",
+			attack_type_label="diffusion_l2",
 			**kwargs
 		)
-	if normalized_type == "dtd_v3":
-		# GeoFA-TD v3 = v2 (geodesic x_t, tangent cosine) with x_t noised from the image's TRUE
-		# location instead of samples of the clean model (paper Eq. 1: x_t = exp_{x0}(k(t) log_{x0} eps)
-		# with x0 the true location). The reference is still the clean predicted velocity psi(x_t|c).
-		kwargs["dot_product_loss"] = "cosine_similarity_negative"
-		kwargs["forward_process"] = "model"
-		kwargs["x0_source"] = "true"
-		return _run_diffusion_attack(
+	if normalized_type == "targeted_l2":
+		return _run_targeted_l2_attack(
 			source_image=source_image,
 			pipeline=pipeline,
-			attack_type_label="dtd_v3",
-			**kwargs
-		)
-	if normalized_type == "dtd_v3_old_forward":
-		# Ablation isolating the x0 change: GeoFA-TD v1 (legacy Gaussian interpolant
-		# sqrt(gamma) x0 + sqrt(1-gamma) n, Euclidean cosine) with x0 = the TRUE location.
-		# v3 - v3_old_forward = effect of the geodesic path; v3_old_forward - v1 = effect of x0.
-		kwargs["dot_product_loss"] = "cosine_similarity_negative"
-		kwargs["forward_process"] = "gaussian"
-		kwargs["x0_source"] = "true"
-		return _run_diffusion_attack(
-			source_image=source_image,
-			pipeline=pipeline,
-			attack_type_label="dtd_v3_old_forward",
-			**kwargs
-		)
-	if normalized_type == "training_loss_v3":
-		# GeoFA-AdvDM v3: the RFM training loss with x_t and the target velocity v(x_t) built from
-		# the image's TRUE location (paper Eq. 9), not from clean-model samples.
-		kwargs["x0_source"] = "true"
-		return _run_training_loss_attack(
-			source_image=source_image,
-			pipeline=pipeline,
-			attack_type_label="training_loss_v3",
-			**kwargs
-		)
-	if normalized_type == "dtd_blur":
-		# Blur-robust DTD: cosine-neg trajectory deviation trained with an
-		# expectation-over-Gaussian-blur objective (half clean, half blurred).
-		kwargs.setdefault("dot_product_loss", "cosine_similarity_negative")
-		return _run_dtd_blur_attack(
-			source_image=source_image,
-			pipeline=pipeline,
-			**kwargs
-		)
-	if normalized_type == "dtd_blur_v3_old_forward":
-		# GeoFA-TD-blur on top of dtd_v3_old_forward: the same blur-EOT objective, but with
-		# the legacy Gaussian interpolant and x0 = the image's TRUE location (Eq. 1 x0), so it
-		# differs from dtd_v3_old_forward by the blur term only.
-		kwargs.setdefault("dot_product_loss", "cosine_similarity_negative")
-		kwargs["forward_process"] = "gaussian"
-		kwargs["x0_source"] = "true"
-		return _run_dtd_blur_attack(
-			source_image=source_image,
-			pipeline=pipeline,
-			attack_type_label="dtd_blur_v3_old_forward",
 			**kwargs
 		)
 	if normalized_type == "sampling":
@@ -394,8 +259,21 @@ def run_attack(
 			pipeline=pipeline,
 			**kwargs
 		)
-	if normalized_type == "truncated_sampling":
-		return _run_truncated_sampling_attack(
+	if normalized_type == "training_loss":
+		return _run_training_loss_attack(
+			source_image=source_image,
+			pipeline=pipeline,
+			**kwargs
+		)
+	if normalized_type == "unidef":
+		return _run_unidef_attack(
+			source_image=source_image,
+			pipeline=pipeline,
+			**kwargs
+		)
+	if normalized_type == "dtd_blur":
+		kwargs.setdefault("dot_product_loss", "cosine_similarity_negative")
+		return _run_dtd_blur_attack(
 			source_image=source_image,
 			pipeline=pipeline,
 			**kwargs
@@ -407,38 +285,17 @@ def run_attack(
 			pipeline=pipeline,
 			**kwargs
 		)
-	if normalized_type == "unidef":
-		return _run_unidef_attack(
+	if normalized_type == "diffusion":
+		# Historical baseline (absolute-dot deviation on the model's own forward process, clean-model x0).
+		kwargs.setdefault("forward_process", "model")
+		kwargs.setdefault("x0_source", "clean_model")
+		return _run_diffusion_attack(
 			source_image=source_image,
 			pipeline=pipeline,
 			**kwargs
 		)
-	if normalized_type == "unidef_v3":
-		# GeoFA-UniDef with x_t and the target velocity built from the TRUE location (as
-		# training_loss_v3), so it differs from GeoFA-AdvDM by the gradient estimator only.
-		kwargs["x0_source"] = "true"
-		return _run_unidef_attack(
-			source_image=source_image,
-			pipeline=pipeline,
-			attack_type_label="unidef_v3",
-			**kwargs
-		)
-	if normalized_type == "unidef_nofdje":
-		kwargs["use_fdje"] = False
-		return _run_unidef_attack(
-			source_image=source_image,
-			pipeline=pipeline,
-			attack_type_label="unidef_nofdje",
-			**kwargs
-		)
-	if normalized_type == "training_loss":
-		return _run_training_loss_attack(
-			source_image=source_image,
-			pipeline=pipeline,
-			**kwargs
-		)
-	if normalized_type == "targeted_l2":
-		return _run_targeted_l2_attack(
+	if normalized_type == "truncated_sampling":
+		return _run_truncated_sampling_attack(
 			source_image=source_image,
 			pipeline=pipeline,
 			**kwargs
@@ -475,8 +332,9 @@ def _run_encoder_attack(
 	early_stopping_patience: int = 0,  # 0=disabled, >0=stop if no improvement for N steps
 	num_restart_workers: int = 1,  # Number of parallel workers for restarts; 1=sequential
 	attack_type_label: str = "encoder",
-	update_rule: str = "adam",  # "adam" (v1) or "sign_sgd" (the shared PGD loop, v3)
-	delta_init: Optional[float] = None,  # None => uniform over the whole budget (v1)
+	update_rule: str = "sign_sgd",  # standard: the shared sign-SGD PGD loop ("adam" = the original Adam version)
+	delta_init: Optional[float] = 1e-4,  # standard: tiny init (None => uniform over the whole budget, the Adam version)
+	true_gps: Optional[Any] = None,  # (lat, lon) of the image, for the FSD-based restart selection
 	**kwargs,  # Absorb unused kwargs
 ) -> Dict[str, Any]:
 	"""Run encoder-space attack with optional optimizations."""
@@ -514,6 +372,7 @@ def _run_encoder_attack(
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
 		main_num_restarts=main_num_restarts,
+		true_gps=true_gps,
 		finalize_kwargs={
 			"attack_mode": attack.attack_mode,
 			"z_source": attack.z_source,
@@ -548,8 +407,8 @@ def _run_diffusion_attack(
 	early_stopping_patience: int = 0,  # 0=disabled, >0=stop if no improvement for N steps
 	num_restart_workers: int = 1,  # Number of parallel workers for restarts; 1=sequential
 	attack_type_label: str = "diffusion",  # Label stored in result dict
-	forward_process: str = "model",  # "model": the attacked model's own forward process (geodesic for RFM, DDPM / linear for diffusion / flow); "gaussian": legacy v1
-	x0_source: str = "clean_model",  # "clean_model" (legacy bank) or "true" (the image's true location)
+	forward_process: str = "gaussian",  # standard: Gaussian interpolant sqrt(g) x0 + sqrt(1-g) n ("model": the attacked model's own process -- geodesic + tangent metric for RFM)
+	x0_source: str = "true",  # standard: the image's true location ("clean_model": a bank of clean-model samples)
 	true_gps: Optional[Any] = None,  # (lat, lon) in degrees; required for x0_source="true"
 	**kwargs,  # Absorb unused kwargs
 ) -> Dict[str, Any]:
@@ -601,6 +460,7 @@ def _run_diffusion_attack(
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
 		main_num_restarts=main_num_restarts,
+		true_gps=true_gps,
 	)
 
 
@@ -632,8 +492,8 @@ def _run_dtd_blur_attack(
 	early_stopping_patience: int = 0,
 	num_restart_workers: int = 1,
 	attack_type_label: str = "dtd_blur",  # Label stored in result dict
-	forward_process: str = "model",  # see DiffusionAttack ("model" or legacy "gaussian")
-	x0_source: str = "clean_model",  # "clean_model" (legacy bank) or "true" (the image's true location)
+	forward_process: str = "gaussian",  # as dtd (see _run_diffusion_attack)
+	x0_source: str = "true",  # as dtd
 	true_gps: Optional[Any] = None,  # (lat, lon) in degrees; required for x0_source="true"
 	**kwargs,  # Absorb unused kwargs
 ) -> Dict[str, Any]:
@@ -686,6 +546,7 @@ def _run_dtd_blur_attack(
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
 		main_num_restarts=main_num_restarts,
+		true_gps=true_gps,
 	)
 
 
@@ -716,6 +577,7 @@ def _run_ace_attack(
 	early_stopping_patience: int = 0,  # 0=disabled, >0=stop if no improvement for N steps
 	num_restart_workers: int = 1,  # Number of parallel workers for restarts; 1=sequential
 	diagnose_grad_balance: bool = True,  # Print per-term grad norms once to check alpha
+	true_gps: Optional[Any] = None,  # (lat, lon) of the image, for the FSD-based restart selection
 	**kwargs,  # Absorb unused kwargs
 ) -> Dict[str, Any]:
 	"""Run the ACE attack: pull the score and encoding towards a target image.
@@ -774,6 +636,7 @@ def _run_ace_attack(
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
 		main_num_restarts=main_num_restarts,
+		true_gps=true_gps,
 		finalize_kwargs={"attack_mode": "targeted"},
 	)
 
@@ -806,7 +669,7 @@ def _run_unidef_attack(
 	early_stopping_patience: int = 0,  # 0=disabled, >0=stop if no improvement for N steps
 	num_restart_workers: int = 1,  # Number of parallel workers for restarts; 1=sequential
 	attack_type_label: str = "unidef",  # Label stored in result dict
-	x0_source: str = "clean_model",  # "clean_model" (legacy bank) or "true" (the image's true location)
+	x0_source: str = "true",  # standard: the image's true location ("clean_model": a bank of clean-model samples)
 	true_gps: Optional[Any] = None,  # (lat, lon) in degrees; required for x0_source="true"
 	**kwargs,  # Absorb unused kwargs
 ) -> Dict[str, Any]:
@@ -858,6 +721,7 @@ def _run_unidef_attack(
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
 		main_num_restarts=main_num_restarts,
+		true_gps=true_gps,
 	)
 
 
@@ -885,7 +749,7 @@ def _run_training_loss_attack(
 	early_stopping_patience: int = 0,
 	num_restart_workers: int = 1,
 	attack_type_label: str = "training_loss",
-	x0_source: str = "clean_model",  # "clean_model" (legacy bank) or "true" (the image's true location)
+	x0_source: str = "true",  # standard: the image's true location ("clean_model": a bank of clean-model samples)
 	true_gps: Optional[Any] = None,
 	**kwargs,
 ) -> Dict[str, Any]:
@@ -933,6 +797,7 @@ def _run_training_loss_attack(
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
 		main_num_restarts=main_num_restarts,
+		true_gps=true_gps,
 	)
 
 
@@ -1008,6 +873,7 @@ def _run_targeted_l2_attack(
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
 		main_num_restarts=main_num_restarts,
+		true_gps=true_gps,
 		finalize_kwargs={"attack_mode": "targeted"},
 	)
 
@@ -1085,6 +951,7 @@ def _run_cosine_targeted_attack(
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
 		main_num_restarts=main_num_restarts,
+		true_gps=true_gps,
 		finalize_kwargs={"attack_mode": "targeted"},
 	)
 
@@ -1116,9 +983,9 @@ def _run_diffusion_salman_attack(
 	early_stopping_patience: int = 0,
 	num_restart_workers: int = 1,
 	attack_type_label: str = "sampling",
-	reference: str = "clean_prediction",  # "clean_prediction" (v1) or "true_location" (paper Eq. 8, v2)
+	reference: str = "true_location",  # standard: deviate from the TRUE location (paper Eq. 8); "clean_prediction": from the clean model's prediction
 	true_gps: Optional[Any] = None,
-	sampling_cfg: float = 0.0,  # guidance inside the attacked 16-step sampler (0 = v1; cluster_full uses 10)
+	sampling_cfg: float = 10.0,  # standard: guidance inside the attacked 16-step sampler = the evaluation guidance (0 = no guidance)
 	**kwargs,
 ) -> Dict[str, Any]:
 	"""Run the Salman diffusion attack through the full sampling trajectory."""
@@ -1157,6 +1024,7 @@ def _run_diffusion_salman_attack(
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
 		main_num_restarts=main_num_restarts,
+		true_gps=true_gps,
 	)
 
 
@@ -1187,6 +1055,7 @@ def _run_truncated_sampling_attack(
 	device: str = "cuda",
 	early_stopping_patience: int = 0,
 	num_restart_workers: int = 1,
+	true_gps: Optional[Any] = None,  # (lat, lon) of the image, for the FSD-based restart selection
 	**kwargs,
 ) -> Dict[str, Any]:
 	"""Run the sampling attack with truncated backprop through the tail of a long trajectory.
@@ -1228,5 +1097,6 @@ def _run_truncated_sampling_attack(
 		restart_eval_seed=restart_eval_seed,
 		num_restart_workers=num_restart_workers,
 		main_num_restarts=main_num_restarts,
+		true_gps=true_gps,
 	)
 

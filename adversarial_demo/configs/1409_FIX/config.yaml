@@ -1,4 +1,12 @@
 # 1409_FIX experiment: pixel-space fix, single run (no restarts).
+# HISTORICAL. The versioned attack keys below (dtd_v2, dtd_v3, dtd_v3_old_forward, encoder_v3,
+# training_loss_v3, sampling_v2, l2_v2/l2_v3, l2_target) refer to the code as of commit 9ab4497;
+# the variants chosen for the paper were since made the standard behaviour of the plain keys
+# (dtd = former dtd_v3_old_forward, diffusion_l2 = former diffusion_l2_v3_old_forward, encoder =
+# encoder_v3, training_loss = training_loss_v3, sampling = sampling_v2 at w=10, unidef = unidef_v3,
+# targeted_l2 = l2_target) and the other variants are reachable through explicit options only
+# (forward_process / x0_source / update_rule / reference / sampling_cfg). The saved results and
+# reports under results/1409_FIX keep the old names.
 # Derived from ../../config.yaml; the ONLY intentional differences are num_restarts 1 /
 # max_restarts 1, attack_types, results/plots dirs, and all opt-in ablations off.
 

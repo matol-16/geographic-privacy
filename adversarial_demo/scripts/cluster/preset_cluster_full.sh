@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 #
 # THE full run: every attack of the paper, every ablation, 3 budgets, 4000 images, on one
-# dataset per invocation (submit both):
+# dataset per invocation (submit both). Equivalent to `DATASET=<ds> ./submit.sh` -- the full
+# experiment is config.sh's default configuration.
 #
 #   ./preset_cluster_full.sh yfcc --dry-run     # print the job plan, submit nothing
 #   ./preset_cluster_full.sh yfcc               # 9 attacks x 40 windows = 360 GPU jobs + merge
 #   ./preset_cluster_full.sh osv                # same on OSV-5M
 #
 # What one shard job computes (100 images x 3 budgets of ONE attack):
-#   * the attack itself: configs/cluster_full/config.yaml pins every attack to its latest
-#     implementation under its canonical key (GeoFA-TD = dtd_v3_old_forward, see the config
-#     header); NUM_RESTARTS (default 5, the paper protocol) restarts per image, FSD-best kept;
+#   * the attack itself (standard specification of each key, see the config header and
+#     configs/cluster_full/ATTACK_SPECS.md); NUM_RESTARTS (default 5, the paper protocol)
+#     restarts per image, the one with the highest FSD to the true location kept;
 #   * eval-time ablations on the kept perturbation: sampling steps [8 16 32 64 250],
 #     guidance scale [1 2 5 10], JPEG q [20 40 60 80 100] + Gaussian blur sigma [0 2 4 6 8 10],
 #     transfer to the diffusion / Euclidean-flow variants (same encoder);
@@ -41,40 +42,9 @@ DS="${1:?usage: preset_cluster_full.sh <yfcc|osv> [--dry-run]}"; shift || true
 case "${DS}" in yfcc|osv) ;; *) echo "dataset must be yfcc or osv, got '${DS}'" >&2; exit 1 ;; esac
 
 export CLUSTER_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "${CLUSTER_DIR}/../.." && pwd)"
 
-export CONFIG_PATH="${CONFIG_PATH:-${PROJECT_DIR}/configs/cluster_full/config.yaml}"
+# The full experiment IS config.sh's default; this preset only fixes the dataset (and lets
+# the usual env knobs through: NUM_RESTARTS, ABLATION_WINDOWS, DATA_ROOT, RESULTS_BASE, ...).
 export DATASET="${DS}"
-export TOTAL_IMAGES="${TOTAL_IMAGES:-4000}"
-export IMAGES_PER_SHARD="${IMAGES_PER_SHARD:-100}"
-export PARALLEL_WORKERS="${PARALLEL_WORKERS:-1}"
-
-# The 9 attacks (canonical keys; the config pins the implementation of each).
-export ATTACK_TYPES_STR="${ATTACKS:-dtd diffusion_l2 targeted_l2 sampling encoder training_loss unidef dtd_blur geoshield}"
-export MERGE_ATTACK_TYPES_STR="${ATTACK_TYPES_STR}"          # fresh run: merge exactly what we compute
-export ATTACK_BUDGETS_STR="${BUDGETS:-0.0039 0.0157 0.0314}"  # 1/255, 4/255, 8/255
-
-# Every ablation on, for every attack.
-export RUN_SAMPLING_STEPS_ABLATION=1
-export RUN_ROBUSTNESS_ABLATION=1
-export RUN_MODEL_TRANSFER_ABLATION=1
-export RUN_CFG_ABLATION=1
-export EVAL_NUM_STEPS_STR="${EVAL_NUM_STEPS:-8 16 32 64 250}"
-export EVAL_CFGS_STR="${EVAL_CFGS:-1 2 5 10}"
-export ROBUSTNESS_ATTACK_TYPES_STR="${ATTACK_TYPES_STR}"      # robustness scoped to ALL attacks of the run
-export ABLATION_WINDOWS="${ABLATION_WINDOWS:-}"
-
-# Restarts: paper protocol (5, FSD-best kept, no extra ablation-only restarts).
-export NUM_RESTARTS="${NUM_RESTARTS:-5}"
-export SAVE_DELTAS="${SAVE_DELTAS:-0}"
-
-# Machine paths.
-export DATA_ROOT="${DATA_ROOT:-${PROJECT_DIR}/DATA}"
-export RESULTS_BASE="${RESULTS_BASE:-${PROJECT_DIR}/results/cluster_full/${DS}_full}"
-export PLOTS_DIR="${PLOTS_DIR:-${RESULTS_BASE}/plots}"
-export GEOSHIELD_IO_DIR="${GEOSHIELD_IO_DIR:-${RESULTS_BASE}/geoshield_io}"
-
-echo "cluster_full preset: dataset=${DS} restarts=${NUM_RESTARTS} ablation_windows=${ABLATION_WINDOWS:-all}"
-echo "  config=${CONFIG_PATH}"
-echo "  data_root=${DATA_ROOT}"
+echo "cluster_full: dataset=${DS} restarts=${NUM_RESTARTS:-5} ablation_windows=${ABLATION_WINDOWS:-all}"
 exec "${CLUSTER_DIR}/submit.sh" "$@"

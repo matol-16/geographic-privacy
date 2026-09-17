@@ -6,19 +6,18 @@
 # config.sh overrides them from the environment on every shard / merge command
 # (DATA_ROOT, RESULTS_BASE), so this file never needs editing per cluster.
 #
-# ATTACK VERSION PINS (attack_train_args.<ds>.per_attack.<key>.attack_variant): every attack
-# runs under its canonical key (result files, plots and tables keep the paper names) but
-# with the LATEST implementation; GeoFA-TD is pinned to v3 (old forward process), i.e. the
-# legacy Gaussian interpolant with x_t noised from the TRUE location.
-#   dtd           -> dtd_v3_old_forward        GeoFA-TD          (cosine, Gaussian x_t, true x0)
-#   diffusion_l2  -> diffusion_l2_v3_old_forward GeoFA-L2        (Euclidean L2, Gaussian x_t, true x0: TD's forward process)
-#   targeted_l2   (single version)             GeoFA-DPA / L2-targeted (denoising loss -> antipode)
-#   sampling      -> sampling_v2 + sampling_cfg 10  GeoFA-Sampling (haversine to the true location through the 16-step sampler at w=10)
-#   encoder       -> encoder_v3                GeoFA-enc.        (sign-SGD PGD on ||E(c+d)-E(c)||^2)
-#   training_loss -> training_loss_v3          GeoFA-AdvDM       (RFM training loss, true x0)
-#   unidef        -> unidef_v3                 GeoFA-UniDef      (finite-difference Jacobian, true x0)
-#   dtd_blur      -> dtd_blur_v3_old_forward   GeoFA-TD-blur     (dtd pin + blur-EOT term)
-#   geoshield     (external)                   GeoShield         (PNG, model-exact 336 px clean copies)
+# ATTACKS (standard specifications, see attacks/attacks.py::run_attack and ATTACK_SPECS.md):
+#   dtd            GeoFA-TD        cosine deviation from the clean velocity; Gaussian x_t from the TRUE location
+#   diffusion_l2   GeoFA-L2        same x_t, Euclidean L2 (metric-only difference to dtd)
+#   targeted_l2    GeoFA-DPA       RFM training loss minimised towards the antipode of the true location
+#   sampling       GeoFA-Sampling  haversine to the true location through the 16-step sampler at w = 10
+#   encoder        GeoFA-enc.      ||E(c+d) - E(c)||^2, sign-SGD PGD
+#   training_loss  GeoFA-AdvDM     RFM training loss maximised, x_t / target from the true location
+#   unidef         GeoFA-UniDef    training_loss with the finite-difference (FDJE) gradient estimator
+#   dtd_blur       GeoFA-TD-blur   dtd + the same loss on a Gaussian-blurred copy (blur EOT)
+#   geoshield      GeoShield       external (PNG, model-exact 336 px clean copies)
+# Restarts are selected by the FSD (distance of the attacked prediction to the TRUE location),
+# the paper's defender-side verification protocol.
 
 device: "cuda"
 seed: 42
@@ -67,30 +66,19 @@ attack_train_args:
     target_pure_noise: false
     dot_product_loss: "cosine_similarity_negative"
     reconstruction_loss_weight: 0.0
-    # Paper protocol: 5 random initialisations per image, keep the FSD-best (defender-side
-    # verification). config.sh's NUM_RESTARTS overrides this AND max_restarts together.
+    # Paper protocol: 5 random initialisations per image, keep the one with the highest FSD
+    # (distance to the TRUE location; defender-side verification). config.sh's NUM_RESTARTS
+    # overrides num_restarts AND max_restarts together.
     num_restarts: 5
-    restart_selection_metric: "final_step_displacement"
+    restart_selection_metric: "final_step_displacement_true"
     restart_eval_cfg: 10.0
     restart_eval_batch_size: 128
     restart_eval_seed: seed
     restart_eval_num_steps: 250
     per_attack:
-      dtd:
-        attack_variant: dtd_v3_old_forward
-      diffusion_l2:
-        attack_variant: diffusion_l2_v3_old_forward
-      sampling:
-        attack_variant: sampling_v2
-        sampling_cfg: 10.0   # guidance inside the attacked 16-step sampler = evaluation guidance
-      encoder:
-        attack_variant: encoder_v3
-      training_loss:
-        attack_variant: training_loss_v3
-      unidef:
-        attack_variant: unidef_v3
+      # dtd_blur: each step the dtd loss is also evaluated on a Gaussian-blurred copy
+      # (sigma ~ U[blur_sigma_min, blur_sigma_max]), mixed with blur_loss_weight (0.5 = half/half).
       dtd_blur:
-        attack_variant: dtd_blur_v3_old_forward
         blur_sigma_min: 0.0
         blur_sigma_max: 4.0
         blur_loss_weight: 0.5
@@ -109,30 +97,19 @@ attack_train_args:
     target_pure_noise: false
     dot_product_loss: "cosine_similarity_negative"
     reconstruction_loss_weight: 0.0
-    # Paper protocol: 5 random initialisations per image, keep the FSD-best (defender-side
-    # verification). config.sh's NUM_RESTARTS overrides this AND max_restarts together.
+    # Paper protocol: 5 random initialisations per image, keep the one with the highest FSD
+    # (distance to the TRUE location; defender-side verification). config.sh's NUM_RESTARTS
+    # overrides num_restarts AND max_restarts together.
     num_restarts: 5
-    restart_selection_metric: "final_step_displacement"
+    restart_selection_metric: "final_step_displacement_true"
     restart_eval_cfg: 10.0
     restart_eval_batch_size: 128
     restart_eval_seed: seed
     restart_eval_num_steps: 250
     per_attack:
-      dtd:
-        attack_variant: dtd_v3_old_forward
-      diffusion_l2:
-        attack_variant: diffusion_l2_v3_old_forward
-      sampling:
-        attack_variant: sampling_v2
-        sampling_cfg: 10.0   # guidance inside the attacked 16-step sampler = evaluation guidance
-      encoder:
-        attack_variant: encoder_v3
-      training_loss:
-        attack_variant: training_loss_v3
-      unidef:
-        attack_variant: unidef_v3
+      # dtd_blur: each step the dtd loss is also evaluated on a Gaussian-blurred copy
+      # (sigma ~ U[blur_sigma_min, blur_sigma_max]), mixed with blur_loss_weight (0.5 = half/half).
       dtd_blur:
-        attack_variant: dtd_blur_v3_old_forward
         blur_sigma_min: 0.0
         blur_sigma_max: 4.0
         blur_loss_weight: 0.5

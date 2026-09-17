@@ -194,9 +194,9 @@ class DiffusionAttack(AttackBase):
         #               before the alignment loss (<.,.>_{x_t}); diffusion: the DDPM interpolant
         #               sqrt(gamma) x0 + sqrt(1-gamma) n; Euclidean flow: the linear interpolant.
         #               ("manifold" is accepted as the former name of this option.)
-        #   "gaussian": legacy v1 behaviour -- the DDPM interpolant regardless of the model, i.e.
-        #               off the sphere with a Euclidean cosine for the RFM model. Kept only so the
-        #               v1 baselines (dtd, diffusion_l2, dtd_v3_old_forward) stay reproducible.
+        #   "gaussian": the DDPM interpolant sqrt(gamma) x0 + sqrt(1-gamma) n regardless of the
+        #               model, i.e. off the sphere with a Euclidean metric for the RFM model. This is
+        #               the STANDARD setting of GeoFA-TD / GeoFA-L2 (see attacks.run_attack).
         if forward_process == "manifold":
             forward_process = "model"
         if forward_process not in ("gaussian", "model"):
