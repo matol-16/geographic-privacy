@@ -7,7 +7,7 @@
 # an environment override, which is how the preset_*.sh launchers drive it).
 #
 # THE DEFAULTS BELOW ARE THE FULL EXPERIMENT (configs/cluster_full/config.yaml): the 9
-# attacks of the paper, budgets 1/255 4/255 8/255, 4000 images, 5 restarts selected by the
+# attacks of the paper + the guided-sampler variant sampling_cfg10, budgets 1/255 4/255 8/255, 4000 images, 5 restarts selected by the
 # FSD to the true location, and every ablation (sampling steps, guidance scale, JPEG / blur
 # robustness, cross-model transfer) for every attack. `DATASET=yfcc ./submit.sh` and
 # `DATASET=osv ./submit.sh` (or preset_cluster_full.sh <ds>) launch it; nothing to edit
@@ -36,10 +36,10 @@ TOTAL_IMAGES="${TOTAL_IMAGES:-4000}"             # full seeded pool to evaluate
 IMAGES_PER_SHARD="${IMAGES_PER_SHARD:-100}"      # images per cluster job (window size)
 PARALLEL_WORKERS="${PARALLEL_WORKERS:-1}"        # per-GPU concurrency (1 = strict reproducibility)
 
-# Attacks COMPUTED by the shard array (one job per attack x window): the 9 attacks of the
-# paper (see configs/cluster_full/ATTACK_SPECS.md). GeoShield is out-of-process but sharded
+# Attacks COMPUTED by the shard array (one job per attack x window): the attacks of the
+# paper (+ sampling_cfg10, the sampling attack trained through the guided sampler) (see configs/cluster_full/ATTACK_SPECS.md). GeoShield is out-of-process but sharded
 # like the rest; drop it if the Geoshield repo isn't set up.
-read -r -a ATTACK_TYPES <<< "${ATTACK_TYPES_STR:-dtd diffusion_l2 targeted_l2 sampling encoder training_loss unidef dtd_blur geoshield}"
+read -r -a ATTACK_TYPES <<< "${ATTACK_TYPES_STR:-dtd diffusion_l2 targeted_l2 sampling sampling_cfg10 encoder training_loss unidef dtd_blur geoshield}"
 
 # Attacks STITCHED by the merge job. Defaults to the computed set. Set it to a SUPERSET
 # (the attacks already sharded into RESULTS_BASE plus a newly computed one) to fold a

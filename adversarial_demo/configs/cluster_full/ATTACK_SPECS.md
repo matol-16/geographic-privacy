@@ -40,7 +40,10 @@ process), Eq. 5 (end objective), Eqs. 7–12 and 15 (surrogates), Sec. 6.1 (prot
 
 ### `sampling` — GeoFA-Sampling (Eq. 8)
 - Objective (maximised): E_{x_N} haversine( x̂₀^{c+δ}(x_N), x₀_true ), backpropagated through the **full 16-step** projected-Euler RFM sampler; a fresh batch of 256 x_N ~ N(0, I₃) per PGD step.
-- The attacked 16-step sampler runs **with guidance w = 10** (`sampling_cfg` default 10 = the evaluation guidance; the sampler doubles the batch with a zero embedding for the unconditional branch, gradients flow through the conditional one). ✔ Eq. 8 / App. C.2 ("16 timesteps"). (The 100-image study ran it at w = 0, option `sampling_cfg: 0`.)
+- The attacked 16-step sampler runs **without guidance (w = 0)**, as in the 100-image study; evaluation is at w = 10. ✔ Eq. 8 / App. C.2 ("16 timesteps").
+
+### `sampling_cfg10` — GeoFA-Sampling trained through the guided sampler
+- Identical to `sampling` except that the back-propagated 16-step sampler runs at the evaluation guidance w = 10 (`sampling_cfg: 10`; batch doubled with a zero embedding for the unconditional branch). Added to test whether matching the evaluation guidance helps; the 1/255 pilot says it hurts (≈ 7 500 vs ≈ 15 000 km mean FSD).
 
 ### `encoder` — GeoFA-Encoder (Eq. 7)
 - Objective (maximised): ‖E(c+δ) − E(c)‖²₂, E = the CLS embedding actually fed to the velocity network (DINOv2 / StreetCLIP), encoder in eval mode.
@@ -70,6 +73,6 @@ process), Eq. 5 (end objective), Eqs. 7–12 and 15 (surrogates), Sec. 6.1 (prot
 | D1 | restart selection | **resolved**: `restart_selection_metric: final_step_displacement_true` — the restart with the highest FSD to the true location is kept |
 | D2 | GeoFA-TD and GeoFA-L² use the Gaussian interpolant √γ x₀ + √(1−γ) n (x₀ = true location) and Euclidean metrics; Eq. 1/12/15 describe the geodesic + tangent version | **decided: keep** — rewrite the attack-side forward process in the paper (Eq. 1 is the *model's* process; the attacks noise the true location with the Gaussian interpolant) |
 | D3 | UniDef x₀ source | **resolved**: true x₀ |
-| D4 | sampling attack guidance | **resolved**: trained through the sampler at w = 10 |
+| D4 | sampling attack guidance | both variants are evaluated: `sampling` (w = 0, the paper's attack) and `sampling_cfg10` |
 | D5 | GeoShield without VLM description / detector regions | known; state it in the GeoShield paragraph |
 | – | 1/255 budget and the JPEG q=100 level are new w.r.t. the paper's grids | update Sec. 6.1 / Fig. 5 |

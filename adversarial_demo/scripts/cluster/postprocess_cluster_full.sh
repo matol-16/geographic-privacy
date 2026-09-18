@@ -31,7 +31,7 @@ export CLEAN="${CLEAN:-0}"
 export MPLBACKEND=Agg
 
 # Attack keys of this run (canonical; the config pinned each to its latest implementation).
-export ALL_ATTACKS="${ALL_ATTACKS:-geoshield unidef training_loss encoder sampling diffusion_l2 targeted_l2 dtd_blur dtd}"
+export ALL_ATTACKS="${ALL_ATTACKS:-geoshield unidef training_loss encoder sampling sampling_cfg10 diffusion_l2 targeted_l2 dtd_blur dtd}"
 export MAIN_HEATMAP_ATTACKS="${MAIN_HEATMAP_ATTACKS:-geoshield encoder training_loss targeted_l2 dtd}"
 export LOCALIZABILITY_ATTACKS="${LOCALIZABILITY_ATTACKS:-geoshield training_loss sampling diffusion_l2 dtd}"
 export DPA_PILOT_DIR=""   # targeted_l2 is part of this run; never fall back to the pilot

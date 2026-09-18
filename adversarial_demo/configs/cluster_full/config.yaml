@@ -10,7 +10,8 @@
 #   dtd            GeoFA-TD        cosine deviation from the clean velocity; Gaussian x_t from the TRUE location
 #   diffusion_l2   GeoFA-L2        same x_t, Euclidean L2 (metric-only difference to dtd)
 #   targeted_l2    GeoFA-DPA       RFM training loss minimised towards the antipode of the true location
-#   sampling       GeoFA-Sampling  haversine to the true location through the 16-step sampler at w = 10
+#   sampling       GeoFA-Sampling  haversine to the true location through the 16-step sampler (w = 0)
+#   sampling_cfg10 GeoFA-Sampling  same, trained through the sampler at the evaluation guidance w = 10
 #   encoder        GeoFA-enc.      ||E(c+d) - E(c)||^2, sign-SGD PGD
 #   training_loss  GeoFA-AdvDM     RFM training loss maximised, x_t / target from the true location
 #   unidef         GeoFA-UniDef    training_loss with the finite-difference (FDJE) gradient estimator
@@ -120,9 +121,9 @@ attack_train_args:
 
 save_deltas: false  # config.sh SAVE_DELTAS=1 turns it on (~1.4 MB per (attack, budget, image))
 
-# The 9 attacks of the run (canonical keys; see the pins above). GeoShield is sharded on
+# The 10 attacks of the run (canonical keys; see the pins above). GeoShield is sharded on
 # its own (one attack per shard) like the others.
-attack_types: ["dtd", "diffusion_l2", "targeted_l2", "sampling", "encoder", "training_loss", "unidef", "dtd_blur", "geoshield"]
+attack_types: ["dtd", "diffusion_l2", "targeted_l2", "sampling", "sampling_cfg10", "encoder", "training_loss", "unidef", "dtd_blur", "geoshield"]
 
 # Ablation grids. max_restarts == num_restarts: no extra restarts beyond the reported best.
 max_restarts: 5
@@ -132,7 +133,7 @@ cfg_num_steps: null
 
 # Robustness (JPEG / Gaussian blur of the protected image) for EVERY attack of the run.
 robustness:
-  attack_types: ["dtd", "diffusion_l2", "targeted_l2", "sampling", "encoder", "training_loss", "unidef", "dtd_blur", "geoshield"]
+  attack_types: ["dtd", "diffusion_l2", "targeted_l2", "sampling", "sampling_cfg10", "encoder", "training_loss", "unidef", "dtd_blur", "geoshield"]
   jpeg_quality_factors: [20, 40, 60, 80, 100]
   gaussian_blur_sigmas: [0, 2, 4, 6, 8, 10]
   num_steps: null

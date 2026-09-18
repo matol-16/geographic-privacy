@@ -5,7 +5,7 @@
 # experiment is config.sh's default configuration.
 #
 #   ./preset_cluster_full.sh yfcc --dry-run     # print the job plan, submit nothing
-#   ./preset_cluster_full.sh yfcc               # 9 attacks x 40 windows = 360 GPU jobs + merge
+#   ./preset_cluster_full.sh yfcc               # 10 attacks x 40 windows = 400 GPU jobs + merge
 #   ./preset_cluster_full.sh osv                # same on OSV-5M
 #
 # What one shard job computes (100 images x 3 budgets of ONE attack):

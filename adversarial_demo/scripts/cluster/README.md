@@ -15,7 +15,7 @@ budgets is thousands of GPU-hours, so we split it into independent jobs.
 #    DATA_ROOT), the plonk conda env, and the Geoshield repo next to this repo's root.
 # 1. optional but recommended: local smoke test of the exact shard command + merge + figures
 scripts/cluster/smoke_test_cluster_full.sh yfcc && scripts/cluster/smoke_test_cluster_full.sh osv
-# 2. preview, then submit both datasets (each: 9 attacks x 40 windows = 360 GPU jobs + merge)
+# 2. preview, then submit both datasets (each: 10 attacks x 40 windows = 400 GPU jobs + merge)
 ./preset_cluster_full.sh yfcc --dry-run
 ./preset_cluster_full.sh yfcc          # == DATASET=yfcc ./submit.sh
 ./preset_cluster_full.sh osv           # == DATASET=osv  ./submit.sh
@@ -26,7 +26,7 @@ scripts/cluster/smoke_test_cluster_full.sh yfcc && scripts/cluster/smoke_test_cl
 | | |
 |---|---|
 | config | `configs/cluster_full/config.yaml` (machine paths injected by `config.sh`: `DATA_ROOT`, `RESULTS_BASE`, `GEOSHIELD_IO_DIR`) |
-| attacks | `dtd` (GeoFA-TD), `diffusion_l2` (GeoFA-L²), `targeted_l2` (GeoFA-DPA / L²-targeted), `sampling`, `encoder`, `training_loss` (AdvDM), `unidef`, `dtd_blur` (GeoFA-TD-blur), `geoshield` |
+| attacks | `dtd` (GeoFA-TD), `diffusion_l2` (GeoFA-L²), `targeted_l2` (GeoFA-DPA / L²-targeted), `sampling` (w=0) and `sampling_cfg10` (trained through the guided sampler), `encoder`, `training_loss` (AdvDM), `unidef`, `dtd_blur` (GeoFA-TD-blur), `geoshield` |
 | specification | one fixed mechanism per key (`attacks/attacks.py::run_attack`, `configs/cluster_full/ATTACK_SPECS.md`); what ran is recorded per key in `attack_args` (`attack_impl`) |
 | budgets | 1/255, 4/255, 8/255 |
 | images | 4000 per dataset, 100 per shard (seeded, prefix-stable ordering) |

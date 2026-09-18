@@ -59,8 +59,9 @@ class SamplingAttack(AttackBase):
         self.dot_product_loss = dot_product_loss
         # CFG is intentionally 0 during training: using CFG would double the batch inside the
         # DDIM loop and make backprop through the full trajectory prohibitively expensive.
-        # Guidance used inside the attacked sampler (v1: 0; the cluster_full run sets 10, the
-        # evaluation guidance). With cfg > 0 the sampler doubles the batch (cond + uncond).
+        # Guidance used inside the attacked sampler: 0 for the standard "sampling" attack,
+        # 10 (the evaluation guidance) for "sampling_cfg10". With cfg > 0 the sampler doubles
+        # the batch (conditional + unconditional branch).
         self.sampling_cfg = float(sampling_cfg)
         self.reconstruction_loss_weight = float(reconstruction_loss_weight)
         self.delta_init = float(delta_init)

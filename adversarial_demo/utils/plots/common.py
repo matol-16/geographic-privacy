@@ -240,6 +240,8 @@ def _display_attack_name(attack_name: str) -> str:
         return "GeoFA-diffusion"
     if normalized in ("sampling", "diffusion_salman", "salman"):
         return "GeoFA-sample"
+    if normalized == "sampling_cfg10":
+        return "GeoFA-sample (w=10)"
     if normalized == "diffusion_l2":
         return "GeoFA-L\u00b2"
     if normalized in ("encoder", "enc"):

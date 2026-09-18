@@ -40,8 +40,8 @@ DATASET_LABELS = {"yfcc": "YFCC4k", "osv": "OSV-5M"}
 # re-implemented in the framework (ACE, UniDef, AdvDM), then the new ones, with the
 # headline GeoFA-TD last. Unknown keys go in between.
 BASELINES = ["geoshield"]
-GEOFA_FAMILY = ["ace", "unidef", "training_loss", "encoder", "sampling", "diffusion_l2",
-                "targeted_l2", "dtd_blur", "dtd"]
+GEOFA_FAMILY = ["ace", "unidef", "training_loss", "encoder", "sampling", "sampling_cfg10",
+                "diffusion_l2", "targeted_l2", "dtd_blur", "dtd"]
 
 
 def _find_sidecar(plots_dir: str, dataset: str, suffix: str) -> str:

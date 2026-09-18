@@ -160,7 +160,8 @@ def run_attack(
 	  diffusion_l2   GeoFA-L2: max E ||psi(x_t|c+d) - psi(x_t|c)||^2, same x_t as dtd (metric-only difference)
 	  targeted_l2    GeoFA-DPA / L2-targeted: min RFM training loss towards the antipode of the true location
 	  sampling       GeoFA-Sampling: max E haversine(x0_hat(x_N), true location) through the 16-step
-	                 sampler run at guidance w = 10 [reference="clean_prediction", sampling_cfg=0]
+	                 sampler run WITHOUT guidance (w = 0) [reference="clean_prediction"]
+	  sampling_cfg10 GeoFA-Sampling trained through the sampler at the evaluation guidance w = 10
 	  encoder        GeoFA-enc.: max ||E(c+d) - E(c)||^2 with the shared sign-SGD PGD loop
 	                 [update_rule="adam", delta_init=None -> the original Adam/full-budget-init version]
 	  training_loss  GeoFA-AdvDM: max RFM training loss, x_t and target from the TRUE location
@@ -207,6 +208,7 @@ def run_attack(
 		"dpa": "targeted_l2",
 		"sampling": "sampling",
 		"diffusion_salman": "sampling",  # historical name
+		"sampling_cfg10": "sampling_cfg10",
 		"encoder": "encoder",
 		"enc": "encoder",
 		"training_loss": "training_loss",
@@ -257,6 +259,16 @@ def run_attack(
 		return _run_diffusion_salman_attack(
 			source_image=source_image,
 			pipeline=pipeline,
+			**kwargs
+		)
+	if normalized_type == "sampling_cfg10":
+		# Same objective, but the 16-step sampler that is back-propagated through runs with the
+		# evaluation guidance (w = 10; the batch is doubled for the unconditional branch).
+		kwargs["sampling_cfg"] = 10.0
+		return _run_diffusion_salman_attack(
+			source_image=source_image,
+			pipeline=pipeline,
+			attack_type_label="sampling_cfg10",
 			**kwargs
 		)
 	if normalized_type == "training_loss":
@@ -985,7 +997,7 @@ def _run_diffusion_salman_attack(
 	attack_type_label: str = "sampling",
 	reference: str = "true_location",  # standard: deviate from the TRUE location (paper Eq. 8); "clean_prediction": from the clean model's prediction
 	true_gps: Optional[Any] = None,
-	sampling_cfg: float = 10.0,  # standard: guidance inside the attacked 16-step sampler = the evaluation guidance (0 = no guidance)
+	sampling_cfg: float = 0.0,  # guidance inside the attacked 16-step sampler: 0 for "sampling", 10 for "sampling_cfg10"
 	**kwargs,
 ) -> Dict[str, Any]:
 	"""Run the Salman diffusion attack through the full sampling trajectory."""
