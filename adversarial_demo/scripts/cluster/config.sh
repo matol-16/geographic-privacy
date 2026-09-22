@@ -39,7 +39,9 @@ PARALLEL_WORKERS="${PARALLEL_WORKERS:-1}"        # per-GPU concurrency (1 = stri
 # Attacks COMPUTED by the shard array (one job per attack x window): the attacks of the
 # paper (+ sampling_cfg10, the sampling attack trained through the guided sampler) (see configs/cluster_full/ATTACK_SPECS.md). GeoShield is out-of-process but sharded
 # like the rest; drop it if the Geoshield repo isn't set up.
-read -r -a ATTACK_TYPES <<< "${ATTACK_TYPES_STR:-dtd diffusion_l2 targeted_l2 sampling sampling_cfg10 encoder training_loss unidef dtd_blur geoshield}"
+# NOTE `ace` (GeoFA-ACE) is part of the run. To fold it into a run that is ALREADY going
+# (rather than recomputing everything), use preset_ace.sh instead of re-submitting here.
+read -r -a ATTACK_TYPES <<< "${ATTACK_TYPES_STR:-dtd diffusion_l2 targeted_l2 sampling sampling_cfg10 encoder training_loss unidef ace dtd_blur geoshield}"
 
 # Attacks STITCHED by the merge job. Defaults to the computed set. Set it to a SUPERSET
 # (the attacks already sharded into RESULTS_BASE plus a newly computed one) to fold a

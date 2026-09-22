@@ -6,7 +6,7 @@
 # minutes. Catches wiring, config and pre/post-processing errors before burning cluster
 # hours. Everything (results, GeoShield I/O) goes under SMOKE_BASE.
 #
-#   ./smoke_test_cluster_full.sh yfcc [attacks...]     # default: all 9 attacks
+#   ./smoke_test_cluster_full.sh yfcc [attacks...]     # default: all 11 attacks
 #   SMOKE_IMAGES=3 ./smoke_test_cluster_full.sh osv dtd geoshield
 #
 # Env: PYTHON (python), DATA_ROOT, SMOKE_BASE, SMOKE_IMAGES (2), NUM_RESTARTS (2),
@@ -23,7 +23,7 @@ export CONFIG_PATH="${CONFIG_PATH:-${PROJECT_DIR}/configs/cluster_full/config.ya
 export DATASET="${DS}"
 export TOTAL_IMAGES="${TOTAL_IMAGES:-4000}"          # same seeded pool as the real run
 export IMAGES_PER_SHARD="${SMOKE_IMAGES:-2}"          # ... but a 2-image window
-export ATTACK_TYPES_STR="${*:-dtd diffusion_l2 targeted_l2 sampling sampling_cfg10 encoder training_loss unidef dtd_blur geoshield}"
+export ATTACK_TYPES_STR="${*:-dtd diffusion_l2 targeted_l2 sampling sampling_cfg10 encoder training_loss unidef ace dtd_blur geoshield}"
 export MERGE_ATTACK_TYPES_STR="${ATTACK_TYPES_STR}"
 export ATTACK_BUDGETS_STR="${BUDGETS:-0.0039 0.0157 0.0314}"
 export RUN_SAMPLING_STEPS_ABLATION=1 RUN_ROBUSTNESS_ABLATION=1 RUN_MODEL_TRANSFER_ABLATION=1 RUN_CFG_ABLATION=1

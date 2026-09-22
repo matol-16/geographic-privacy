@@ -57,6 +57,19 @@ process), Eq. 5 (end objective), Eqs. 7–12 and 15 (surrogates), Sec. 6.1 (prot
 - Same objective as AdvDM (training loss, true target v(x_t), geodesic x_t, uniform w(t)), gradient estimated by a **symmetric finite difference** in embedding space: z = E(c)/‖E(c)‖, h = 0.01, ĝ_emb = 2⟨(ψ(x_t, e+hz) − ψ(x_t, e−hz))/2h, ψ(x_t,e) − v⟩ z, back-propagated to δ through the encoder only. ✔ Eq. 20.
 - x₀ = TRUE location, so it differs from GeoFA-AdvDM by the gradient estimator only. ✔ "same quantity, different estimator" (App. C.3).
 
+### `ace` — GeoFA-ACE (targeted, image-space target)
+
+- Targeted at a fixed **target image** (`.media/MIST.png`, the same one the historical runs used), not at a location: `target_image` is passed per attack through `attack_train_args.<ds>.per_attack.ace`.
+- Objective (minimised): `score_loss + alpha * encoder_l2` with **`alpha = 1`** (as in the historical runs; the ACE class default is 100) —
+  (i) `l2_target`: E ‖ψ(x_t|c+δ) − ψ(x_t|c_tgt)‖² between the perturbed and the **target image's** velocity prediction, and
+  (ii) the encoder term ‖E(c+δ) − E(c_tgt)‖² pulling the embedding onto the target's.
+- x_t: the attacked **model's own forward process** (`forward_process: "model"`, geodesic) around the anchor bank x₀ sampled from the *clean* model (`ACE` inherits `DiffusionAttack`'s defaults) — unlike GeoFA-TD/L², it does not noise the true location.
+- `true_gps` is used for the **restart selection only** (`final_step_displacement_true`), like every other attack of the run.
+- Same shared sign-SGD PGD loop, budgets, restarts and evaluation protocol as the rest.
+- ⇒ **note on the mixing weight**: `alpha` scales the *encoder* term, so a larger `alpha` makes ACE more encoder-like, not less. Measured ‖alpha·g_enc‖/‖g_score‖: **3.8 at `alpha = 1`**, 377.5 at `alpha = 100`. Even at 1 the encoder term leads, so ACE overlaps GeoFA-enc. to a degree; `alpha ≪ 1` would be the knob if a purely score-space targeted baseline is wanted. Each shard logs one `[ACE grad balance]` line — check it on the first jobs.
+- The only targeted-at-an-image attack of the run (GeoFA-DPA is targeted at a *location*, the antipode). Present in the pre-fix `yfcc4k_full` run; re-run here under the pixel-space convention.
+- Submitted with `scripts/cluster/preset_ace.sh <ds>` (folds into a run already in flight).
+
 ### `dtd_blur` — GeoFA-TD-blur
 - (1−w)·L_TD(c+δ) + w·L_TD(blur_σ(c+δ)), w = 0.5, σ ~ U[0, 4] per step, differentiable Gaussian blur (25×25 kernel, reflect padding) of the protected image; reference ψ(x_t|c) stays the *un-blurred* clean prediction; L_TD identical to `dtd` above (Gaussian x_t, true x₀, Euclidean cosine).
 - Not described in the paper body (robustness ablation candidate).

@@ -24,7 +24,7 @@ detect_shard_attacks() {
 # merge_shards takes robustness_attack_types EXPLICITLY (it does not auto-detect like the
 # other ablations), so passing a subset would silently drop the existing curves from the
 # re-merged robustness JSON.
-ROBUSTNESS_CAPABLE="${ROBUSTNESS_CAPABLE:-geoshield dtd encoder sampling targeted_l2 dtd_blur}"
+ROBUSTNESS_CAPABLE="${ROBUSTNESS_CAPABLE:-geoshield dtd encoder sampling targeted_l2 dtd_blur ace}"
 
 # union_lists "a b" "b c"  -> "a b c"  (order preserved, deduped)
 union_lists() {

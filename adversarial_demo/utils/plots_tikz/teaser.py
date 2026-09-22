@@ -120,6 +120,7 @@ def plot_geolocation_teaser_tikz(
     attack_labels: Sequence[str] = ("dtd", "geoshield"),
     thumb_width_cm: float = 2.6,
     map_resolution: str = "110m",
+    stem: Optional[str] = None,
 ) -> dict:
     """Standalone pgfplots teaser figure for one example image.
 
@@ -152,7 +153,7 @@ def plot_geolocation_teaser_tikz(
 
     tikz_dir = plot_dir / "tikz"
     tikz_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"teaser_{image_dir.name}"
+    stem = stem or f"teaser_{image_dir.name}"  # e.g. a per-budget subfolder wants the image id
 
     # Background world map: generated once under a shared assets cache, then copied
     # alongside this figure's own .tex so the output folder stays self-contained.

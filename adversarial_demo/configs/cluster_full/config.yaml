@@ -15,6 +15,7 @@
 #   encoder        GeoFA-enc.      ||E(c+d) - E(c)||^2, sign-SGD PGD
 #   training_loss  GeoFA-AdvDM     RFM training loss maximised, x_t / target from the true location
 #   unidef         GeoFA-UniDef    training_loss with the finite-difference (FDJE) gradient estimator
+#   ace            GeoFA-ACE       targeted: pulls the score + encoding towards the MIST target image
 #   dtd_blur       GeoFA-TD-blur   dtd + the same loss on a Gaussian-blurred copy (blur EOT)
 #   geoshield      GeoShield       external (PNG, model-exact 336 px clean copies)
 # Restarts are selected by the FSD (distance of the attacked prediction to the TRUE location),
@@ -83,9 +84,16 @@ attack_train_args:
         blur_sigma_min: 0.0
         blur_sigma_max: 4.0
         blur_loss_weight: 0.5
-      ace:  # not part of this run; kept so the key stays runnable
+      ace:  # GeoFA-ACE (targeted at the MIST image). Path is relative to PROJECT_DIR
+        # (adversarial_demo/), which is where the shard and merge jobs cd to; .media/ lives
+        # at the REPO root, one level up. preset_ace.sh overrides it with an absolute path.
         dot_product_loss: "l2_target"
-        target_image: ".media/MIST.png"
+        target_image: "../.media/MIST.png"
+        # alpha weights the ENCODER term: loss = score_loss + alpha * encoder_l2, so a
+        # LARGER alpha makes ACE more encoder-like. 1 = what the historical runs used
+        # (the ACE class default is 100). Measured gradient balance
+        # ratio(alpha*encoder/score): 3.8 at alpha=1, 377.5 at alpha=100 -- so even at 1
+        # the encoder term leads. Watch the "[ACE grad balance]" line in the shard logs.
         alpha: 1
 
   osv:
@@ -114,16 +122,23 @@ attack_train_args:
         blur_sigma_min: 0.0
         blur_sigma_max: 4.0
         blur_loss_weight: 0.5
-      ace:  # not part of this run; kept so the key stays runnable
+      ace:  # GeoFA-ACE (targeted at the MIST image). Path is relative to PROJECT_DIR
+        # (adversarial_demo/), which is where the shard and merge jobs cd to; .media/ lives
+        # at the REPO root, one level up. preset_ace.sh overrides it with an absolute path.
         dot_product_loss: "l2_target"
-        target_image: ".media/MIST.png"
+        target_image: "../.media/MIST.png"
+        # alpha weights the ENCODER term: loss = score_loss + alpha * encoder_l2, so a
+        # LARGER alpha makes ACE more encoder-like. 1 = what the historical runs used
+        # (the ACE class default is 100). Measured gradient balance
+        # ratio(alpha*encoder/score): 3.8 at alpha=1, 377.5 at alpha=100 -- so even at 1
+        # the encoder term leads. Watch the "[ACE grad balance]" line in the shard logs.
         alpha: 1
 
 save_deltas: false  # config.sh SAVE_DELTAS=1 turns it on (~1.4 MB per (attack, budget, image))
 
-# The 10 attacks of the run (canonical keys; see the pins above). GeoShield is sharded on
+# The 11 attacks of the run (canonical keys; see the pins above). GeoShield is sharded on
 # its own (one attack per shard) like the others.
-attack_types: ["dtd", "diffusion_l2", "targeted_l2", "sampling", "sampling_cfg10", "encoder", "training_loss", "unidef", "dtd_blur", "geoshield"]
+attack_types: ["dtd", "diffusion_l2", "targeted_l2", "sampling", "sampling_cfg10", "encoder", "training_loss", "unidef", "ace", "dtd_blur", "geoshield"]
 
 # Ablation grids. max_restarts == num_restarts: no extra restarts beyond the reported best.
 max_restarts: 5
@@ -133,7 +148,7 @@ cfg_num_steps: null
 
 # Robustness (JPEG / Gaussian blur of the protected image) for EVERY attack of the run.
 robustness:
-  attack_types: ["dtd", "diffusion_l2", "targeted_l2", "sampling", "sampling_cfg10", "encoder", "training_loss", "unidef", "dtd_blur", "geoshield"]
+  attack_types: ["dtd", "diffusion_l2", "targeted_l2", "sampling", "sampling_cfg10", "encoder", "training_loss", "unidef", "ace", "dtd_blur", "geoshield"]
   jpeg_quality_factors: [20, 40, 60, 80, 100]
   gaussian_blur_sigmas: [0, 2, 4, 6, 8, 10]
   num_steps: null
