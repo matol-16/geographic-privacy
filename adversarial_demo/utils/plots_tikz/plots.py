@@ -1124,6 +1124,7 @@ def plot_robustness_and_sampling_steps_tikz(
     plot_dir: str,
     eps: float = DEFAULT_ABLATION_EPS,
     thresholds: Optional[Sequence[float]] = None,
+    cfg_json: Optional[dict] = None,
 ) -> dict:
     """Combined robustness figure: one row per success-rate threshold (the
     2500 km headline by default, every threshold for the appendix -- see
@@ -1138,6 +1139,11 @@ def plot_robustness_and_sampling_steps_tikz(
     to). Panel geometry matches the other single-row success-rate groupplots
     (SUCCESS_RATE_PANEL_W/H/H_SEP) so this figure sits at the same visual
     scale as those.
+
+    With ``cfg_json`` (the guidance-scale ablation) a fourth column, guidance
+    scale w, is added in the same style; the figure is then laid out to fit the
+    ICLR text width (narrower panels, y tick labels on the first column only,
+    legend on two rows).
     """
     thresholds = select_thresholds(robustness_json["success_rate_thresholds_km"], thresholds)
     metric = "true"
@@ -1167,6 +1173,10 @@ def plot_robustness_and_sampling_steps_tikz(
         ("JPEG quality factor", "jpeg"),
         ("Sampling steps", None),
     ]
+    if cfg_json is not None:
+        transforms.append(("Guidance scale $w$", "cfg"))
+        eval_cfgs = [float(c) for c in cfg_json["eval_cfgs"]]
+        cfg_budgets_per_type = cfg_json.get("attack_budgets_per_type", {})
     n_cols = len(transforms)
     n_rows = len(thresholds)
 
@@ -1180,8 +1190,10 @@ def plot_robustness_and_sampling_steps_tikz(
     for attack_type in attack_types:
         color_name, hexcode = attack_pgf_color(attack_type)
         colors[color_name] = hexcode
-        marker, mark_size = attack_marker(attack_type), attack_mark_size(attack_type, base_pt=2.8)
-        line_width = attack_line_width(attack_type, base_pt=1.4)
+        compact = cfg_json is not None
+        marker = attack_marker(attack_type)
+        mark_size = attack_mark_size(attack_type, base_pt=2.0 if compact else 2.8)
+        line_width = attack_line_width(attack_type, base_pt=1.2 if compact else 1.4)
         has_robustness_data = attack_type in common_set
 
         def _add_line(col_idx: int, row_idx: int, xs, rates, want_legend: bool) -> None:
@@ -1226,23 +1238,46 @@ def plot_robustness_and_sampling_steps_tikz(
             ]
             _add_line(2, row_idx, eval_num_steps, rates, want_legend=False)
 
+        if cfg_json is not None and attack_type in cfg_json["results"]:
+            budget = select_closest_budget(cfg_budgets_per_type.get(attack_type, cfg_json["attack_budgets"]), eps)
+            node = cfg_json["results"][attack_type].get(f"budget_{budget:.6f}", {})
+            for row_idx, thr in enumerate(thresholds):
+                pts = [(w, node[k]["success_rates"][str(thr)]) for w in eval_cfgs
+                       if (k := (str(int(w)) if w.is_integer() else str(w))) in node]
+                if pts:
+                    _add_line(3, row_idx, [w for w, _ in pts], [r for _, r in pts], want_legend=False)
+
     panel_w, panel_h, h_sep = SUCCESS_RATE_PANEL_W, SUCCESS_RATE_PANEL_H, SUCCESS_RATE_H_SEP
+    legend_cols, legend_y, legend_font = "-1", 1.35, "\\large"
+    if cfg_json is not None:
+        # Four panels at the ICLR text width (5.5in): ~19-20 cm natural width keeps
+        # every label at >= ~7pt once scaled to \textwidth. The y range is shared,
+        # so only the first column keeps its tick labels and the gaps can shrink.
+        panel_w, panel_h, h_sep = 4.8, 4.4, 0.35
+        v_sep = 1.5  # no per-panel titles to clear between rows
+        legend_cols, legend_y, legend_font = str((len(attack_types) + 1) // 2), 1.06, "\\normalsize"
     # Wider than h_sep: each row-to-row gap has to fit the bottom row's xlabel
     # *and* the next row's title stacked in it, unlike the purely-horizontal
     # single-row figures where h_sep only ever separates two plot frames.
-    v_sep = 2.2
+    if cfg_json is None:
+        v_sep = 2.2
     legend_x = groupplot_legend_center_x(n_cols, panel_w, h_sep)
     xtick_str = ",".join(str(s) for s in eval_num_steps)
 
     group_axes = []
     for row_idx, thr in enumerate(thresholds):
         for col_idx, (xlabel, json_key) in enumerate(transforms):
-            opts = [
-                "ymin=0.3", "ymax=1", "grid=major", "grid style={gray!25}",
-                f"title={{Displacement > {thr} km}}",
-            ]
-            if col_idx == 0:
-                opts.append("ylabel={Attack success rate}")
+            opts = ["ymin=0.3", "ymax=1", "grid=major", "grid style={gray!25}"]
+            if cfg_json is None:
+                opts.append(f"title={{Displacement > {thr} km}}")
+                if col_idx == 0:
+                    opts.append("ylabel={Attack success rate}")
+            elif col_idx == 0:
+                # Narrow panels: the threshold moves from a per-panel title into
+                # the row's y label.
+                opts.append(f"ylabel={{ASR@{thr:g}\\,km}}")
+            else:
+                opts.append("yticklabels={}")
             # The x-axis quantity, on the other hand, does need to appear on
             # every panel: each row is a separate axis, so a bottom-row-only
             # xlabel would leave the top row's columns unlabeled.
@@ -1252,9 +1287,16 @@ def plot_robustness_and_sampling_steps_tikz(
             elif json_key is None:
                 opts += ["xmode=log", "log basis x=2", "log ticks with fixed point",
                          "xminorticks=false", f"xtick={{{xtick_str}}}"]
+            elif json_key == "cfg":
+                opts += ["xmode=log", "log ticks with fixed point", "xminorticks=false",
+                         f"xtick={{{','.join(f'{w:g}' for w in eval_cfgs)}}}"]
             if row_idx == 0 and col_idx == 0:
-                opts.append(f"legend style={{at={{({legend_x:.4g},1.35)}}, anchor=south, "
-                            f"legend columns=-1, draw=none, font=\\large}}")
+                opts.append(f"legend style={{at={{({legend_x:.4g},{legend_y})}}, anchor=south, "
+                            f"legend columns={legend_cols}, draw=none, font={legend_font}"
+                            + (", /tikz/every even column/.append style={column sep=6pt}" if cfg_json is not None else "")
+                            + "}")
+                if cfg_json is not None:
+                    opts.append("legend cell align=left")
                 opts.append(SINGLE_MARK_LEGEND_IMAGE)
             blocks = cell_blocks.get((col_idx, row_idx), [])
             group_axes.append(f"\\nextgroupplot[{', '.join(opts)}]\n" + "\n".join(blocks))

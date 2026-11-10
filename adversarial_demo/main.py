@@ -1892,13 +1892,24 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
             None,
             os.path.join(results_dir, f"{dataset}_sampling_steps_results.json"),
         )
-        print(f"Plotting combined robustness + sampling-steps results from: {robustness_file}, {sampling_steps_file}")
+        # Optional 4th panel: the guidance-scale ablation, when its JSON exists.
+        cfg_file = pick_value(
+            args.results_files[2] if args.results_files and len(args.results_files) > 2 else None,
+            None,
+            os.path.join(results_dir, f"{dataset}_cfg_results.json"),
+        )
+        cfg_json = None
+        if os.path.exists(cfg_file):
+            with open(cfg_file) as f:
+                cfg_json = json.load(f)
+        print(f"Plotting combined robustness + sampling-steps results from: {robustness_file}, {sampling_steps_file}"
+              + (f", guidance scale from {cfg_file}" if cfg_json is not None else ""))
         with open(robustness_file) as f:
             robustness_json = json.load(f)
         sampling_steps_json = merge_sampling_steps_results([sampling_steps_file])
         plot_robustness_and_sampling_steps_tikz(
             robustness_json=robustness_json, sampling_steps_json=sampling_steps_json, plot_dir=plots_dir,
-            thresholds=robustness_thresholds,
+            thresholds=robustness_thresholds, cfg_json=cfg_json,
         )
 
     elif plot_type == "restarts":
