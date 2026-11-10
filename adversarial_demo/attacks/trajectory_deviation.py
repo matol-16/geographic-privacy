@@ -235,6 +235,21 @@ class DiffusionAttack(AttackBase):
         self.dot_product_loss = dot_product_loss
         self.reconstruction_loss_weight = float(reconstruction_loss_weight)
         self.delta_init = float(delta_init)
+        # Clean-image embedding, computed on the first step and reused (it never changes).
+        self._emb_source = None
+
+    def _clean_embedding_batch(self) -> torch.Tensor:
+        """Clean embedding repeated to the train batch; the encoder runs once per attack."""
+        if self._emb_source is None:
+            with torch.no_grad():
+                self._emb_source = compute_embedding(
+                    self.source_tensor,
+                    self.train_batch_size,
+                    self.pipeline,
+                    device=self.device,
+                    track_grad=False,
+                ).detach()
+        return self._emb_source
 
     def initialize_delta(self, restart_idx: int) -> torch.Tensor:
         """Initialize delta with tiny random noise to avoid zero-gradient dead start."""
@@ -284,16 +299,9 @@ class DiffusionAttack(AttackBase):
         
         # Reference noise prediction
         if not self.target_pure_noise:
-            emb_source = compute_embedding(
-                self.source_tensor,
-                self.train_batch_size,
-                self.pipeline,
-                device=self.device,
-                track_grad=False,
-            )
             model_batch = {
                 "y": x_t,
-                "emb": emb_source,
+                "emb": self._clean_embedding_batch(),
                 "gamma": gamma,
             }
             eps_pred = self.pipeline.model(model_batch)
@@ -447,6 +455,20 @@ class ACE(DiffusionAttack):
         # (frozen) reference the perturbed prediction is pulled towards.
         self.target_image = target_image
         self.target_tensor = conditional_preprocessing(target_image, pipeline, device=device)
+        self._emb_target = None  # target embedding, computed on the first step and reused
+
+    def _target_embedding_batch(self) -> torch.Tensor:
+        """Target embedding repeated to the train batch; the encoder runs once per attack."""
+        if self._emb_target is None:
+            with torch.no_grad():
+                self._emb_target = compute_embedding(
+                    self.target_tensor,
+                    self.train_batch_size,
+                    self.pipeline,
+                    device=self.device,
+                    track_grad=False,
+                ).detach()
+        return self._emb_target
 
     def run_step(
         self,
@@ -486,13 +508,7 @@ class ACE(DiffusionAttack):
         eps_pred_perturbed = self.pipeline.model(model_batch_perturbed)
 
         # Reference noise prediction conditioned on the target image (frozen)
-        emb_target = compute_embedding(
-            self.target_tensor,
-            self.train_batch_size,
-            self.pipeline,
-            device=self.device,
-            track_grad=False,
-        )
+        emb_target = self._target_embedding_batch()
         model_batch_target = {
             "y": x_t,
             "emb": emb_target,
@@ -1277,14 +1293,7 @@ class DTDBlur(DiffusionAttack):
         _tangent = self.forward_process == "model" and self.model_kind == "rfm"
 
         # Clean reference score (unperturbed, unblurred source); shared, no grad.
-        emb_source = compute_embedding(
-            self.source_tensor,
-            self.train_batch_size,
-            self.pipeline,
-            device=self.device,
-            track_grad=False,
-        )
-        eps_pred = self.pipeline.model({"y": x_t, "emb": emb_source, "gamma": gamma})
+        eps_pred = self.pipeline.model({"y": x_t, "emb": self._clean_embedding_batch(), "gamma": gamma})
         if _tangent:
             eps_pred = self.manifold.proju(x_t, eps_pred)
 
