@@ -19,7 +19,7 @@ from utils.plots_tikz.plots import (
     plot_robustness_results_tikz,
     plot_sampling_steps_success_rate_tikz,
 )
-from utils.plots_tikz.teaser import plot_geolocation_teaser_tikz
+from utils.plots_tikz.teaser import plot_geolocation_teaser_tikz, plot_geolocation_teaser_pair_tikz
 
 __all__ = [
     "plot_results_tikz",
@@ -34,4 +34,5 @@ __all__ = [
     "plot_robustness_results_tikz",
     "plot_robustness_and_sampling_steps_tikz",
     "plot_geolocation_teaser_tikz",
+    "plot_geolocation_teaser_pair_tikz",
 ]
