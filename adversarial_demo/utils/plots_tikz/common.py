@@ -307,6 +307,34 @@ def write_dat_file(path: str, columns: dict[str, np.ndarray]) -> None:
                 f.write(" ".join(f"{v:.6g}" for v in row) + "\n")
 
 
+_FIXED_RATE_YMINS = ("0.3", "0.4")
+_COORD_RE = re.compile(r"\(([-+0-9.eE]+),([-+0-9.eE]+)\)")
+
+
+def adapt_rate_ymin(body: str) -> str:
+    """Lower the success-rate figures' fixed ``ymin=0.3`` / ``ymin=0.4`` when a curve dips
+    below it (e.g. GeoShield at 1/255), to the next 0.1 step under the lowest point.
+
+    Those floors were tuned for the 8/255 figures; at small budgets they would clip
+    whole curves. Bodies whose data stay above the floor are returned unchanged.
+    """
+    present = [y for y in _FIXED_RATE_YMINS if f"ymin={y}," in body or f'"ymin={y}"' in body
+               or re.search(rf"ymin={re.escape(y)}\b", body)]
+    if not present:
+        return body
+    ys = []
+    for block in re.findall(r"coordinates \{([^}]*)\}", body):
+        ys += [float(m.group(2)) for m in _COORD_RE.finditer(block)]
+    if not ys:
+        return body
+    lowest = min(ys)
+    for y in present:
+        if lowest < float(y):
+            new = max(0.0, np.floor(lowest * 10) / 10)
+            body = re.sub(rf"ymin={re.escape(y)}\b", f"ymin={new:.1f}", body)
+    return body
+
+
 def render_tikz(body: str, plot_dir: str, filename_stem: str, extra_preamble: str = "") -> dict:
     """Write ``body`` (the contents of a ``tikzpicture``) as a standalone .tex file
     under ``<plot_dir>/tikz/``, then best-effort compile it to a PDF and rasterize a
@@ -317,6 +345,7 @@ def render_tikz(body: str, plot_dir: str, filename_stem: str, extra_preamble: st
     # .tex/.pdf/.png stems; any ``.dat`` companions written by the caller keep
     # the bare stem, which is fine since they hold the same data either way.
     filename_stem = output_stem(filename_stem)
+    body = adapt_rate_ymin(body)
     tex_path = os.path.join(tikz_dir, f"{filename_stem}.tex")
     with open(tex_path, "w") as f:
         f.write(_PREAMBLE.format(extra_preamble=extra_preamble, body=body))

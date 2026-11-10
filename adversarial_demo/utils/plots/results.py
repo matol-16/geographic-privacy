@@ -16,6 +16,7 @@ import numpy as np
 from matplotlib.ticker import FixedFormatter, FixedLocator, NullLocator
 
 from utils.plots.common import (
+    rate_ylim,
     _display_attack_name,
     _get_metric_samples_by_budget,
     _load_attack_results,
@@ -260,7 +261,7 @@ def plot_attack_success_rate(
             )
 
     ax.set_xlabel("Attack budget out of 255 (log scale)")
-    ax.set_ylim(0.4, 1.0)
+    rate_ylim(ax, floor=0.4)
     ax.grid(alpha=0.25, linestyle='--', linewidth=0.6)
     # Legend anchored just outside the axes so it never overlaps the curves.
     ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1.0), borderaxespad=0., ncol=1, frameon=False)

@@ -33,7 +33,13 @@
 #   CLEAN=1 scripts/make_paper_figures.sh    # wipe plots/ + plots_appendix/ first
 #
 # Env knobs: PYTHON, TIKZ (default 1), CLEAN (default 0), YFCC_BASE, OSV_BASE,
-#            ALL_ATTACKS, MAIN_HEATMAP_ATTACKS, LOCALIZABILITY_ATTACKS.
+#            ALL_ATTACKS, MAIN_HEATMAP_ATTACKS, LOCALIZABILITY_ATTACKS, EPS.
+#
+# EPS (e.g. 0.0039 for 1/255): draw the single-budget figures (ablations, spread,
+# heatmaps) at that budget instead of the default 8/255, into plots_eps<N>/ and
+# plots_appendix_eps<N>/ (N = EPS*255). The figures that already span every budget
+# (displacement / success rate vs budget, restarts) are skipped in that mode.
+#   EPS=0.0039 scripts/make_paper_figures.sh yfcc
 #
 # Each .pt-backed plot re-loads every attack's results file (~30 s per attack), so a
 # full run is ~45 min per dataset; run the two datasets as two processes to halve it:
@@ -49,6 +55,7 @@ WHICH="${1:-all}"
 PYTHON="${PYTHON:-/Data/mathias.ollu/conda/plonk/bin/python}"
 TIKZ="${TIKZ:-1}"
 CLEAN="${CLEAN:-0}"
+EPS="${EPS:-}"
 YFCC_BASE="${YFCC_BASE:-${PROJECT_DIR}/results/cluster_eval/yfcc4k_full}"
 OSV_BASE="${OSV_BASE:-${PROJECT_DIR}/results/cluster_eval_2/osv_full}"
 
@@ -70,6 +77,12 @@ LOCALIZABILITY_ATTACKS="${LOCALIZABILITY_ATTACKS:-${MAIN_ATTACKS}}"
 
 export MPLBACKEND=Agg
 
+EPS_ARGS=() PLOTS_TAG=""
+if [[ -n "${EPS}" ]]; then
+  EPS_ARGS=(--eps "${EPS}")
+  PLOTS_TAG="_eps$("${PYTHON}" -c "print(round(${EPS} * 255))")"
+fi
+
 # Backends to render: matplotlib always, plus the pgfplots twin when TIKZ=1.
 FLAG_SETS=("")
 [[ "${TIKZ}" == "1" ]] && FLAG_SETS+=("--tikz")
@@ -83,7 +96,7 @@ plot() {
   local type="$1" ds="$2" rdir="$3" pdir="$4" cfg="$5"; shift 5
   echo; echo ">>> [${ds}] plot ${type} -> ${pdir}  ($*)"
   "${PYTHON}" main.py plot "${type}" --config "${cfg}" --dataset "${ds}" \
-    --results-dir "${rdir}" --plots-dir "${pdir}" "$@"
+    --results-dir "${rdir}" --plots-dir "${pdir}" ${EPS_ARGS[@]+"${EPS_ARGS[@]}"} "$@"
 }
 
 # Same, once per backend in FLAG_SETS.
@@ -122,7 +135,7 @@ localizability() {
 # run_dataset <dataset> <base> <ablations: main|appendix>
 run_dataset() {
   local ds="$1" base="$2" ablation_home="$3"
-  local main="${base}/plots" app="${base}/plots_appendix"
+  local main="${base}/plots${PLOTS_TAG}" app="${base}/plots_appendix${PLOTS_TAG}"
   local cfg="${base}/${ds}_run_config_merged.yaml"
   [[ -f "${cfg}" ]] || cfg="${PROJECT_DIR}/config.yaml"
   # Where the ablation figures of this dataset live, and the stem suffix they carry.
@@ -151,10 +164,12 @@ run_dataset() {
   mkdir -p "${main}" "${app}"
 
   # -- main results: every attack, against the true GPS ------------------------------
-  # shellcheck disable=SC2086
-  plot_both results       "${ds}" "${base}" "${main}" "${cfg}" --attack-types ${ALL_ATTACKS} --override plot.gps_true=true
-  # shellcheck disable=SC2086
-  plot_both success-rate  "${ds}" "${base}" "${main}" "${cfg}" --attack-types ${ALL_ATTACKS} --override plot.gps_true=true
+  if [[ -z "${EPS}" ]]; then
+    # shellcheck disable=SC2086
+    plot_both results       "${ds}" "${base}" "${main}" "${cfg}" --attack-types ${ALL_ATTACKS} --override plot.gps_true=true
+    # shellcheck disable=SC2086
+    plot_both success-rate  "${ds}" "${base}" "${main}" "${cfg}" --attack-types ${ALL_ATTACKS} --override plot.gps_true=true
+  fi
   # shellcheck disable=SC2086
   plot_both dtd-variance  "${ds}" "${base}" "${main}" "${cfg}" --attack-types ${ALL_ATTACKS} --override plot.gps_true=true
 
@@ -183,8 +198,8 @@ run_dataset() {
     plot_both model-transfer "${ds}" "${base}" "${abl_dir}" "${cfg}" --attack-types ${MAIN_ATTACKS} \
       ${abl_suffix[@]+"${abl_suffix[@]}"}
     plot_both model-transfer "${ds}" "${base}" "${app}" "${cfg}" --filename-suffix "${all_suffix}"
-    # One panel per budget at 2500 km (TikZ only).
-    if [[ "${TIKZ}" == "1" ]]; then
+    # One panel per budget at 2500 km (TikZ only); spans every budget, so not in EPS mode.
+    if [[ "${TIKZ}" == "1" && -z "${EPS}" ]]; then
       # shellcheck disable=SC2086
       plot model-transfer-by-budget "${ds}" "${base}" "${abl_dir}" "${cfg}" --tikz --attack-types ${MAIN_ATTACKS} \
         ${abl_suffix[@]+"${abl_suffix[@]}"}
@@ -193,7 +208,9 @@ run_dataset() {
   else
     echo ">>> [${ds}] no model-transfer JSON -- skipping"
   fi
-  if [[ -f "${base}/${ds}_restarts_results.json" ]]; then
+  if [[ -n "${EPS}" ]]; then
+    echo ">>> [${ds}] restarts figure spans every budget -- skipped in EPS mode"
+  elif [[ -f "${base}/${ds}_restarts_results.json" ]]; then
     # matplotlib only (no TikZ twin).
     plot restarts "${ds}" "${base}" "${abl_dir}" "${cfg}" ${abl_suffix[@]+"${abl_suffix[@]}"}
   else
@@ -226,12 +243,16 @@ run_dataset() {
   fi
 
   # -- localizability (needs precomputed scores; see scripts/run_localizability.sh) ---
-  # Main attacks where the ablations live, every attack in the appendix.
-  localizability "${ds}" "${base}" "${abl_dir}" "${cfg}" "${LOCALIZABILITY_ATTACKS}" ${abl_suffix[@]+"${abl_suffix[@]}"}
-  # (OSV keeps its main-attack version in the appendix too, hence the distinct stem.)
-  # shellcheck disable=SC2086
-  localizability "${ds}" "${base}" "${app}" "${cfg}" "$(present_attacks "${ds}" "${base}" ${ALL_ATTACKS})" \
-    --filename-suffix "${all_suffix}"
+  # One figure per budget already, so not repeated in EPS mode. Main attacks where
+  # the ablations live, every attack in the appendix.
+  if [[ -z "${EPS}" ]]; then
+    localizability "${ds}" "${base}" "${abl_dir}" "${cfg}" "${LOCALIZABILITY_ATTACKS}" ${abl_suffix[@]+"${abl_suffix[@]}"}
+    # shellcheck disable=SC2086
+    # (OSV keeps its main-attack version in the appendix too, hence the distinct stem.)
+    # shellcheck disable=SC2086
+    localizability "${ds}" "${base}" "${app}" "${cfg}" "$(present_attacks "${ds}" "${base}" ${ALL_ATTACKS})" \
+      --filename-suffix "${all_suffix}"
+  fi
 
   echo; echo "[${ds}] done."
 }

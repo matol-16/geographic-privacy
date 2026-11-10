@@ -201,6 +201,15 @@ def select_thresholds(available, requested=None) -> list:
     return picked
 
 
+def rate_ylim(ax, floor: float = 0.3) -> None:
+    """``ax.set_ylim(floor, 1)``, lowered to the next 0.1 step when a plotted curve dips
+    below ``floor`` (the default floor was tuned for 8/255; small budgets go lower)."""
+    ys = [y for line in ax.get_lines() for y in np.asarray(line.get_ydata(), dtype=float)
+          if np.isfinite(y)]
+    lowest = min(ys, default=floor)
+    ax.set_ylim(min(floor, max(0.0, np.floor(lowest * 10) / 10)), 1)
+
+
 def select_closest_budget(attack_budgets, target_eps: float) -> float:
     """Return the value in ``attack_budgets`` closest to ``target_eps``.
 

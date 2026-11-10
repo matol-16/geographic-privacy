@@ -13,6 +13,7 @@ from matplotlib.patches import Patch
 
 from utils.adversarial_metrics import trajectory_displacement
 from utils.plots.common import (
+    rate_ylim,
     _display_attack_name,
     _get_metric_samples_by_budget,
     _get_metric_tensor,
@@ -355,7 +356,7 @@ def plot_sampling_steps_success_rate(
         ax.set_xlabel("Sampling steps")
         ax.set_ylabel("Attack success rate")
         ax.set_title(f"Displacement > {thr} km")
-        ax.set_ylim(0.3, 1)
+        rate_ylim(ax)
         ax.grid(True, alpha=0.3)
 
     _finalize_figure(fig, legend_handles, legend_labels)
@@ -412,7 +413,7 @@ def plot_cfg_success_rate(
         ax.set_xlabel("Guidance scale (cfg)")
         ax.set_ylabel("Attack success rate")
         ax.set_title(f"Displacement > {thr} km")
-        ax.set_ylim(0.3, 1)
+        rate_ylim(ax)
         ax.grid(True, alpha=0.3)
 
     _finalize_figure(fig, legend_handles, legend_labels)
@@ -555,7 +556,7 @@ def plot_robustness_results(
             ax.set_ylabel("Attack success rate")
             if len(thresholds) > 1:
                 ax.set_title(f"Displacement > {thr} km")
-            ax.set_ylim(0.3, 1)
+            rate_ylim(ax)
             ax.grid(True, alpha=0.3)
             if json_key == "jpeg":
                 # Lower quality factor = more compression; invert so both columns

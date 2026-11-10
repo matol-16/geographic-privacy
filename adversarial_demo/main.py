@@ -1729,6 +1729,9 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
     elif robustness_thresholds:
         robustness_thresholds = [float(t) for t in robustness_thresholds]
     heatmap_n_cols = getattr(args, "n_cols", None)
+    # Budget the single-budget figures (ablations, spread, heatmap) are drawn at;
+    # unset -> each plot's own default (8/255). The closest stored budget is used.
+    eps_kwargs = {"eps": args.eps} if getattr(args, "eps", None) is not None else {}
     # --extra-results attack=dir: take that attack's <ds>_<attack>_results.pt from
     # another run (e.g. a pilot run standing in until the full one lands). Only the
     # clean-vs-attacked heatmap supports it -- it is the one figure that treats
@@ -1811,6 +1814,7 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
             dataset_name=dataset,
             attack_types=attack_types,
             gps_true=gps_true,
+            **eps_kwargs,
         )
 
     elif plot_type == "loss-vs-fsd":
@@ -1825,6 +1829,7 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
             dataset_name=dataset,
             attack_types=loss_attack_types,
             gps_true=gps_true,
+            **eps_kwargs,
         )
 
     elif plot_type == "clean-vs-attacked-displacement":
@@ -1857,6 +1862,7 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
             attack_types=attack_types,
             all_results=all_results,
             **clean_vs_attacked_kwargs,
+            **eps_kwargs,
         )
 
     elif plot_type == "sampling-steps":
@@ -1865,7 +1871,7 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         print(f"Merging {len(results_files)} result file(s) for joint sampling-steps plot")
         merged = merge_sampling_steps_results(results_files)
         sampling_steps_fn = plot_sampling_steps_success_rate_tikz if tikz else plot_sampling_steps_success_rate
-        sampling_steps_fn(json_results=merged, plot_dir=plots_dir)
+        sampling_steps_fn(json_results=merged, plot_dir=plots_dir, **eps_kwargs)
 
     elif plot_type == "robustness":
         results_file = pick_value(
@@ -1877,7 +1883,7 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         with open(results_file) as f:
             json_results = json.load(f)
         robustness_fn = plot_robustness_results_tikz if tikz else plot_robustness_results
-        robustness_fn(json_results=json_results, plot_dir=plots_dir, thresholds=robustness_thresholds)
+        robustness_fn(json_results=json_results, plot_dir=plots_dir, thresholds=robustness_thresholds, **eps_kwargs)
 
     elif plot_type == "robustness-and-sampling-steps":
         if not tikz:
@@ -1909,7 +1915,7 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         sampling_steps_json = merge_sampling_steps_results([sampling_steps_file])
         plot_robustness_and_sampling_steps_tikz(
             robustness_json=robustness_json, sampling_steps_json=sampling_steps_json, plot_dir=plots_dir,
-            thresholds=robustness_thresholds, cfg_json=cfg_json,
+            thresholds=robustness_thresholds, cfg_json=cfg_json, **eps_kwargs,
         )
 
     elif plot_type == "restarts":
@@ -1950,7 +1956,7 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
                 print(f"NOTE: no model-transfer results for {missing} -- skipped")
             json_results["attack_types"] = [a for a in args.attack_types if a in json_results["attack_types"]]
         model_transfer_fn = plot_model_transfer_success_rate_tikz if tikz else plot_model_transfer_success_rate
-        model_transfer_fn(json_results=json_results, plot_dir=plots_dir)
+        model_transfer_fn(json_results=json_results, plot_dir=plots_dir, **eps_kwargs)
 
     elif plot_type == "model-transfer-by-budget":
         # One panel per budget at a single success-rate threshold (default 2500 km,
@@ -1988,7 +1994,7 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         print(f"Plotting guidance-scale (cfg) results from: {results_file}")
         with open(results_file) as f:
             json_results = json.load(f)
-        plot_cfg_success_rate(json_results=json_results, plot_dir=plots_dir)
+        plot_cfg_success_rate(json_results=json_results, plot_dir=plots_dir, **eps_kwargs)
 
     else:
         raise ValueError(f"Unknown plot type: {plot_type}")
@@ -2281,6 +2287,10 @@ Examples:
                           help="For 'clean-vs-attacked-displacement': load ATTACK's <dataset>_ATTACK_results.pt "
                                "from DIR instead of --results-dir (e.g. a pilot run standing in for a full one; "
                                "the panel then states its n)")
+    plot_cmd.add_argument("--eps", type=float, default=None,
+                          help="Attack budget the single-budget figures (ablations, dtd-variance, loss-vs-fsd, "
+                               "clean-vs-attacked heatmap) are drawn at, e.g. 0.0039 for 1/255; the closest "
+                               "stored budget is used (default: 8/255)")
     plot_cmd.add_argument("--n-cols", type=int, default=None,
                           help="Panels per row for the --tikz 'clean-vs-attacked-displacement' heatmap grid "
                                "(default 4; e.g. 5 puts the five headline attacks on one line)")
