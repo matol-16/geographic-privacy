@@ -143,7 +143,7 @@ def render_latex(runs: list[dict], attacks: list[str], label: str, caption: str)
     hdr = [""]
     for r, n in zip(runs, per_budget):
         for b in r["budgets"]:
-            hdr.append(f"\\multicolumn{{{n}}}{{c}}{{$\\epsilon={budget_label(b)}$}}")
+            hdr.append(f"\\multicolumn{{{n}}}{{c}}{{$b={budget_label(b)}$}}")
     out.append(" & ".join(hdr) + " \\\\")
     # metric header row
     hdr = ["Attack"]
@@ -207,12 +207,12 @@ def main() -> None:
         n_img = max(v for vs in r["n"].values() for v in vs)
         emit(f"success_rate_{ds}", [r],
              f"Attack success rate (\\%, higher is better) at 200/750/2500\\,km and mean final-step "
-             f"displacement (km) on {DATASET_LABELS.get(ds, ds)} ({n_img} images), per budget $\\epsilon$.")
+             f"displacement (km) on {DATASET_LABELS.get(ds, ds)} ({n_img} images), per budget $b$.")
     if len(runs) > 1:
         emit("success_rate_all", runs,
              "Attack success rate (\\%, higher is better) at 200/750/2500\\,km and mean final-step "
              "displacement (km) on " + " and ".join(DATASET_LABELS.get(r["dataset"], r["dataset"]) for r in runs)
-             + ", per budget $\\epsilon$. Best value per column in bold.")
+             + ", per budget $b$. Best value per column in bold.")
         # Compact headline table: 2500 km success rate only.
         compact = []
         for r in runs:
@@ -220,7 +220,7 @@ def main() -> None:
             rr["fsd_mean"] = {}
             compact.append(rr)
         emit("success_rate_2500km", compact,
-             "Attack success rate (\\%) at the 2500\\,km threshold, per dataset and budget $\\epsilon$.")
+             "Attack success rate (\\%) at the 2500\\,km threshold, per dataset and budget $b$.")
 
     print("\nWritten:\n  " + "\n  ".join(written))
 
