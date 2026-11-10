@@ -464,7 +464,6 @@ def plot_clean_vs_attacked_displacement_tikz(
             "No paired (clean, attacked) true-GPS displacement samples available -- this "
             "requires results saved with restart-level 'gps_source'/'true_gps' data."
         )
-    n_max = max(b.size for _, b, _, _ in panels)
 
     combined = np.concatenate(all_vals)
     positive = combined[combined > 0]
@@ -512,11 +511,6 @@ def plot_clean_vs_attacked_displacement_tikz(
                         {"clean": xs_flat, "attacked": ys_flat, "density": zs_flat})
 
         r_label = f"r = {r:.2f}" if r is not None else "r = n/a"
-        # A panel drawn from a smaller run (e.g. a 100-image pilot standing in
-        # for a full evaluation) says so, otherwise its sparser density would
-        # read as a weaker attack.
-        if baseline.size < n_max:
-            r_label += f", n = {baseline.size}"
         # Two-line title (name / correlation): on the single-row headline layout
         # the panels sit 0.5cm apart, and "GeoFA-AdvDM (r = 0.16)" on one line
         # runs into its neighbours.
