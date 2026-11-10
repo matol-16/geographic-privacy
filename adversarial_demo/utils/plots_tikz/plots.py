@@ -894,6 +894,7 @@ def plot_model_transfer_success_rate_tikz(
     json_results: dict,
     plot_dir: str,
     eps: float = DEFAULT_ABLATION_EPS,
+    by_budget_threshold: Optional[float] = None,
 ) -> dict:
     """TikZ twin of ``utils.plots.ablations.plot_model_transfer_success_rate``.
 
@@ -905,6 +906,10 @@ def plot_model_transfer_success_rate_tikz(
     Restricted to the headline attacks -- GeoFA-UniDef, GeoFA-TD, GeoFA-sample,
     GeoFA-enc., and GeoShield when the dataset has it -- so the chart isn't cluttered with
     every ablation baseline.
+
+    ``by_budget_threshold`` (e.g. 2500) switches the panels from "one per success-rate
+    threshold at budget ``eps``" to "one per budget at that single threshold", saved as
+    ``<ds>_model_transfer_success_rate_by_budget``.
     """
     model_labels = json_results["model_labels"]
 
@@ -921,86 +926,110 @@ def plot_model_transfer_success_rate_tikz(
 
     model_labels_capital = [tex_escape(_model_label(m)) for m in model_labels]
     thresholds = json_results["success_rate_thresholds_km"]
-    _HEADLINE_ATTACKS = ["unidef", "dtd", "sampling", "encoder", "geoshield"]
-    attack_types = sorted(
-        (a for a in json_results["attack_types"] if a.lower() in _HEADLINE_ATTACKS),
-        key=lambda a: _HEADLINE_ATTACKS.index(a.lower()),
-    )
+    # Which attacks to show is decided upstream (``main.py plot model-transfer
+    # --attack-types``: the main attacks for the paper, every attack for the appendix).
+    attack_types = attacks_dtd_last(json_results["attack_types"])
     attack_budgets = json_results["attack_budgets"]
     dataset = json_results["dataset"]
     budgets_per_type = json_results.get("attack_budgets_per_type", {})
+    # Panels as (budget, threshold) pairs; the budget drawn is stated in every title.
+    if by_budget_threshold is None:
+        title_eps = select_closest_budget(attack_budgets, eps)
+        panel_specs = [(title_eps, thr) for thr in thresholds]
+    else:
+        thr_key = next((t for t in thresholds if float(t) == float(by_budget_threshold)), None)
+        if thr_key is None:
+            raise ValueError(f"threshold {by_budget_threshold} not in {thresholds}")
+        panel_specs = [(float(b), thr_key) for b in attack_budgets]
 
-    # Fixed qualitative palette for the 3 backbones (independent of the
-    # per-attack palette used everywhere else -- here the model is the
-    # series, not the attack).
-    _MODEL_COLORS = {"rfm": "1F77B4", "diffusion": "FF7F0E", "flow": "2CA02C"}
-    _MODEL_PATTERNS = {"rfm": "north east lines", "diffusion": "horizontal lines", "flow": "dots"}
+    # Fixed neutral palette for the backbones (independent of the per-attack
+    # palette used everywhere else -- here the model is the series, not the
+    # attack): black RFM, light grey diffusion, slate flow; solid fills.
+    _MODEL_COLORS = {"rfm": "000000", "diffusion": "BDBDBD", "flow": "7C93AB"}
 
     xcoords_labels = [tex_escape(_display_attack_name(a)) for a in attack_types]
     colors: dict[str, str] = {}
-    panels: list[list[str]] = [[] for _ in thresholds]
+    panels: list[list[str]] = [[] for _ in panel_specs]
     for m_idx, model in enumerate(model_labels):
         color_name = "model" + sanitize_pgfname(model).capitalize()
         hexcode = _MODEL_COLORS.get(model.lower(), _MODEL_COLORS["rfm"])
         colors[color_name] = hexcode
-        pattern = _MODEL_PATTERNS.get(model.lower(), "crosshatch")
-        pattern_color = contrasting_ink(hexcode)
-        for col_idx, thr in enumerate(thresholds):
+        for col_idx, (panel_eps, thr) in enumerate(panel_specs):
             rates = []
             for attack_type in attack_types:
-                budget = select_closest_budget(budgets_per_type.get(attack_type, attack_budgets), eps)
+                budget = select_closest_budget(budgets_per_type.get(attack_type, attack_budgets), panel_eps)
                 bkey = f"budget_{budget:.6f}"
                 cell = json_results["results"][attack_type][bkey][model]
                 rates.append(cell["success_rates"][str(thr)])
             pts = " ".join(f"({lbl},{r:.6g})" for lbl, r in zip(xcoords_labels, rates))
-            # Single-swatch legend image only matters for the addplot that
-            # actually contributes a legend entry (col_idx == 0); the default
-            # (unset) legend image on the other columns' addplots is never
-            # rendered since they have no \addlegendentry.
-            legend_img = f", {bar_legend_image_code(color_name, pattern, pattern_color)}" if col_idx == 0 else ""
-            entry = (f"\\addplot[fill={color_name}, draw=black, line width=0.3pt, "
-                     f"postaction={{pattern={pattern}, pattern color={pattern_color}}}{legend_img}] "
+            entry = (f"\\addplot[fill={color_name}, draw=black, line width=0.3pt] "
                      f"coordinates {{{pts}}};")
             if col_idx == 0:
                 entry += f"\n\\addlegendentry{{{model_labels_capital[m_idx]}}}"
             panels[col_idx].append(entry)
 
     xcoords = ",".join(xcoords_labels)
-    panel_w, panel_h, h_sep = SUCCESS_RATE_PANEL_W, SUCCESS_RATE_PANEL_H, SUCCESS_RATE_H_SEP
+    # Sized to be included at natural size in an ICLR column (\textwidth = 5.5in):
+    # panels side by side (or stacked when there are many attacks), shared y tick
+    # labels on the left, and the model legend in one column on the right.
+    # (text_w leaves ~0.5cm for the first rotated tick label, which overhangs the y axis.)
+    text_w, ylabel_w, legend_w, h_sep = 13.35, 1.25, 1.75, 0.25
     enlarge = 0.12
-    legend_x = groupplot_legend_center_x(len(thresholds), panel_w, h_sep)
+    stacked = len(attack_types) > 6
+    n_cols = 1 if stacked else len(panel_specs)
+    panel_w = (text_w - ylabel_w - legend_w - (n_cols - 1) * h_sep) / n_cols
+    panel_h = 1.5 if stacked else 1.9
     # Bar width is an absolute pt size, so it must fit within one category's
-    # actual on-canvas slot (panel width minus the enlarge margins, divided
-    # among the attack categories) or adjacent clusters overlap -- the old
-    # formula sized bars only off the bar count, ignoring how many categories
-    # they had to fit next to, which is what caused the overlap.
+    # on-canvas slot (panel width minus the enlarge margins, divided among the
+    # attack categories) or adjacent clusters overlap.
     _CM_TO_PT = 28.4527559
     usable_pt = panel_w * _CM_TO_PT * (1 - 2 * enlarge)
     slot_pt = usable_pt / max(len(attack_types), 1)
-    bar_width = max(3.0, slot_pt / max(len(model_labels), 1) * 0.8)
+    bar_width = max(2.0, slot_pt / max(len(model_labels), 1) * 0.8)
 
     group_axes = []
-    for col_idx, thr in enumerate(thresholds):
+    for col_idx, (panel_eps, thr) in enumerate(panel_specs):
+        title = (f"$b = {round(panel_eps * 255)}/255$" if by_budget_threshold is not None
+                 else f"$b = {round(panel_eps * 255)}/255$, $>${thr}\\,km")
         opts = [
             "ybar", f"bar width={bar_width:.3g}pt",
             f"symbolic x coords={{{xcoords}}}", "xtick=data",
-            "x tick label style={rotate=30, anchor=east}",
             f"enlarge x limits={{{enlarge}}}",
-            f"title={{Displacement > {thr} km}}", "ymin=0", "ymax=1",
-            "grid=major", "grid style={gray!25}",
+            f"title={{{title}}}",
         ]
+        if stacked or col_idx == 0:
+            opts.append(f"ylabel={{ASR@{thr}\\,km}}" if by_budget_threshold is not None
+                        else "ylabel={ASR}")
+        if stacked and col_idx < len(panel_specs) - 1:
+            opts.append("xticklabels={}")  # attack names only under the bottom panel
         if col_idx == 0:
-            opts.append("ylabel={Attack success rate}")
-            opts.append(f"legend style={{at={{({legend_x:.4g},1.35)}}, anchor=south, "
-                        f"legend columns=-1, draw=none, font=\\large}}")
+            opts += ["legend to name=modeltransferleg", "legend columns=1", "area legend",
+                     "legend style={font=\\scriptsize, draw=black, line width=0.4pt, inner sep=2pt, "
+                     "row sep=-1pt, cells={anchor=west}}"]
         group_axes.append(f"\\nextgroupplot[{', '.join(opts)}]\n" + "\n".join(panels[col_idx]))
 
-    body = (
-        f"\\begin{{groupplot}}[group style={{group size={len(thresholds)} by 1, "
-        f"horizontal sep={h_sep}cm}}, width={panel_w}cm, height={panel_h}cm]\n"
-        + "\n".join(group_axes) + "\n\\end{groupplot}"
+    if stacked:
+        group_style = (f"group name=g, group size=1 by {len(panel_specs)}, vertical sep=0.7cm")
+        legend_anchor = f"g c1r{(len(panel_specs) + 1) // 2}.east"
+    else:
+        group_style = (f"group name=g, group size={n_cols} by 1, horizontal sep={h_sep}cm, "
+                       "yticklabels at=edge left")
+        legend_anchor = f"g c{n_cols}r1.east"
+    axis_style = (
+        f"scale only axis, width={panel_w:.3f}cm, height={panel_h}cm, ymin=0, ymax=1, "
+        "ytick={0,0.5,1}, minor ytick={0.25,0.75}, grid=both, minor grid style={gray!12}, minor tick length=0pt,  grid style={gray!25}, "
+        "tick label style={font=\\scriptsize}, label style={font=\\scriptsize}, "
+        "title style={font=\\scriptsize, yshift=-4pt}, "
+        "x tick label style={rotate=35, anchor=north east, inner sep=1pt}, "
+        "tick pos=left, major tick length=2pt, ylabel style={yshift=-3pt}"
     )
-    return render_tikz(body, plot_dir, f"{dataset}_model_transfer_success_rate", color_definitions(colors))
+    body = (
+        f"\\begin{{groupplot}}[group style={{{group_style}}}, {axis_style}]\n"
+        + "\n".join(group_axes) + "\n\\end{groupplot}\n"
+        f"\\node[anchor=west, xshift=4pt] at ({legend_anchor}) {{\\pgfplotslegendfromname{{modeltransferleg}}}};"
+    )
+    stem = f"{dataset}_model_transfer_success_rate" + ("_by_budget" if by_budget_threshold is not None else "")
+    return render_tikz(body, plot_dir, stem, color_definitions(colors))
 
 
 def plot_robustness_results_tikz(

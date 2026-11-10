@@ -55,14 +55,18 @@ OSV_BASE="${OSV_BASE:-${PROJECT_DIR}/results/cluster_eval_2/osv_full}"
 # Every attack in the combined curves/tables. targeted_l2 (GeoFA-DPA) is listed so it
 # folds in automatically once its results exist.
 ALL_ATTACKS="${ALL_ATTACKS:-encoder sampling diffusion_l2 dtd ace geoshield training_loss unidef targeted_l2}"
-# Main-paper heatmap: these five, single row (dtd is forced last by the plot code).
-MAIN_HEATMAP_ATTACKS="${MAIN_HEATMAP_ATTACKS:-geoshield encoder training_loss targeted_l2 dtd}"
+# Main-paper attack subset for the figures that do not show every attack (heatmap,
+# localizability, model transfer): GeoShield, GeoFA-sample, GeoFA-AdvDM, GeoFA-DPA, GeoFA-TD. Each of
+# those figures also gets an all-attacks "_appendix" twin.
+MAIN_ATTACKS="${MAIN_ATTACKS:-geoshield sampling training_loss targeted_l2 dtd}"
+# Main-paper heatmap: the main attacks, single row (dtd is forced last by the plot code).
+MAIN_HEATMAP_ATTACKS="${MAIN_HEATMAP_ATTACKS:-${MAIN_ATTACKS}}"
 # Until the full targeted_l2 (GeoFA-DPA) run lands, its heatmap panel comes from the
 # 100-image YFCC pilot (the panel title states n = 100). Used only when the dataset has
 # no <ds>_targeted_l2_results.pt of its own; set DPA_PILOT_DIR="" to disable.
 DPA_PILOT_DIR="${DPA_PILOT_DIR-${PROJECT_DIR}/results/test/test_targeted_l2}"
 # Localizability panel columns.
-LOCALIZABILITY_ATTACKS="${LOCALIZABILITY_ATTACKS:-geoshield training_loss sampling diffusion_l2 dtd}"
+LOCALIZABILITY_ATTACKS="${LOCALIZABILITY_ATTACKS:-${MAIN_ATTACKS}}"
 
 export MPLBACKEND=Agg
 
@@ -91,9 +95,16 @@ plot_both() {
   done
 }
 
-# localizability <dataset> <results_dir> <plots_dir> <config> [extra args...]
+# present_attacks <dataset> <results_dir> <attacks...>: those with a results file on disk.
+present_attacks() {
+  local ds="$1" rdir="$2" a out=(); shift 2
+  for a in "$@"; do [[ -f "${rdir}/${ds}_${a}_results.pt" ]] && out+=("${a}"); done
+  echo "${out[*]}"
+}
+
+# localizability <dataset> <results_dir> <plots_dir> <config> <attacks> [extra args...]
 localizability() {
-  local ds="$1" rdir="$2" pdir="$3" cfg="$4"; shift 4
+  local ds="$1" rdir="$2" pdir="$3" cfg="$4" attacks="$5"; shift 5
   if ! ls "${rdir}/localizability_shards/${ds}_loc__"*.pt >/dev/null 2>&1 \
      && [[ ! -f "${rdir}/${ds}_localizability.pt" ]]; then
     echo; echo ">>> [${ds}] localizability: no scores under ${rdir} -- skipping"
@@ -104,7 +115,7 @@ localizability() {
     echo; echo ">>> [${ds}] localizability plot -> ${pdir}  ($* ${flags})"
     # shellcheck disable=SC2086
     "${PYTHON}" main.py evaluate-localizability --stage plot --config "${cfg}" --dataset "${ds}" \
-      --attack-types ${LOCALIZABILITY_ATTACKS} --results-dir "${rdir}" --plots-dir "${pdir}" "$@" ${flags}
+      --attack-types ${attacks} --results-dir "${rdir}" --plots-dir "${pdir}" "$@" ${flags}
   done
 }
 
@@ -116,6 +127,11 @@ run_dataset() {
   [[ -f "${cfg}" ]] || cfg="${PROJECT_DIR}/config.yaml"
   # Where the ablation figures of this dataset live, and the stem suffix they carry.
   local abl_dir abl_suffix=()
+  # Stem suffix of the all-attacks twin of a main-attacks figure. On a dataset whose
+  # ablations already live in the appendix (OSV) the main-attacks version is itself
+  # "_appendix", so the all-attacks one needs a distinct stem.
+  local all_suffix=_appendix
+  [[ "${ablation_home}" == "appendix" ]] && all_suffix=_all_appendix
   if [[ "${ablation_home}" == "appendix" ]]; then
     abl_dir="${app}"; abl_suffix=(--filename-suffix _appendix)
   else
@@ -162,7 +178,18 @@ run_dataset() {
     echo ">>> [${ds}] no sampling-steps JSON -- skipping"
   fi
   if [[ -f "${base}/${ds}_model_transfer_results.json" ]]; then
-    plot_both model-transfer "${ds}" "${base}" "${abl_dir}" "${cfg}" ${abl_suffix[@]+"${abl_suffix[@]}"}
+    # Main attacks where the ablations live; every attack in the appendix twin.
+    # shellcheck disable=SC2086
+    plot_both model-transfer "${ds}" "${base}" "${abl_dir}" "${cfg}" --attack-types ${MAIN_ATTACKS} \
+      ${abl_suffix[@]+"${abl_suffix[@]}"}
+    plot_both model-transfer "${ds}" "${base}" "${app}" "${cfg}" --filename-suffix "${all_suffix}"
+    # One panel per budget at 2500 km (TikZ only).
+    if [[ "${TIKZ}" == "1" ]]; then
+      # shellcheck disable=SC2086
+      plot model-transfer-by-budget "${ds}" "${base}" "${abl_dir}" "${cfg}" --tikz --attack-types ${MAIN_ATTACKS} \
+        ${abl_suffix[@]+"${abl_suffix[@]}"}
+      plot model-transfer-by-budget "${ds}" "${base}" "${app}" "${cfg}" --tikz --filename-suffix "${all_suffix}"
+    fi
   else
     echo ">>> [${ds}] no model-transfer JSON -- skipping"
   fi
@@ -199,7 +226,12 @@ run_dataset() {
   fi
 
   # -- localizability (needs precomputed scores; see scripts/run_localizability.sh) ---
-  localizability "${ds}" "${base}" "${abl_dir}" "${cfg}" ${abl_suffix[@]+"${abl_suffix[@]}"}
+  # Main attacks where the ablations live, every attack in the appendix.
+  localizability "${ds}" "${base}" "${abl_dir}" "${cfg}" "${LOCALIZABILITY_ATTACKS}" ${abl_suffix[@]+"${abl_suffix[@]}"}
+  # (OSV keeps its main-attack version in the appendix too, hence the distinct stem.)
+  # shellcheck disable=SC2086
+  localizability "${ds}" "${base}" "${app}" "${cfg}" "$(present_attacks "${ds}" "${base}" ${ALL_ATTACKS})" \
+    --filename-suffix "${all_suffix}"
 
   echo; echo "[${ds}] done."
 }

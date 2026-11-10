@@ -1939,8 +1939,42 @@ def cmd_plot(args, config: Dict[str, Any]) -> None:
         print(f"Plotting cross-model transfer results from: {results_file}")
         with open(results_file) as f:
             json_results = json.load(f)
+        # Flow-transfer ASR is a lower bound: NaN samples (from the flow backbone's
+        # own eval) count as failures, so it drops with budget instead of rising --
+        # drop it from the figure until it's recomputed without that artifact.
+        json_results["model_labels"] = [m for m in json_results["model_labels"] if m.lower() != "flow"]
+        if args.attack_types:
+            # Main-paper subset (the appendix twin is drawn without --attack-types).
+            missing = [a for a in args.attack_types if a not in json_results["attack_types"]]
+            if missing:
+                print(f"NOTE: no model-transfer results for {missing} -- skipped")
+            json_results["attack_types"] = [a for a in args.attack_types if a in json_results["attack_types"]]
         model_transfer_fn = plot_model_transfer_success_rate_tikz if tikz else plot_model_transfer_success_rate
         model_transfer_fn(json_results=json_results, plot_dir=plots_dir)
+
+    elif plot_type == "model-transfer-by-budget":
+        # One panel per budget at a single success-rate threshold (default 2500 km,
+        # override with --thresholds <km>). TikZ only.
+        if not tikz:
+            raise ValueError("plot_type 'model-transfer-by-budget' is only implemented for --tikz.")
+        results_file = pick_value(
+            args.results_files[0] if args.results_files else None,
+            config.get("results_file"),
+            os.path.join(results_dir, f"{dataset}_model_transfer_results.json"),
+        )
+        with open(results_file) as f:
+            json_results = json.load(f)
+        # See the matching note in the "model-transfer" branch: flow-transfer ASR
+        # is a NaN-inflated lower bound, dropped from the figure for now.
+        json_results["model_labels"] = [m for m in json_results["model_labels"] if m.lower() != "flow"]
+        if args.attack_types:
+            json_results["attack_types"] = [a for a in args.attack_types if a in json_results["attack_types"]]
+        threshold = 2500.0
+        if isinstance(robustness_thresholds, list) and len(robustness_thresholds) == 1:
+            threshold = robustness_thresholds[0]
+        print(f"Plotting cross-model transfer per budget at {threshold:g} km from: {results_file}")
+        plot_model_transfer_success_rate_tikz(json_results=json_results, plot_dir=plots_dir,
+                                              by_budget_threshold=threshold)
 
     elif plot_type == "cfg":
         if tikz:
@@ -2224,7 +2258,8 @@ Examples:
     plot_cmd.add_argument("plot_type", nargs="?",
                           choices=["results", "success-rate", "sampling-steps", "dtd-variance",
                                    "loss-vs-fsd", "clean-vs-attacked-displacement", "restarts",
-                                   "robustness", "model-transfer", "cfg", "robustness-and-sampling-steps"],
+                                   "robustness", "model-transfer", "cfg", "robustness-and-sampling-steps",
+                                   "model-transfer-by-budget"],
                           help="Type of plot to generate")
     plot_cmd.add_argument("--dataset", choices=["yfcc", "osv"], help="Dataset to plot")
     plot_cmd.add_argument("--attack-types", nargs="+", help="Attack types to plot (for 'results' plot type)")

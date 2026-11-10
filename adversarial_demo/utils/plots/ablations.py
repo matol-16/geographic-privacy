@@ -464,7 +464,8 @@ def plot_model_transfer_success_rate(
     axes[0][0].set_ylabel("Attack success rate")
 
     for col_idx, thr in enumerate(thresholds):
-        axes[0][col_idx].set_title(f"Displacement > {thr} km")
+        title_eps = select_closest_budget(attack_budgets, eps)
+        axes[0][col_idx].set_title(f"$\\epsilon = {round(title_eps * 255)}/255$, displacement > {thr} km")
         axes[0][col_idx].set_ylim(0, 1)
     for col_idx in range(n_cols):
         ax = axes[0][col_idx]
