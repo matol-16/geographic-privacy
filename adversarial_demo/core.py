@@ -102,6 +102,39 @@ class EvaluationConfig:
     # ``<results_dir>/deltas/`` so the attacked image can be re-evaluated offline (other
     # samplers / cfg / models / seeds) without retraining. Config key ``save_deltas``.
     save_deltas: bool = False
+    # Re-seed Python / NumPy / Torch before every (attack, budget, image) task from
+    # (seed, attack, budget, image id), so each cell is a deterministic function of its
+    # own identity -- independent of task order and of where a killed shard resumed.
+    # Off by default: the historical runs seeded once per shard. Config key ``per_task_seed``.
+    per_task_seed: bool = False
+
+
+def task_seed(seed: int, attack_type: str, budget: float, image_id: Any) -> int:
+    """Stable 31-bit seed for one (attack, budget, image) task (crc32, not salted hash())."""
+    import zlib
+    key = f"{int(seed)}|{attack_type}|{float(budget):.6g}|{image_id}".encode()
+    return zlib.crc32(key) & 0x7FFFFFFF
+
+
+def _maybe_seed_task(runner, attack_type: str, budget_idx: int, image_idx: int) -> None:
+    """Apply ``per_task_seed`` (see EvaluationConfig) before a task trains its attack."""
+    config = runner.config
+    if not getattr(config, "per_task_seed", False):
+        return
+    from utils.adversarial_utils import seed_everything
+    # Deterministic kernels too (needs CUBLAS_WORKSPACE_CONFIG=:4096:8 in the environment);
+    # warn_only keeps ops without a deterministic implementation running.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    # The flash / memory-efficient SDPA backwards are non-deterministic, and sign-SGD turns
+    # their last-bit noise into different trajectories: use the math attention kernel.
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_math_sdp(True)
+    ids = runner.source_image_ids
+    image_id = ids[image_idx] if ids is not None else image_idx
+    seed_everything(task_seed(config.seed, attack_type, config.attack_budgets[budget_idx], image_id))
 
 
 @dataclass
@@ -1055,6 +1088,7 @@ class EvaluationRunner(BaseEvaluationRunner):
             "run_cfg_ablation": self.config.run_cfg_ablation,
             "eval_cfgs": list(self.config.eval_cfgs) if self.config.eval_cfgs else None,
             "cfg_num_steps": self.config.cfg_num_steps,
+            "per_task_seed": bool(getattr(self.config, "per_task_seed", False)),
         }
 
     def _signature_match_keys(self) -> List[str]:
@@ -1593,6 +1627,9 @@ def parallel_evaluate_attacks(
         eps = config.attack_budgets[budget_idx]
         kwargs = runner.merge_attack_kwargs(attack_type, budget_idx)
         _maybe_add_true_gps(runner, attack_type, image_idx, kwargs)
+        # NB: the global RNG is shared across worker threads, so per_task_seed only makes
+        # tasks reproducible with parallel_workers == 1 (the sequential path).
+        _maybe_seed_task(runner, attack_type, budget_idx, image_idx)
 
         # Handle CUDA streams if requested
         if (config.use_cuda_streams and
@@ -1693,6 +1730,7 @@ def sequential_evaluate_attacks(
         eps = config.attack_budgets[budget_idx]
         kwargs = runner.merge_attack_kwargs(attack_type, budget_idx)
         _maybe_add_true_gps(runner, attack_type, image_idx, kwargs)
+        _maybe_seed_task(runner, attack_type, budget_idx, image_idx)
 
         result = run_attack(
             attack_type=attack_type,

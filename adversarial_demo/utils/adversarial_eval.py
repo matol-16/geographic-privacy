@@ -796,6 +796,7 @@ def evaluate_attack_shard(
         eval_cfgs=[float(c) for c in eval_cfgs] if eval_cfgs else None,
         cfg_num_steps=cfg_num_steps,
         save_deltas=bool((config_dump or {}).get("save_deltas", False)),
+        per_task_seed=bool((config_dump or {}).get("per_task_seed", False)),
     )
 
     runner = EvaluationRunner(config, pipeline, transfer_pipelines=transfer_pipelines)
