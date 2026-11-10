@@ -54,13 +54,13 @@ _PREAMBLE = r"""\documentclass[tikz,border=2pt]{{standalone}}
 # identifiable by color *or* shape alone (colorblind-safe, grayscale-safe).
 _ATTACK_MARKERS = ["*", "square*", "triangle*", "star", "diamond*",
                    "pentagon*", "+", "10-pointed star", "x", "asterisk",
-                   "halfcircle*", "|"]
+                   "halfcircle*", "|", "diamond"]
 # "oplus*"/"otimes*" (circle + plus/cross) render as plain filled circles in
 # this pgfplots version -- indistinguishable from "*" -- so plain "+"/"x" are
 # used instead, which actually show their shape at these small mark sizes.
 _ATTACK_PATTERNS = ["north east lines", "horizontal lines", "vertical lines", "crosshatch", "dots",
                     "north west lines", "grid", "crosshatch dots", "bricks", "fivepointed stars",
-                    "sixpointed stars", "checkerboard"]
+                    "sixpointed stars", "checkerboard", "horizontal lines light gray"]
 
 
 def attack_marker(attack_type: str) -> str:
