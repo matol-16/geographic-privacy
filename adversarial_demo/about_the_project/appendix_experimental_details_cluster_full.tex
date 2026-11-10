@@ -1,0 +1,130 @@
+% ---------------------------------------------------------------------------
+% Appendix: Experimental Details -- regenerated for the cluster_full run.
+% Every number below is read from configs/cluster_full/config.yaml,
+% configs/cluster_full/ATTACK_SPECS.md and scripts/cluster/config.sh.
+% Requires: booktabs, amsmath.
+% ---------------------------------------------------------------------------
+\section{Experimental Details}
+\label{app:exp_details}
+
+\paragraph{Attacked models and data.}
+The attacked model is, for each dataset, the public Riemannian flow-matching checkpoint of
+\citet{dufour2024around} on $\mathcal{S}^2$ (\texttt{PLONK\_YFCC}, \texttt{PLONK\_OSV\_5M}).
+The image encoder $\mathcal{E}$ is frozen and shared with the diffusion and Euclidean
+flow-matching checkpoints used in the transfer experiment: DINOv2 ViT-L/14 with registers
+\citep{oquab2024dinov2} on YFCC4k, the StreetCLIP ViT-L/14 vision tower
+\citep{haas2023streetclip} on OSV-5M, both taking a $336{\times}336$ input obtained by a
+$1{:}1$ centre crop, bicubic resize and the encoder's own channel normalisation. We evaluate
+$4\,000$ images per dataset: YFCC4k in full, and for OSV-5M a fixed, prefix-stable subset of
+the test split (seeded shuffle, seed $42$), so that every attack, budget and ablation sees
+exactly the same images.
+
+\paragraph{Attack hyperparameters.}
+Attacks are trained per image over 60 PGD steps, with batch-size 256 (where applicable) and
+learning rate $10^{-3}$. These hyperparameters ensure comparable training length and memory
+usage across considered baselines despite their design differences. We train with budgets
+$b \in \{1/255,\, 4/255,\, 8/255\}$. This choice aims at demonstrating the high performance of
+our attack even at very low perturbation budgets, considered as highly stealthy in the
+literature \citep{kang2024diffattackevasionattacksdiffusionbased,
+croce2021robustbenchstandardizedadversarialrobustness}. Budget $8/255$ allows direct
+comparison with GeoShield. Concretely, every trainable attack shares the same outer loop: the
+perturbation $\delta$ lives on the $[0,1]$ pixel scale of the model-input square and is
+updated by sign-SGD, $\delta \leftarrow \mathrm{clip}(\delta - \eta\,\mathrm{sign}(\nabla_\delta
+\mathcal{L}), \pm b)$ with $\eta = 10^{-3}$, from a small random start
+$\delta_0 \sim \mathcal{U}(-10^{-4}, 10^{-4})$. Expectations over $(x_t, \epsilon, t)$ are
+estimated with $256$ Monte-Carlo samples per step, $t \sim \mathcal{U}[0,1]$ and
+$\gamma(t)$ the model's own noise schedule. The forward process is anchored at the image's
+\emph{true} location $x_0$, which the defender knows by construction; only GeoFA-ACE, which is
+targeted at an image rather than at a location, anchors it instead on a bank of $512$ samples
+drawn once from the clean model ($100$ steps, $w=0$) and shared by all restarts.
+
+\paragraph{Restarts and selection.}
+Each attack is trained from 5 independent random initializations (except GeoShield), and we
+select the one achieving the highest displacement from the true location in order to improve
+attack consistency. We emphasize that this selection is not an evaluation artifact but a
+\emph{deployable defender-side verification protocol}: in our setting the image's location is
+the defender's own private information, so verifying candidate perturbations against the
+white-box model and keeping the best is a legitimate step of the defense. Verification is also
+necessary: we observe that GeoFA-TD's adversarial loss is imperfectly correlated with the
+resulting FSD, so loss-based selection would be inadequate. For comparability with single-run
+protocols, we report single-restart results. A restart is scored exactly like the final
+evaluation, but with $128$ samples and noise seeded by $42 + \text{restart index}$, so that
+the selection never reuses the evaluation noise.
+
+\paragraph{Evaluation protocol.}
+The protected image $\mathrm{clamp}(c+\delta)$ is quantised to 8 bits and fed to the model
+through the very same preprocessing as a clean image, so that nothing of the perturbation
+survives outside the pixel domain. For every (image, attack, budget) we draw $128$ locations
+with $250$ sampling steps and guidance $w=10$ from noise shared with the clean run; FSD is the
+mean haversine distance between these predictions and the ground truth, and
+$\mathrm{ASR}_{>d}$ the fraction of images whose FSD exceeds $d \in \{200, 750, 2500\}$\,km.
+Clean rows apply the same protocol to the unprotected image.
+
+\paragraph{Attack-specific settings.}
+Table~\ref{tab:hyperparams-specific} lists what differs between instances; everything else
+(budget, optimiser, steps, restarts, evaluation) is shared. Two additional variants are
+reported in the appendix only: \emph{GeoFA-Sampling} ($w{=}10$), identical to GeoFA-Sampling
+except that the unrolled sampler runs at the evaluation guidance, which tests whether matching
+the guidance at training time helps; and \emph{GeoFA-TD-blur}, which mixes the GeoFA-TD loss on
+the protected image and on a Gaussian-blurred copy ($\sigma \sim \mathcal{U}[0,4]$, equal
+weights), a blur-EOT variant meant for the robustness ablation.
+
+\begin{table}[h]
+\centering\small\setlength{\tabcolsep}{5pt}
+\caption{Attack-specific settings. $\psi$ is the velocity network, $\mathcal{E}$ the image
+encoder, $c$ the clean image and $x_0$ its true location. ``Gaussian'' denotes the interpolant
+$x_t = \sqrt{\gamma}\,x_0 + \sqrt{1-\gamma}\,n$, $n \sim \mathcal{N}(0, I_3)$; ``geodesic'' the
+forward process of Eq.~\ref{equ:forward} between a uniform point of $\mathcal{S}^2$ and the
+data endpoint.}
+\label{tab:hyperparams-specific}
+\begin{tabular}{llll}
+\toprule
+Attack & Objective & Data endpoint / target & Forward process \\
+\midrule
+GeoFA-TD       & $\min$ cosine$\big(\psi(x_t|c+\delta), \psi(x_t|c)\big)$       & $x_0$ (true)            & Gaussian \\
+GeoFA-$L^2$    & $\max \lVert \psi(x_t|c+\delta) - \psi(x_t|c) \rVert^2$        & $x_0$ (true)            & Gaussian \\
+GeoFA-DPA      & $\min$ RFM loss towards $-x_0$                                 & antipode of $x_0$       & geodesic \\
+GeoFA-Sampling & $\max$ haversine$\big(\hat{x}_0^{c+\delta}(x_N), x_0\big)$     & $x_0$ (true)            & $16$-step sampler, $w{=}0$ \\
+GeoFA-Encoder  & $\max \lVert \mathcal{E}(c+\delta) - \mathcal{E}(c) \rVert^2$  & --                      & -- \\
+GeoFA-AdvDM    & $\max$ RFM loss at $x_0$                                       & $x_0$ (true)            & geodesic \\
+GeoFA-UniDef   & same as AdvDM, FDJE gradient ($h = 10^{-2}$, one probe)        & $x_0$ (true)            & geodesic \\
+GeoFA-ACE      & $\min \lVert \psi(x_t|c+\delta) - \psi(x_t|c') \rVert^2 + \alpha \lVert \mathcal{E}(c+\delta) - \mathcal{E}(c') \rVert^2$ & target image $c'$, $\alpha = 1$ & geodesic, clean-model bank \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{GeoShield.}
+GeoShield \citep{liu2025geoshield} is run with the authors' released implementation and its
+\texttt{ensemble\_3models} configuration: $100$ FGSM-style sign steps of size $1/255$ at the
+budgets $\{1, 4, 8\}/255$, a CLIP ensemble (ViT-B/16, ViT-B/32, LAION ViT-G/14), global and
+random-crop (scale $[0.5, 0.9]$) feature-similarity losses and a geo-text term. To make the
+comparison exact, it is given lossless PNG copies of the very square the attacked pipeline
+feeds to its encoder ($336$\,px), so that its own crop and resize are a no-op and its
+perturbation is measured against the same clean tensor as the trainable attacks; its output is
+then scored by the protocol above. We note that the released code ships a placeholder image
+description and no detector regions, so our GeoShield is its CLIP-ensemble feature attack with
+a constant geo-text term rather than the full VLM/detector pipeline of the original paper. It
+has no restart mechanism.
+
+\paragraph{Ablations.}
+All ablations reuse the selected perturbations; nothing is retrained. \emph{Sampling steps:}
+the protected image is re-evaluated with $\{8, 16, 32, 64, 250\}$ steps at $w=10$.
+\emph{Guidance:} the same with $w \in \{1, 2, 5, 10\}$. \emph{Robustness:} the protected image
+is JPEG-compressed at quality $\{20, 40, 60, 80, 100\}$ ($100$ = no compression) or blurred
+with a Gaussian kernel of $\sigma \in \{0, 2, 4, 6, 8, 10\}$ pixels before the encoder, then
+evaluated at $250$ steps; this sweep covers every attack of the run. \emph{Transfer:} the same
+protected image is evaluated against the diffusion and Euclidean flow-matching checkpoints of
+\citet{dufour2024around}, which share the encoder, at $250$ steps and $w=10$.
+\emph{Restarts:} success rates are recomputed when keeping the best of the first $k \le 5$
+restarts. \emph{Localizability:} the entropy of Eq.~\ref{equ:localizability} is estimated on
+the clean image with $256$ Monte-Carlo samples of the model likelihood, and images are split
+at the $33\%$ and $66\%$ quantiles.
+
+\paragraph{Compute.}
+The evaluation is sharded on a SLURM cluster as one job per (attack, window of $100$ images),
+i.e. $11 \times 40 = 440$ single-GPU jobs per dataset, each covering the three budgets, the
+five restarts and the ablations; the shards are then merged into the reported results. Cost is
+dominated by the number of passes through $\psi$ per PGD step: GeoFA-Encoder needs none,
+GeoFA-AdvDM, GeoFA-DPA and GeoFA-UniDef one forward-backward, GeoFA-TD, GeoFA-$L^2$ and
+GeoFA-ACE two (the reference prediction is recomputed at every step), and GeoFA-Sampling
+unrolls the $16$-step sampler.
