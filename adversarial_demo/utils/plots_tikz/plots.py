@@ -620,7 +620,10 @@ def _get_localizability_attack_strength(res, attack, budget_idx) -> np.ndarray:
     import torch
     attack_result = res["attack_results"][attack]
     if isinstance(attack_result, dict):
-        t = _get_metric_tensor(attack_result, "final_step_displacement_predicted")
+        # Same metric preference as the matplotlib twin: true location first.
+        t = _get_metric_tensor(attack_result, "final_step_displacement_true")
+        if t is None:
+            t = _get_metric_tensor(attack_result, "final_step_displacement_predicted")
         if t is None:
             t = _get_metric_tensor(attack_result, "final_step_displacement")
         if t is None:

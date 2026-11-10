@@ -115,8 +115,8 @@ def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, 
 
     bucket_names = ["Low", "Medium", "High"]
     colors = colormaps['Set1'](np.linspace(0, 1, 3))
-    y_tick_values = [1000, 2500, 5000, 10000]
-    y_tick_labels = ["1,000 km", "2,500 km", "5,000 km", "10,000 km"]
+    y_tick_values = [1, 10, 100, 1000, 10000]
+    y_tick_labels = ["1 km", "10 km", "100 km", "1,000 km", "10,000 km"]
 
     def _get_buckets(res):
         loc = res["localizability"].detach().cpu()
@@ -130,7 +130,11 @@ def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, 
     def _get_attack_strength(res, attack):
         attack_result = res["attack_results"][attack]
         if isinstance(attack_result, dict):
-            t = _get_metric_tensor(attack_result, "final_step_displacement_predicted")
+            # Displacement to the true location first; older results files only
+            # carry the clean-prediction metric.
+            t = _get_metric_tensor(attack_result, "final_step_displacement_true")
+            if t is None:
+                t = _get_metric_tensor(attack_result, "final_step_displacement_predicted")
             if t is None:
                 t = _get_metric_tensor(attack_result, "final_step_displacement")
             if t is None:
@@ -151,6 +155,7 @@ def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, 
         buckets = _get_buckets(res)
         strength = _get_attack_strength(res, attack)
         data = [strength[buckets == k].numpy() for k in range(3)]
+        data = [d[np.isfinite(d)] for d in data]
         box = ax.boxplot(
             data,
             positions=np.arange(3),
@@ -194,11 +199,14 @@ def plot_localizability_results(attack_budgets, plot_dir, all_datasets_results, 
             all_values.append(vals)
 
     flat = np.concatenate([v for v in all_values if v.size > 0]) if any(v.size > 0 for v in all_values) else np.array([])
-    if flat.size > 0 and np.nanmax(flat) >= y_tick_values[0]:
+    if flat.size > 0 and np.nanmax(flat) >= 1000:
+        top = float(np.nanmax(flat)) * 1.15
+        ticks = [(v, l) for v, l in zip(y_tick_values, y_tick_labels) if v <= top]
         for r in range(n_rows):
-            axes[r, 0].set_yticks(y_tick_values)
-            axes[r, 0].set_yticklabels(y_tick_labels)
             axes[r, 0].set_yscale('log')
+            axes[r, 0].set_yticks([v for v, _ in ticks])
+            axes[r, 0].set_yticklabels([l for _, l in ticks])
+            axes[r, 0].set_ylim(10**-1, top)
     legend_handles = [
         Patch(facecolor=colors[i], edgecolor=colors[i], alpha=0.5, label=f"{bucket_names[i]} localizability")
         for i in range(3)
